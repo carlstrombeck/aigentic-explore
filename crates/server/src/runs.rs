@@ -34,6 +34,7 @@ use ulid::Ulid;
 use crate::awake::{Held, KeepAwake};
 use crate::build::{ProviderFactory, Root, build_thread};
 use crate::config::Config;
+use crate::threads::Ids;
 use crate::workspaces::Workspace;
 
 /// Where a run gets the seams it drives the world through. Production
@@ -89,6 +90,12 @@ pub struct RunWorld {
     /// The daemon's keep-awake guard: held while a run advances, so a
     /// long step is not a sleeping laptop half way through.
     pub guard: Arc<dyn KeepAwake>,
+    /// The thread ids a run's children get, from the daemon's one source
+    /// ([`Ids`]), so a child's id orders against its lead's and against
+    /// the front threads'.
+    ///
+    /// [`Ids`]: crate::threads::Ids
+    pub ids: Arc<Ids>,
     /// The project the run works in.
     pub root: Root,
     /// The project's name, for the children's `thread_started`.
@@ -144,7 +151,7 @@ impl ServerHost {
 
 impl RunnerHost for ServerHost {
     fn new_child_id(&mut self) -> Ulid {
-        Ulid::generate()
+        self.world.ids.next()
     }
 
     fn create_child(&mut self, id: Ulid, step: &str) -> Result<(), RunnerError> {

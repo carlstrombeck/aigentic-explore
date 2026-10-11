@@ -1235,6 +1235,7 @@ impl ThreadTable {
             providers: self.providers.clone(),
             deps: self.run_deps(),
             guard: self.guard(),
+            ids: self.ids(),
             root,
             project: project.to_owned(),
             workspaces: self.workspaces.clone(),
