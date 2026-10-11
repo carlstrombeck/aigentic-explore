@@ -779,6 +779,49 @@ fn e4_edge_rows_of_the_outside_the_repo_boundary() {
     }
 }
 
+/// A bare argument of a path-argument command names something in the
+/// tree: only the head and its flags are not paths, so `touch x.rs`, `rm
+/// -f newfile.rs` and `chmod +x deploy.sh` change the tested tree and E4
+/// must fail them after a green gate. An argument that carries a `/` and
+/// lands outside the root is what the exemption is for.
+#[test]
+fn e4_reads_a_bare_argument_as_a_path_in_the_tree() {
+    use aigentic_runtime::checks::is_an_edit;
+
+    for (command, wanted) in [
+        ("touch x.rs", true),
+        ("rm -f newfile.rs", true),
+        ("chmod +x deploy.sh", true),
+        ("ln -s x.rs y.rs", true),
+        (
+            "rm -f /tmp/base-runs.rs /tmp/140-restore-comments.py",
+            false,
+        ),
+        ("chmod +x /tmp/deploy.sh", false),
+        ("mkdir -p /tmp/x", false),
+        ("ln -s /tmp/a /tmp/b", false),
+    ] {
+        assert_eq!(is_an_edit(command, Path::new(REPO)), wanted, "{command}");
+    }
+
+    for (command, is_edit) in [("touch x.rs", true), ("rm -f /tmp/x.rs", false)] {
+        let mut log = Log::new();
+        healthy_gate(&mut log, false);
+        let call = log.bash(7, command);
+        log.ok(8, &call, "");
+        let got = verdict_of(&log.take(), "E4");
+        if is_edit {
+            let detail = got.expect_err("an edit after the gate");
+            assert!(
+                detail.contains("edit after the gate"),
+                "{command}: {detail}"
+            );
+        } else {
+            assert_eq!(got, Ok(()), "{command} writes outside the repo");
+        }
+    }
+}
+
 /// T7: an `edit_file` or `write_file` is read by where its path lands: a
 /// path outside the root is not an edit, a repo path and a call that
 /// names no path are.
@@ -921,6 +964,19 @@ fn e7_says_only_that_the_output_is_missing_when_nothing_cut_it() {
     log.ok(2, &call, "");
     let got = verdict_of(&log.take(), "E7").expect_err("no output");
     assert_eq!(got, format!("\"{NAME}\": output not in the log"));
+}
+
+/// A name filter after a target-only segment is still judged: `cargo test
+/// --lib && cargo test bar` fails E7, where taking only the first segment
+/// that runs `cargo test` would pass the call with nothing proven about
+/// `bar`. Stricter than the walk E7 used to read, on purpose.
+#[test]
+fn e7_reads_a_name_after_a_target_only_segment() {
+    let mut log = Log::new();
+    let call = log.bash(1, "cargo test --lib && cargo test bar");
+    log.ok(2, &call, "");
+    let got = verdict_of(&log.take(), "E7").expect_err("nothing proved `bar`");
+    assert_eq!(got, "\"bar\": output not in the log");
 }
 
 /// T13: #34's fixture (`01M3KD9HZXX1YX7SFRRR5N6Y80`) is a named run whose

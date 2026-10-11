@@ -634,7 +634,9 @@ fn named_run(command: &str) -> Option<String> {
 /// the scan it was found in and the index of the segment that named it: a
 /// caller that also needs to know what happened to that segment's output
 /// reads the same walk rather than scanning twice. A call with `--list`
-/// runs nothing, so it names none.
+/// runs nothing, so it names none; a segment that runs tests without
+/// naming one (`cargo test --lib`) does not end the walk either, so a
+/// filter later on the line is still a named run the check judges.
 fn named_run_segment(command: &str) -> Option<(Vec<ScanSegment>, usize)> {
     let segments = scan(behind_a_leading_cd(command));
     let index = segments
@@ -846,15 +848,18 @@ fn segment_is_an_edit(segment: &ScanSegment, root: &Path) -> bool {
     {
         return false;
     }
-    // A path-like word is one with a `/` in it: a bare word names
-    // something in the tree, so the segment stays an edit. Every
+    // Only the head and its flags are not paths: every other word must
+    // be a path-like word that lands outside the root. A path-like word
+    // is one with a `/` in it, so a bare argument (`touch x.rs`) names
+    // something in the tree and leaves the segment an edit. Every
     // redirection target is read the same way, and a relative path or a
     // `..` anywhere is inside, so those ways fail safe.
     let names_only_outside_paths = segment
         .words
         .iter()
-        .filter(|word| word.contains('/'))
-        .all(|word| outside_the_repo(word, root))
+        .skip(1)
+        .filter(|word| !word.starts_with('-') && !word.starts_with('+'))
+        .all(|word| word.contains('/') && outside_the_repo(word, root))
         && segment
             .redirects
             .iter()
