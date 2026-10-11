@@ -822,6 +822,43 @@ fn e4_reads_a_bare_argument_as_a_path_in_the_tree() {
     }
 }
 
+/// A substitution's commands are read through their own table, so a
+/// substitution holding only reads leaves the call a read while one that
+/// can write — a nested one included — keeps it an edit, whatever the
+/// outer command is. A process substitution is a redirection and keeps
+/// its verdict.
+#[test]
+fn e4_reads_a_substitutions_commands_through_its_own_table() {
+    use aigentic_runtime::checks::is_an_edit;
+
+    for (command, wanted) in [
+        (
+            "git log --format='%h %s' 3e99082..HEAD; echo \"--- count: $(git rev-list --count 3e99082..HEAD)\"",
+            false,
+        ),
+        ("git log; echo $(git status --short | wc -l)", false),
+        ("echo \"$(git rev-parse --show-toplevel)\"", false),
+        ("echo \"`git rev-list --count 3e99082..HEAD`\"", false),
+        ("echo $(touch crates/runtime/src/new.rs)", true),
+        ("echo \"$(git commit -m x)\"", true),
+        ("echo \"$(git add crates/runtime/src/new.rs)\"", true),
+        (
+            "echo \"$(git rev-list --count $(git rev-parse HEAD))\"",
+            true,
+        ),
+        ("echo \"$(cargo fmt)\"", true),
+        ("git status --short $(touch crates/runtime/src/x.rs)", true),
+        ("echo \"$(whoami)\"", true),
+        ("echo \"$(touch /tmp/145-note)\"", true),
+        ("echo \"$(cat\"", true),
+        ("echo $()", true),
+        ("cat <(git log --oneline)", false),
+        ("cat <(touch crates/runtime/src/new.rs)", true),
+    ] {
+        assert_eq!(is_an_edit(command, Path::new(REPO)), wanted, "{command}");
+    }
+}
+
 /// T7: an `edit_file` or `write_file` is read by where its path lands: a
 /// path outside the root is not an edit, a repo path and a call that
 /// names no path are.
@@ -880,6 +917,28 @@ fn e4_fails_an_edit_after_the_gate_naming_the_edit() {
     let got = verdict_of(&log.take(), "E4").expect_err("an edit after the gate");
     assert!(got.contains("edit after the gate"), "{got}");
     assert!(got.contains("crates/runtime/src/checks/mod.rs"), "{got}");
+}
+
+/// The issue's own command is a read after a green gate, and a write
+/// inside a substitution is still an edit there: E4's verdict, not only
+/// the table's.
+#[test]
+fn e4_reads_a_read_only_substitution_after_the_gate() {
+    let mut log = Log::new();
+    healthy_gate(&mut log, false);
+    let call = log.bash(
+        7,
+        "git log --format='%h %s' 3e99082..HEAD; echo \"--- count: $(git rev-list --count 3e99082..HEAD)\"",
+    );
+    log.ok(8, &call, "");
+    assert_eq!(verdict_of(&log.take(), "E4"), Ok(()));
+
+    let mut log = Log::new();
+    healthy_gate(&mut log, false);
+    let edit = log.bash(7, "echo $(touch crates/runtime/src/new.rs)");
+    log.ok(8, &edit, "");
+    let got = verdict_of(&log.take(), "E4").expect_err("a write inside a substitution");
+    assert!(got.contains("edit after the gate"), "{got}");
 }
 
 /// T11: #54's verbatim fixture, the echo form.
@@ -1120,6 +1179,24 @@ fn e5_reads_a_full_suite_with_flags() {
             "{partial} is a partial run, not a full suite"
         );
     }
+}
+
+/// A read-only call between two full-suite runs is no edit, so E5 still
+/// reads the pair as the same work twice.
+#[test]
+fn e5_flags_the_pair_across_a_read_only_substitution() {
+    let mut log = Log::new();
+    let call = log.bash(1, "cargo test > /tmp/145-one 2>&1");
+    log.ok(2, &call, "test result: ok. 12 passed; 0 failed");
+    let call = log.bash(3, "git log; echo $(git status --short | wc -l)");
+    log.ok(4, &call, "");
+    let call = log.bash(5, "cargo test > /tmp/145-two 2>&1");
+    log.ok(6, &call, "test result: ok. 12 passed; 0 failed");
+
+    let outcome = outcome_of(&log.take(), "E5");
+    assert_eq!(outcome.result, CheckResult::Flag);
+    let detail = outcome.detail.unwrap_or_default();
+    assert!(detail.contains("seq 1 and seq 5"), "{detail}");
 }
 
 /// E7's detail says what the latest run reported: a run whose tests

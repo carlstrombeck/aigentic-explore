@@ -745,16 +745,32 @@ fn failed_count(output: &str) -> u64 {
 
 /// A bash call is an edit unless every segment is harmless or read-only,
 /// or names only paths outside the repo root. The command-head rows win
-/// over the classify-based ones (`## Plan amendment` item 4): `cargo fmt`
-/// is allow-listed, so it classifies read-only, and it is still an edit.
+/// over the classify-based ones: `cargo fmt` is allow-listed, so it
+/// classifies read-only, and it is still an edit.
 pub fn is_an_edit(command: &str, root: &Path) -> bool {
+    is_an_edit_at(command, root, Level::Step)
+}
+
+/// Where a command line sits: the step's own call, or a command
+/// substitution inside one. A step's calls are read for what they mean —
+/// the gate's own work, `git add`, `git status` — while a substitution's
+/// calls are read for what they can touch, so `git commit` in one is an
+/// edit like anywhere else and the step's own-work rows say nothing
+/// about it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Level {
+    Step,
+    Substitution,
+}
+
+fn is_an_edit_at(command: &str, root: &Path, level: Level) -> bool {
     let segments = scan(&without_heredocs(command));
     if segments.is_empty() {
         return true;
     }
     segments
         .iter()
-        .any(|segment| segment_is_an_edit(segment, root))
+        .any(|segment| segment_is_an_edit(segment, root, level))
 }
 
 /// The command with heredoc bodies removed: the lines between a `<<WORD`
@@ -837,14 +853,31 @@ const PATH_ARGUMENT_COMMANDS: &[&str] = &[
     "rm", "rmdir", "mkdir", "touch", "mv", "cp", "ln", "chmod", "chown",
 ];
 
-fn segment_is_an_edit(segment: &ScanSegment, root: &Path) -> bool {
+fn segment_is_an_edit(segment: &ScanSegment, root: &Path, level: Level) -> bool {
+    // A substitution runs commands of its own, and no row below may
+    // launder one: `git status --short $(touch …)` writes even though its
+    // outer command is a read. A nested substitution always fails, so the
+    // walk is two levels deep and no recursion guard is needed.
+    if !segment.subs.is_empty() {
+        if level == Level::Substitution {
+            return true;
+        }
+        if segment
+            .subs
+            .iter()
+            .any(|sub| is_an_edit_at(sub, root, Level::Substitution))
+        {
+            return true;
+        }
+    }
     let head = segment.words.as_slice();
     if head.starts_with(&["cargo".to_string(), "fmt".to_string()]) {
         return true;
     }
-    if head.starts_with(&["git".to_string(), "add".to_string()])
-        || head.starts_with(&["git".to_string(), "commit".to_string()])
-        || head.starts_with(&["git".to_string(), "status".to_string()])
+    if level == Level::Step
+        && (head.starts_with(&["git".to_string(), "add".to_string()])
+            || head.starts_with(&["git".to_string(), "commit".to_string()])
+            || head.starts_with(&["git".to_string(), "status".to_string()]))
     {
         return false;
     }
