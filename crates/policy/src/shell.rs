@@ -944,6 +944,13 @@ pub struct ScanSegment {
     /// The same words, one to an entry; `segment_text`'s words exactly,
     /// so a caller can compare either.
     pub words: Vec<String>,
+    /// The text of every `$(...)` and backtick substitution in the
+    /// segment, for a caller to read as command lines of their own: a
+    /// redirection target's first, in `redirects` order, then each
+    /// word's. Quotes and a nested substitution are inside the text,
+    /// and an unclosed one is here too; a process substitution is a
+    /// redirection of its own and not in the list.
+    pub subs: Vec<String>,
     /// The target of each of its redirections, in order, except a
     /// descriptor duplication (`2>&1`, `>&2`), which names no file. A
     /// digit target of any other redirection (`> 1`, `2>1`) is a file
@@ -984,6 +991,12 @@ pub fn scan(command: &str) -> Vec<ScanSegment> {
             ScanSegment {
                 text: segment_text(seg),
                 words: segment_words(seg).iter().map(|w| w.to_string()).collect(),
+                subs: seg
+                    .redirects
+                    .iter()
+                    .flat_map(|(_, target)| target.subs.iter().cloned())
+                    .chain(seg.words.iter().flat_map(|word| word.subs.iter().cloned()))
+                    .collect(),
                 redirects: seg
                     .redirects
                     .iter()
@@ -1678,6 +1691,33 @@ mod tests {
         assert!(!allows("echo $(cat file > out.txt)"));
         // What the prefix grants is the substitution's own command.
         assert_eq!(riskiest("echo $(git push)"), Some("git push".into()));
+    }
+
+    /// The field a caller reads a substitution's own commands out of:
+    /// source order, the raw text, an unclosed one included, and no
+    /// process substitution.
+    #[test]
+    fn scan_carries_each_substitution_text() {
+        let subs = |command: &str| scan(command)[0].subs.clone();
+        assert_eq!(
+            subs("echo \"--- count: $(git rev-list --count 3e99082..HEAD)\""),
+            ["git rev-list --count 3e99082..HEAD"]
+        );
+        assert_eq!(
+            subs("echo `git log --oneline -1`"),
+            ["git log --oneline -1"]
+        );
+        assert_eq!(
+            subs("echo $(git log --oneline -1) $(git status --short)"),
+            ["git log --oneline -1", "git status --short"]
+        );
+        assert_eq!(
+            subs("echo $(git rev-list --count $(git rev-parse HEAD))"),
+            ["git rev-list --count $(git rev-parse HEAD)"]
+        );
+        assert_eq!(subs("echo hi > $(mktemp)"), ["mktemp"]);
+        assert_eq!(subs("echo $(cat"), ["cat"]);
+        assert!(subs("cat <(git log --oneline)").is_empty());
     }
 
     #[test]
