@@ -22,7 +22,7 @@ use aigentic_runtime::aigentic_policy::Participants;
 use aigentic_runtime::workflow::WorkflowFile;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
-use ulid::Ulid;
+use ulid::{Generator, Ulid};
 
 use crate::actor::{Mail, Mailbox, Reports, ThreadActor};
 use crate::auth;
@@ -97,6 +97,63 @@ pub struct Indexed {
 /// brief, which is worth caching too.
 type CachedBrief = (Option<SystemTime>, Option<String>);
 
+/// The daemon's thread ids, from one source per process.
+///
+/// Every id is greater than the one before it, so the greatest id in a
+/// base is the newest thread there — the rule `latest_front` and
+/// `front_root` judge by.
+pub struct Ids {
+    source: Mutex<Source>,
+}
+
+enum Source {
+    /// The clock through a monotone generator: within one millisecond the
+    /// random part counts up, so two ids made together still have an order.
+    Live(Generator),
+    /// Always `at`, with the random part counting from 1: a test pins the
+    /// millisecond with this so two threads land in one and still differ.
+    Fixed { at: u64, next: u64 },
+}
+
+impl Ids {
+    /// A source that reads the clock: what a daemon builds.
+    pub fn live() -> Self {
+        Self {
+            source: Mutex::new(Source::Live(Generator::new())),
+        }
+    }
+
+    /// A source frozen at `millisecond`, whose ids count up from 1.
+    pub fn fixed(millisecond: u64) -> Self {
+        Self {
+            source: Mutex::new(Source::Fixed {
+                at: millisecond,
+                next: 1,
+            }),
+        }
+    }
+
+    /// The next thread id: greater than every id this source gave out.
+    pub(crate) fn next(&self) -> Ulid {
+        let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
+        match &mut *source {
+            Source::Live(generator) => match generator.generate() {
+                Ok(id) => id,
+                // The 80-bit random part would have to wrap inside one
+                // millisecond (about 10^24 ids). The crate's recovery moves
+                // to the next millisecond, which is still greater than the
+                // id before it.
+                Err(overflow) => overflow.commit_overflow_random(),
+            },
+            Source::Fixed { at, next } => {
+                let id = Ulid::from_parts(*at, u128::from(*next));
+                *next += 1;
+                id
+            }
+        }
+    }
+}
+
 /// The table, shared by every session.
 pub struct ThreadTable {
     config: Arc<Config>,
@@ -119,6 +176,11 @@ pub struct ThreadTable {
     /// test can install a recording guard, as `with_run_deps` swaps the
     /// world's seams.
     guard: Mutex<Arc<dyn KeepAwake>>,
+    /// The source of every thread id this daemon makes, the person's
+    /// threads and a run's children alike. Swapped under a lock for the
+    /// same reason as the guard: a test pins the millisecond with
+    /// [`Ids::fixed`] and then drives the daemon through `Server::new`.
+    ids: Mutex<Arc<Ids>>,
     /// Which runs a task drives, and who watches them (issue #58). It
     /// hangs off the table because a session sees nothing but the table
     /// and the config.
@@ -279,6 +341,7 @@ impl ThreadTable {
             reports,
             threads_base,
             guard: Mutex::new(guard),
+            ids: Mutex::new(Arc::new(Ids::live())),
             runs: Arc::new(Runs::new()),
             run_deps: Mutex::new(Arc::new(ProdDeps)),
             brief_cache: Mutex::new(HashMap::new()),
@@ -303,6 +366,18 @@ impl ThreadTable {
     /// the guard it was built with.
     pub fn with_keep_awake(&self, guard: Arc<dyn KeepAwake>) {
         *self.guard.lock().unwrap_or_else(|e| e.into_inner()) = guard;
+    }
+
+    /// The source of the next thread id, as it stands now.
+    fn ids(&self) -> Arc<Ids> {
+        self.ids.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Install the thread id source every thread made from now on reads:
+    /// a test's [`Ids::fixed`], so two threads land in one millisecond.
+    /// A create that already took a source keeps it.
+    pub fn with_ids(&self, ids: Arc<Ids>) {
+        *self.ids.lock().unwrap_or_else(|e| e.into_inner()) = ids;
     }
 
     /// The run registry: which lead a task drives, and who watches it.
@@ -678,6 +753,9 @@ impl ThreadTable {
     /// another daemon wrote is found too — the greatest whose entry is
     /// `front` and whose creator is `user`. PLAN §2's `latest_for`
     /// becomes this, in its neighbours' shape: `Option`, not `Result`.
+    /// The greatest id is the newest thread because thread ids are made
+    /// by one strictly increasing source ([`Ids`]), so this order is the
+    /// order they were made in.
     pub fn latest_front(&self, user: &str) -> Option<Ulid> {
         self.known_ids()
             .into_iter()
@@ -975,7 +1053,7 @@ impl ThreadTable {
     ) -> Result<ThreadInfo, ThreadError> {
         let root = self.root_of(project)?;
         std::fs::create_dir_all(&root.threads_dir).map_err(BuildError::from)?;
-        let id = Ulid::generate();
+        let id = self.ids().next();
         // The creator, for the index and for the log (issue #81): only a
         // person counts, so a lead a build starts through `create` gets
         // none.
@@ -2066,9 +2144,10 @@ pub fn name_clashes(name: &str, root: &Path, workspaces: &[Workspace]) -> bool {
 /// Walks the flat directory and every legacy one, reads the first line
 /// of each log — a daemon-made log starts with `thread_started` — keeps
 /// the ones whose `thread_started` is a person's front thread, and takes
-/// the largest id. `None` when there is no front thread, when its
-/// project is `None`, or when it is the legacy `_none` a front thread
-/// can never have.
+/// the largest id. The largest is the newest because thread ids come
+/// from one strictly increasing source ([`Ids`]). `None` when there is
+/// no front thread, when its project is `None`, or when it is the
+/// legacy `_none` a front thread can never have.
 pub fn front_root(base: &Path, user: &str) -> Option<(String, PathBuf)> {
     let mut newest: Option<(Ulid, PathBuf)> = None;
     for path in log_files(base).into_iter().chain(
@@ -2506,5 +2585,15 @@ mod tests {
         assert!(at(lead_b) < at(child_b1));
         assert!(at(child_a2) < at(inner_lead));
         assert!(at(inner_lead) < at(inner_child));
+    }
+
+    /// Thread ids from one source come out in the order they were made,
+    /// so a base's greatest id is its newest thread — which front thread
+    /// resumes is decided by that order.
+    #[test]
+    fn ids_are_strictly_increasing() {
+        let ids = Ids::live();
+        let made: Vec<Ulid> = (0..1000).map(|_| ids.next()).collect();
+        assert!(made.windows(2).all(|w| w[1] > w[0]), "{made:?}");
     }
 }
