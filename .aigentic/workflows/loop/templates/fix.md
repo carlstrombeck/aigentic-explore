@@ -28,6 +28,8 @@ Each in its own bash call, nothing before or after it: `cargo fmt`, `cargo clipp
 
 Never `git reset`, `git checkout -- <file>`, `git stash`, `git clean`, `git add -A` or `git rebase`. Commit nothing under `.scratch/`; leave `.aigentic/rules.toml` alone.
 
+Search the repository with `git grep` or `rg`, never a bare `grep -r` from the root: it walks `target/`, tens of gigabytes, until the timeout kills it.
+
 ## Report
 
 End by calling `finish_step` once, with `status: done`, `commits`, `release_impact`, and `body` (the runner puts `## Fix` above it): one paragraph per review item, what changed, the tests' names and their without-the-fix failures, and the gate's totals. The runner posts it.
