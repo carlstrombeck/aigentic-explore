@@ -191,7 +191,9 @@ pub struct Step {
     pub budget: Option<f64>,
     #[serde(default)]
     pub wall_secs: Option<u64>,
-    /// The `finish_step` key this step routes on, e.g. `size`.
+    /// The `finish_step` key this step routes on, e.g. `size`; a `verdict`
+    /// branch also reads the report's top-level field when its slot is
+    /// absent.
     #[serde(default)]
     pub route_by: Option<String>,
     /// Route value to target: a step id, a named route, `done` or `ask`.

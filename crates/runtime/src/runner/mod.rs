@@ -28,7 +28,7 @@ use aigentic_log::{
     ChecksOutcome, ChecksRunPayload, CommitRef, LogError, NewEvent, NextMove, PushedPayload,
     ReleaseImpact, ReportStatus, RouteTakenPayload, RunFinishedPayload, RunOutcome,
     RunStartedPayload, RunState, StepFinishedPayload, StepReport, StepStartedPayload, StepStatus,
-    ThreadLog, TurnEndedPayload, run_state,
+    ThreadLog, TurnEndedPayload, Verdict, run_state,
 };
 use serde_json::Value;
 use ulid::Ulid;
@@ -683,15 +683,21 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 .and_then(|slots| slots.get(name))
                 .cloned()
         };
-        let Some(size) = slot(&branch).and_then(|v| v.as_str().map(str::to_owned)) else {
-            return self.escalate(
-                "route_escalate",
-                vec![
-                    step.id.clone(),
-                    attempt.to_string(),
-                    format!("the report has no `{branch}` slot"),
-                ],
-            );
+        let size = match slot(&branch).and_then(|v| v.as_str().map(str::to_owned)) {
+            Some(size) => size,
+            None => match verdict_route(&branch, report) {
+                Some(size) => size,
+                None => {
+                    return self.escalate(
+                        "route_escalate",
+                        vec![
+                            step.id.clone(),
+                            attempt.to_string(),
+                            missing_reason(&branch),
+                        ],
+                    );
+                }
+            },
         };
         let Some(taken) = step.routes.get(&size).cloned() else {
             return self.escalate(
@@ -1705,9 +1711,34 @@ fn budget_usd(value: &serde_json::Value) -> Option<f64> {
     text[..end].parse::<f64>().ok().filter(|n| n.is_finite())
 }
 
+/// The value a `verdict` branch routes on when the report has no `verdict`
+/// slot: `finish_step`'s schema spells the same fact as a top-level field
+/// (`approve`, `changes_needed`), the loop's routes on `approve` and
+/// `changes`. Only `verdict` has two spellings; every other branch reads its
+/// slot alone.
+fn verdict_route(branch: &str, report: &StepReport) -> Option<String> {
+    if branch != "verdict" {
+        return None;
+    }
+    match report.verdict? {
+        Verdict::Approve => Some("approve".to_owned()),
+        Verdict::ChangesNeeded => Some("changes".to_owned()),
+    }
+}
+
+/// What a `route_escalate` gate tells the person is missing; a `verdict`
+/// branch looks for two spellings, so its message names both.
+fn missing_reason(branch: &str) -> String {
+    let mut reason = format!("the report has no `{branch}` slot");
+    if branch == "verdict" {
+        reason.push_str(&format!(" and no `{branch}` field"));
+    }
+    reason
+}
+
 #[cfg(test)]
 mod tests {
-    use super::budget_usd;
+    use super::{StepReport, Verdict, budget_usd, verdict_route};
     use serde_json::json;
 
     #[test]
@@ -1722,5 +1753,24 @@ mod tests {
         assert_eq!(budget_usd(&json!("USD 3")), None);
         assert_eq!(budget_usd(&json!("")), None);
         assert_eq!(budget_usd(&json!(null)), None);
+    }
+
+    /// Only a `verdict` branch reads the report's top-level field, and only
+    /// the enum's two values map.
+    #[test]
+    fn only_the_verdict_branch_reads_the_verdict_field() {
+        for (verdict, expected) in [
+            (Verdict::Approve, "approve"),
+            (Verdict::ChangesNeeded, "changes"),
+        ] {
+            let report = StepReport {
+                verdict: Some(verdict),
+                ..Default::default()
+            };
+            assert_eq!(verdict_route("verdict", &report).as_deref(), Some(expected));
+            assert_eq!(verdict_route("size", &report), None);
+            assert_eq!(verdict_route("fix", &report), None);
+        }
+        assert_eq!(verdict_route("verdict", &StepReport::default()), None);
     }
 }

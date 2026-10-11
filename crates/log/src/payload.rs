@@ -643,8 +643,7 @@ pub enum CheckResult {
 }
 
 /// The judge's verdict (§6.5). What to do about `changes_needed` is
-/// [`FixSize`], a separate field: `fix is the judge's field`, and a
-/// verdict is not a route.
+/// [`FixSize`], a separate field: `fix is the judge's field`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {

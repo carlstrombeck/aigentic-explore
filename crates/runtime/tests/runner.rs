@@ -3814,12 +3814,107 @@ fn loop_files() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// A one-step workflow whose step routes on `size`: the fallback is for
+/// `verdict` alone, so a missing `size` slot still escalates.
+const SIZE_TOML: &str = r###"
+name = "size-test"
+version = 1
+
+[budget]
+trivial = 3.0
+full = 10.0
+max_raise = 2.0
+
+[[slots]]
+name = "issue"
+kind = "string"
+filled_by = "runner"
+
+[[steps]]
+id = "sizer"
+role = "sizer"
+profile = "flash"
+template = "templates/sizer.md"
+marker = "## Size"
+route_by = "size"
+routes = { trivial = "ask", full = "ask" }
+"###;
+
+fn size_files() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("workflow.toml", SIZE_TOML),
+        ("templates/sizer.md", "size issue {{issue}}\n"),
+    ]
+}
+
+/// The same one-step shape with a `verdict` branch that routes `approve`
+/// only, so the mapped `changes` word names no route.
+const VERDICT_ONLY_TOML: &str = r###"
+name = "verdict-only-test"
+version = 1
+
+[budget]
+trivial = 3.0
+full = 10.0
+max_raise = 2.0
+
+[[slots]]
+name = "issue"
+kind = "string"
+filled_by = "runner"
+
+[[steps]]
+id = "judge"
+role = "judge"
+profile = "flash"
+template = "templates/judge.md"
+marker = "## Review"
+route_by = "verdict"
+routes = { approve = "done" }
+"###;
+
+fn verdict_only_files() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("workflow.toml", VERDICT_ONLY_TOML),
+        ("templates/judge.md", "judge issue {{issue}}\n"),
+    ]
+}
+
+/// One step of the fixture's workflow, by id.
+fn step_named(fx: &Fixture, id: &str) -> aigentic_runtime::workflow::Step {
+    fx.workflow
+        .workflow
+        .steps
+        .iter()
+        .find(|step| step.id == id)
+        .unwrap_or_else(|| panic!("the fixture's workflow has a `{id}` step"))
+        .clone()
+}
+
 /// A report with a body under `marker` and the given slots.
 fn reported(marker: &str, slots: Value) -> Value {
     json!({
         "status": "done",
         "body": format!("{marker}\n\nwhat this step found"),
         "slots": slots,
+        "release_impact": "patch",
+    })
+}
+
+/// The same report with `verdict` set as `finish_step`'s top-level field.
+fn with_field(mut args: Value, verdict: &str) -> Value {
+    args["verdict"] = json!(verdict);
+    args
+}
+
+/// A report carrying `verdict` as its top-level field and no `slots` key at
+/// all: the shape a judge wrote when a finished, approved run ended
+/// `stopped`.
+fn verdict_report(marker: &str, verdict: &str) -> Value {
+    json!({
+        "status": "done",
+        "body": format!("{marker}\n\nwhat this step found"),
+        "verdict": verdict,
         "release_impact": "patch",
     })
 }
@@ -3831,7 +3926,9 @@ struct Looped {
     judge: Ulid,
 }
 
-fn looped(verdict: &str) -> Looped {
+/// The loop fixture whose judge reports `judge_args`, whatever shape the
+/// verdict comes in.
+fn looped_report(judge_args: Value) -> Looped {
     let check = Ulid::generate();
     let implement = Ulid::generate();
     let judge = Ulid::generate();
@@ -3842,13 +3939,7 @@ fn looped(verdict: &str) -> Looped {
                 implement,
                 vec![report("i1", reported("## Implementation", json!({})))],
             ),
-            (
-                judge,
-                vec![report(
-                    "j1",
-                    reported("## Review", json!({ "verdict": verdict })),
-                )],
-            ),
+            (judge, vec![report("j1", judge_args)]),
         ],
         &loop_files(),
     );
@@ -3858,6 +3949,11 @@ fn looped(verdict: &str) -> Looped {
         implement,
         judge,
     }
+}
+
+/// The same world with the verdict as a `slots.verdict` entry.
+fn looped(verdict: &str) -> Looped {
+    looped_report(reported("## Review", json!({ "verdict": verdict })))
 }
 
 fn steve() -> Author {
@@ -4016,6 +4112,227 @@ async fn a_judge_that_wants_changes_asks() {
         Advanced::WaitingHuman {
             gate: "route".into()
         }
+    );
+}
+
+/// A judge whose verdict is only `finish_step`'s top-level field still
+/// approves: the run it was written by ended `stopped` while the report
+/// said `approve`, because the runner read the slot alone.
+#[tokio::test]
+async fn a_report_with_the_verdict_only_at_the_top_level_approves() {
+    let l = looped_report(verdict_report("## Review", "approve"));
+    let fx = &l.fx;
+    let mut runner = fx.runner();
+    drive(fx, &mut runner).await;
+    runner
+        .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+        .unwrap();
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        }
+    );
+    // The fixture's own route is the expectation, not a typed word.
+    let judge = step_named(fx, "judge");
+    let branch = judge.route_by.as_deref().expect("the judge has a branch");
+    let word = serde_json::to_value(aigentic_log::Verdict::Approve)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let taken = judge
+        .routes
+        .get(&word)
+        .expect("the fixture's judge routes the approve word");
+    let lead = fx.lead_events();
+    let last = routes(&lead).pop().expect("the judge took a route");
+    assert_eq!(last.branch, branch);
+    assert_eq!(last.proposed, word);
+    assert_eq!(&last.taken, taken);
+    assert_eq!(gate(&lead), None);
+}
+
+/// A top-level `changes_needed` reaches the fixture's `changes` route and
+/// opens the route gate, the move a person can answer.
+#[tokio::test]
+async fn a_top_level_changes_needed_reaches_the_changes_route() {
+    let l = looped_report(verdict_report("## Review", "changes_needed"));
+    let fx = &l.fx;
+    let mut runner = fx.runner();
+    drive(fx, &mut runner).await;
+    runner
+        .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+        .unwrap();
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "route".into()
+        }
+    );
+    let judge = step_named(fx, "judge");
+    let branch = judge.route_by.as_deref().expect("the judge has a branch");
+    // The mapped word is the issue's rule, so the judge found `changes`.
+    let taken = judge
+        .routes
+        .get("changes")
+        .expect("the fixture's judge routes the changes word");
+    let lead = fx.lead_events();
+    let judge_routes: Vec<_> = routes(&lead)
+        .into_iter()
+        .filter(|route| route.branch == branch)
+        .collect();
+    assert_eq!(judge_routes.len(), 1, "the judge routed once");
+    assert_eq!(judge_routes[0].proposed, "changes");
+    assert_eq!(&judge_routes[0].taken, taken);
+    assert_eq!(gate(&lead), Some("route".to_owned()));
+}
+
+/// The slot wins when both spellings are present, and a non-string slot is
+/// no value at all: three worlds, one test.
+#[tokio::test]
+async fn a_verdict_slot_wins_over_the_top_level_field() {
+    use aigentic_log::RunOutcome;
+    let cases = [
+        (
+            with_field(
+                reported("## Review", json!({ "verdict": "changes" })),
+                "approve",
+            ),
+            true,
+            "changes",
+        ),
+        (
+            with_field(
+                reported("## Review", json!({ "verdict": "approve" })),
+                "changes_needed",
+            ),
+            false,
+            "approve",
+        ),
+        (
+            with_field(reported("## Review", json!({ "verdict": true })), "approve"),
+            false,
+            "approve",
+        ),
+    ];
+    for (args, waits, proposed) in cases {
+        let l = looped_report(args);
+        let fx = &l.fx;
+        let mut runner = fx.runner();
+        drive(fx, &mut runner).await;
+        runner
+            .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+            .unwrap();
+        let advanced = drive(fx, &mut runner).await;
+        if waits {
+            assert_eq!(
+                advanced,
+                Advanced::WaitingHuman {
+                    gate: "route".into()
+                }
+            );
+        } else {
+            assert_eq!(
+                advanced,
+                Advanced::Finished {
+                    outcome: RunOutcome::Closed
+                }
+            );
+        }
+        let last = routes(&fx.lead_events())
+            .pop()
+            .expect("the judge took a route");
+        assert_eq!(last.proposed, proposed);
+    }
+}
+
+/// A branch whose slot is missing still escalates, and the gate names the
+/// branch: the fallback is for `verdict` alone.
+#[tokio::test]
+async fn a_missing_size_slot_still_escalates() {
+    let sizer = Ulid::generate();
+    let fx = Fixture::with_workflow(
+        vec![(sizer, vec![report("s1", reported("## Size", json!({})))])],
+        &size_files(),
+    );
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "route_escalate".into()
+        }
+    );
+    let step = step_named(&fx, "sizer");
+    let branch = step.route_by.as_deref().expect("the step has a branch");
+    let lead = fx.lead_events();
+    assert!(
+        routes(&lead).iter().all(|route| route.branch != branch),
+        "the sizer took no route"
+    );
+    let shown = gate_shown(&lead);
+    assert_eq!(shown[0], step.id);
+    assert_eq!(shown[2], format!("the report has no `{branch}` slot"));
+}
+
+/// A `verdict` step with neither spelling escalates, and its gate names
+/// both places it looked.
+#[tokio::test]
+async fn a_verdict_step_with_neither_spelling_escalates() {
+    let l = looped_report(reported("## Review", json!({})));
+    let fx = &l.fx;
+    let mut runner = fx.runner();
+    drive(fx, &mut runner).await;
+    runner
+        .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+        .unwrap();
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "route_escalate".into()
+        }
+    );
+    let step = step_named(fx, "judge");
+    let branch = step.route_by.as_deref().expect("the judge has a branch");
+    let lead = fx.lead_events();
+    assert!(
+        routes(&lead).iter().all(|route| route.branch != branch),
+        "the judge took no route"
+    );
+    assert_eq!(
+        gate_shown(&lead)[2],
+        format!("the report has no `{branch}` slot and no `{branch}` field")
+    );
+}
+
+/// A verdict naming no route still escalates, and the gate names the value.
+#[tokio::test]
+async fn a_verdict_naming_no_route_still_escalates() {
+    let judge = Ulid::generate();
+    let fx = Fixture::with_workflow(
+        vec![(
+            judge,
+            vec![report("j1", verdict_report("## Review", "changes_needed"))],
+        )],
+        &verdict_only_files(),
+    );
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "route_escalate".into()
+        }
+    );
+    let step = step_named(&fx, "judge");
+    let branch = step.route_by.as_deref().expect("the step has a branch");
+    let lead = fx.lead_events();
+    assert!(
+        routes(&lead).iter().all(|route| route.branch != branch),
+        "the judge took no route"
+    );
+    assert_eq!(
+        gate_shown(&lead)[2],
+        format!("`{branch} = changes` names no route")
     );
 }
 
