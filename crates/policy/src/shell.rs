@@ -956,6 +956,11 @@ pub struct ScanSegment {
     /// in one of its words — rather than only from its redirections.
     /// `false` on a segment that does not write at all.
     pub write_from_command: bool,
+    /// Whether a `|` feeds this segment from the previous one (not
+    /// `&&`, `;` or `||`): the segment reads the line before it, so
+    /// what that line printed left through a pipe rather than landing
+    /// in the log.
+    pub piped: bool,
 }
 
 /// Split a command line into segments and classify each one, against
@@ -987,6 +992,7 @@ pub fn scan(command: &str) -> Vec<ScanSegment> {
                     .collect(),
                 kind: class.kind,
                 write_from_command: class.write_from_command,
+                piped: seg.piped,
             }
         })
         .collect()
@@ -1520,6 +1526,27 @@ mod tests {
         assert_eq!(scan("echo x > 1")[0].redirects, vec!["1"]);
         assert_eq!(scan("echo x 2>1")[0].redirects, vec!["1"]);
         assert!(scan("echo x >&2")[0].redirects.is_empty());
+    }
+
+    /// E7 asks whether a pipe carried a run's output away, so `piped`
+    /// has to sit on the segment the pipe feeds, not on the one before
+    /// it — the wrong side would name the `cargo test` line as a filter.
+    #[test]
+    fn the_scan_marks_the_segment_a_pipe_feeds() {
+        let piped = scan("cargo test -p aigentic-runtime the_scan 2>&1 | grep -E x");
+        assert_eq!(piped.len(), 2);
+        assert_eq!(piped[1].words, vec!["grep", "-E", "x"]);
+        assert_eq!(
+            piped.iter().map(|s| s.piped).collect::<Vec<_>>(),
+            vec![false, true]
+        );
+
+        // A `;` and a redirection are not a pipe.
+        let split = scan("cargo test x > /tmp/o; echo done");
+        assert_eq!(
+            split.iter().map(|s| s.piped).collect::<Vec<_>>(),
+            vec![false, false]
+        );
     }
 
     /// The `bash` row's text (issue #21): the segment that carries the
