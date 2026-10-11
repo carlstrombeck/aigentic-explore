@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use aigentic_api::client::{Addr, Client};
 use aigentic_api::{
@@ -27,6 +27,7 @@ use aigentic_server::awake::KeepAwake;
 use aigentic_server::build::{BuildError, ProviderFactory};
 use aigentic_server::config::{Config, ProjectConfig, ServerConfig, UserConfig};
 use aigentic_server::runs::ServerHost;
+use aigentic_server::threads::Ids;
 use aigentic_server::{Listener, NoReports, Server};
 use futures_core::Stream;
 use serde_json::to_value;
@@ -365,6 +366,10 @@ fn events_of(base: &Path, id: Ulid) -> Vec<aigentic_runtime::aigentic_core::Even
     ThreadLog::open(base, id).unwrap().read_all().unwrap()
 }
 
+/// How far an id's timestamp may sit from a clock read around the call
+/// that made it, so a slow machine or a clock step cannot flake it.
+const CLOCK_SLACK_MS: u64 = 1_000;
+
 /// `id`'s `thread_started` payload.
 fn front_of(base: &Path, id: Ulid) -> ThreadStartedPayload {
     let events = events_of(base, id);
@@ -567,6 +572,10 @@ async fn t4_the_first_front_thread_is_made_and_then_resumed() {
     let daemon = Daemon::new(dir.path(), vec![pc("p", &p)], &["steve"], false).await;
     let mut steve = daemon.connect("steve").await;
 
+    let before_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let (made, outcome) = front(&mut steve, "p").await;
     assert_eq!(outcome, FrontOutcome::First);
     let payload = front_of(daemon.base(), made);
@@ -577,6 +586,32 @@ async fn t4_the_first_front_thread_is_made_and_then_resumed() {
     let (again, outcome) = front(&mut steve, "p").await;
     assert_eq!(outcome, FrontOutcome::Resumed);
     assert_eq!(again, made);
+
+    let after_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(
+        made.timestamp_ms() >= before_ms.saturating_sub(CLOCK_SLACK_MS)
+            && made.timestamp_ms() <= after_ms.saturating_add(CLOCK_SLACK_MS),
+        "a thread's id names the clock: {made}"
+    );
+    let Response::Thread { thread: second } = steve
+        .request(Request::NewFront {
+            project: "p".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("a new thread")
+    };
+    assert!(second.id > made, "a later id is greater: {second:?}");
+    let (resumed, outcome_after) = front(&mut steve, "p").await;
+    assert_eq!(outcome_after, FrontOutcome::Resumed);
+    assert_eq!(
+        resumed, second.id,
+        "the greater id is the newest front thread"
+    );
 }
 
 /// T5 — the front thread survives a daemon restart: its record is in the
@@ -608,6 +643,12 @@ async fn t6_new_front_makes_a_second_front_thread_the_front_now_resumes() {
     let daemon = Daemon::new(dir.path(), vec![pc("p", &p)], &["steve"], false).await;
     let mut steve = daemon.connect("steve").await;
 
+    let millisecond = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    daemon.threads().with_ids(Arc::new(Ids::fixed(millisecond)));
+
     let (old, _) = front(&mut steve, "p").await;
     let Response::Thread { thread: new } = steve
         .request(Request::NewFront {
@@ -619,6 +660,12 @@ async fn t6_new_front_makes_a_second_front_thread_the_front_now_resumes() {
         panic!("a new thread")
     };
     assert_ne!(new.id, old);
+    assert_eq!(
+        old.timestamp_ms(),
+        millisecond,
+        "the old one is in the forced millisecond"
+    );
+    assert_eq!(new.id.timestamp_ms(), millisecond, "and the new one is too");
     assert!(front_of(daemon.base(), new.id).front);
 
     let (resumed, outcome) = front(&mut steve, "p").await;
