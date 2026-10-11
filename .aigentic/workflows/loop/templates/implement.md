@@ -44,7 +44,7 @@ A single named test must report at least `1 passed`. A test or probe that runs p
 
 Never `git reset`, `git checkout -- <file>`, `git stash`, `git clean`, `git add -A` or `git rebase`. Commit nothing under `.scratch/`, and leave `.aigentic/rules.toml` alone.
 
-Search the repository with `git grep` or `rg`, never a bare `grep -r` from the root: it walks `target/`, tens of gigabytes, until the timeout kills it.
+Search the repository with `rg`, never a bare `grep -r` from the root: it walks `target/`, tens of gigabytes, until the timeout kills it.
 
 ## Report
 

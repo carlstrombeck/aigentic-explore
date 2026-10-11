@@ -24,8 +24,8 @@ steps run on the `flash` profile.
 
 A trivial change (a one-line fix, a docs edit) skips 3, 4 and 6.
 
-**Searching the repository, in every step:** use `git grep` or `rg`, which
-skip what `.gitignore` names. Never run a bare `grep -r` from the repository
+**Searching the repository, in every step:** use `rg`, which skips what
+`.gitignore` names and is a read-only command to the checks. Never run a bare `grep -r` from the repository
 root: it walks `target/`, which is tens of gigabytes, and runs until the bash
 timeout kills it.
 
