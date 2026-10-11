@@ -861,6 +861,68 @@ fn e7_fails_when_the_output_never_came_back() {
     assert!(got.contains("output not in the log (redirected)"), "{got}");
 }
 
+/// T2: the #139 shape — the line pipes its output to a filter, so the
+/// detail names the filter and the command to repeat, unpiped, and says
+/// why the plain run's output is not there.
+#[test]
+fn e7_names_the_command_for_a_piped_run() {
+    const FILTER: &str = "the_scan_keeps";
+    // The line #139's gate ran: the filter, and the output piped to the
+    // very grep that then holds the only copy of it.
+    let piped = format!(
+        r#"cargo test -p aigentic-tui --bin aigentic {FILTER} 2>&1 | grep -E "{FILTER}|test result""#
+    );
+    let unpiped = piped.split_once(" 2>&1").expect("the redirect").0;
+
+    let mut log = Log::new();
+    let call = log.bash(1, &piped);
+    log.ok(2, &call, FILTER);
+    let got = verdict_of(&log.take(), "E7").expect_err("grep's output");
+    assert!(got.contains(FILTER), "{got}");
+    assert!(got.contains("(piped)"), "{got}");
+    assert!(
+        got.contains(&format!(
+            "run `{unpiped}` again, unpiped: the line piped its output to grep"
+        )),
+        "{got}"
+    );
+}
+
+/// T3: a redirection hides the run's output too, so the detail names the
+/// redirect to drop rather than telling the writer to add the line back.
+#[test]
+fn e7_names_the_command_for_a_redirected_run() {
+    const REDIRECT: &str = "/tmp/141-e7.log";
+
+    let mut log = Log::new();
+    let call = log.bash(
+        1,
+        &format!("cargo test -p aigentic-policy --lib the_scan_keeps > {REDIRECT} 2>&1"),
+    );
+    log.ok(2, &call, "");
+    let got = verdict_of(&log.take(), "E7").expect_err("no output");
+    assert!(got.contains("(redirected)"), "{got}");
+    assert!(
+        got.contains(&format!(
+            "without the redirect: the line redirected its output to {REDIRECT}"
+        )),
+        "{got}"
+    );
+}
+
+/// T4: nothing cut the line's output, so E7 keeps its own wording and
+/// invents no command to repeat.
+#[test]
+fn e7_says_only_that_the_output_is_missing_when_nothing_cut_it() {
+    const NAME: &str = "the_scan_keeps";
+
+    let mut log = Log::new();
+    let call = log.bash(1, &format!("cargo test -p aigentic-policy --lib {NAME}"));
+    log.ok(2, &call, "");
+    let got = verdict_of(&log.take(), "E7").expect_err("no output");
+    assert_eq!(got, format!("\"{NAME}\": output not in the log"));
+}
+
 /// T13: #34's fixture (`01M3KD9HZXX1YX7SFRRR5N6Y80`) is a named run whose
 /// output says `running 0 tests`; one `passed` in the same line is the
 /// healthy variant. A later run of the same name supersedes an earlier

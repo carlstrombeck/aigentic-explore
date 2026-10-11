@@ -382,27 +382,51 @@ fn e5_full_suites(input: &CheckInput<'_>) -> Result<(), String> {
 /// unless a later run of the same filter says otherwise.
 fn e7_named_runs(input: &CheckInput<'_>) -> Result<(), String> {
     let calls = calls(input.events);
-    let mut latest: HashMap<String, usize> = HashMap::new();
+    let mut latest: HashMap<String, (usize, ScanSegment, Option<Cut>)> = HashMap::new();
     for (index, call) in calls.iter().enumerate() {
-        let Some(name) = call.command().and_then(named_run) else {
+        let Some(command) = call.command() else {
             continue;
         };
-        latest.insert(name, index);
+        let Some(name) = named_run(command) else {
+            continue;
+        };
+        let Some((segments, at)) = named_run_segment(command) else {
+            continue;
+        };
+        let cut = cut_of(&segments, at);
+        latest.insert(name, (index, segments[at].clone(), cut));
     }
     // The key is the name filter alone: a later run of the same filter
     // under another target selection (`--lib x`, then `--test t x`)
     // supersedes the earlier one. That is intended: the name did run and
     // pass in the end (#56's second review).
     // In the log's order, so the detail names the earliest name at fault.
-    let mut judged: Vec<(usize, &String)> = latest.iter().map(|(name, at)| (*at, name)).collect();
+    let mut judged: Vec<(usize, &String)> = latest
+        .iter()
+        .map(|(name, (at, _, _))| (*at, name))
+        .collect();
     judged.sort_by_key(|(at, _)| *at);
     for (index, name) in judged {
+        let (_, segment, cut) = &latest[name];
         let call = &calls[index];
+        // Only a run the line redirected or piped gets the reason's
+        // parenthesis and the rerun clause: with no cut to name, the
+        // check says only that the output is missing (a wrong claim
+        // would send the implementer after the wrong thing).
+        let missing = match cut {
+            Some(Cut::Piped(_)) => "output not in the log (piped)",
+            Some(Cut::Redirected(_)) => "output not in the log (redirected)",
+            None => "output not in the log",
+        };
+        let clause = cut
+            .as_ref()
+            .map(|cut| cut.rerun_clause(&segment.text))
+            .unwrap_or_default();
         let Some(answer) = &call.answer else {
-            return Err(format!("{name:?}: output not in the log (redirected)"));
+            return Err(format!("{name:?}: {missing}{clause}"));
         };
         if !answer.content.contains("test result:") {
-            return Err(format!("{name:?}: output not in the log (redirected)"));
+            return Err(format!("{name:?}: {missing}{clause}"));
         }
         if passed_count(&answer.content) == 0 {
             let failed = failed_count(&answer.content);
@@ -597,11 +621,68 @@ fn selects_a_target(flag: &str) -> bool {
     )
 }
 
-/// The test name a `cargo test` call filters on, when it names one. A
-/// call with `--list` runs nothing, so it names none (`## Plan
-/// amendment 2` item 4).
+/// The test name a `cargo test` call filters on, when it names one: the
+/// first segment that names a filter, over the same walk `named_run_segment`
+/// gives a caller that also needs that segment. A call with `--list` runs
+/// nothing, so it names none.
 fn named_run(command: &str) -> Option<String> {
-    scan(command).iter().find_map(cargo_test_args)?.name
+    let (segments, index) = named_run_segment(command)?;
+    cargo_test_args(&segments[index])?.name
+}
+
+/// The test name a `cargo test` call filters on, when it names one, with
+/// the scan it was found in and the index of the segment that named it: a
+/// caller that also needs to know what happened to that segment's output
+/// reads the same walk rather than scanning twice. A call with `--list`
+/// runs nothing, so it names none.
+fn named_run_segment(command: &str) -> Option<(Vec<ScanSegment>, usize)> {
+    let segments = scan(behind_a_leading_cd(command));
+    let index = segments
+        .iter()
+        .position(|segment| cargo_test_args(segment).is_some_and(|args| args.name.is_some()))?;
+    Some((segments, index))
+}
+
+/// What took a named run's output before the log saw it. Both are facts
+/// of the parsed line — a redirect target is a path, and a fed segment is
+/// a segment of the same scan — so neither can be forged by text inside a
+/// quoted argument.
+enum Cut {
+    /// A `|` fed the output to a filter (`grep`, `tail`, `awk`).
+    Piped(String),
+    /// A redirection sent the output to a file.
+    Redirected(String),
+}
+
+impl Cut {
+    /// The clause a failure appends after the reason: the command to
+    /// repeat, ready to paste, and what to leave off this time.
+    fn rerun_clause(&self, command: &str) -> String {
+        let how = match self {
+            Cut::Piped(program) => {
+                format!("unpiped: the line piped its output to {program}")
+            }
+            Cut::Redirected(target) => {
+                format!("without the redirect: the line redirected its output to {target}")
+            }
+        };
+        format!("; run `{command}` again, {how}")
+    }
+}
+
+/// What cut the naming segment's output, when the line shows a cut: a
+/// redirect on the segment itself first, else a pipe into the next
+/// segment. `None` when the line neither redirected nor piped, so the
+/// check claims nothing about a run whose output simply went missing.
+fn cut_of(segments: &[ScanSegment], index: usize) -> Option<Cut> {
+    if let Some(target) = segments[index].redirects.first() {
+        return Some(Cut::Redirected(target.clone()));
+    }
+    let next = segments.get(index + 1)?;
+    if next.piped {
+        return Some(Cut::Piped(next.words.first()?.clone()));
+    }
+    None
 }
 
 /// Does this flag take the next word as its value? Every option of
