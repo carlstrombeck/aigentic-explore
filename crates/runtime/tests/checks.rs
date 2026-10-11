@@ -74,6 +74,10 @@ fn trailer(model: &str) -> String {
 const PROFILE_MODEL: &str = "deepseek/deepseek-v4.1-flash";
 const TRAILER_MODEL: &str = "deepseek-v4.1-flash";
 
+/// This repository's root, the root every `CheckInput` here reads a path
+/// against.
+const REPO: &str = "/Users/steve/Projects/aigentic";
+
 fn input<'a>(
     commits: &'a [ObservedCommit],
     named_subjects: &'a [String],
@@ -96,6 +100,7 @@ fn input_with<'a>(
         named_subjects,
         model: PROFILE_MODEL,
         uncommitted,
+        root: Path::new(REPO),
     }
 }
 
@@ -611,7 +616,7 @@ fn e4_edit_table_row_by_row() {
         ("echo x >&2", false),
     ];
     for (command, wanted) in rows {
-        assert_eq!(is_an_edit(command), wanted, "{command}");
+        assert_eq!(is_an_edit(command, Path::new(REPO)), wanted, "{command}");
     }
 
     // And the row the gate turns on, through E4: an edit between the
@@ -660,13 +665,14 @@ fn t10_e4_a_temp_path_write_is_not_an_edit() {
         ),
         ("cp /tmp/x.rs crates/runtime/src/lib.rs > /tmp/d", true),
     ] {
-        assert_eq!(is_an_edit(command), wanted, "{command}");
+        assert_eq!(is_an_edit(command, Path::new(REPO)), wanted, "{command}");
     }
 
     // And through E4, the tool calls: a gate whose child writes to a temp
     // path passes, and one that touches a repo file between the steps
-    // fails. The paths are the rows `to_temp` turns on: temp itself, a
-    // temp path that climbs out with `..`, and a call that names none.
+    // fails. The paths are the rows the outside-repo rule turns on: a
+    // path outside the repo, one that climbs out with `..` into it, and a
+    // call that names none.
     for (name, args, is_edit) in [
         (
             "write_file",
@@ -711,6 +717,93 @@ fn t10_e4_a_temp_path_write_is_not_an_edit() {
             assert!(detail.contains("edit between"), "{name}: {detail}");
         } else {
             assert_eq!(got, Ok(()), "{name} writes outside the repo");
+        }
+    }
+}
+
+/// T5: a cleanup the run itself did outside the repo root is not an edit,
+/// and one that lands in the repo is.
+#[test]
+fn e4_reads_a_cleanup_by_where_it_lands() {
+    let mut log = Log::new();
+    healthy_gate(&mut log, false);
+    let cleanup = log.bash(7, "rm -f /tmp/base-runs.rs /tmp/140-restore-comments.py");
+    log.ok(8, &cleanup, "");
+    assert_eq!(verdict_of(&log.take(), "E4"), Ok(()));
+
+    let mut log = Log::new();
+    healthy_gate(&mut log, false);
+    let edit = log.bash(7, "rm -f crates/runtime/src/new.rs");
+    log.ok(8, &edit, "");
+    let got = verdict_of(&log.take(), "E4").expect_err("a repo path");
+    assert!(got.contains("edit after the gate"), "{got}");
+}
+
+/// T6: the edges of the outside-the-repo boundary — a sibling directory
+/// of the root is not under it, a `..` is never outside, and rows through
+/// `is_an_edit` keep the whole command an edit when one segment writes
+/// into the repo.
+#[test]
+fn e4_edge_rows_of_the_outside_the_repo_boundary() {
+    use aigentic_runtime::checks::{is_an_edit, outside_the_repo};
+
+    assert!(outside_the_repo(
+        "/Users/steve/Projects/aigentic-2/x.rs",
+        Path::new(REPO)
+    ));
+    assert!(!outside_the_repo(
+        "/tmp/../Users/steve/Projects/aigentic/src/lib.rs",
+        Path::new(REPO)
+    ));
+    assert!(!outside_the_repo(
+        "crates/runtime/src/lib.rs",
+        Path::new(REPO)
+    ));
+
+    for (command, wanted) in [
+        ("git checkout main", true),
+        ("git reset --hard", true),
+        ("python3 /tmp/cleanup.py", true),
+        ("cp /tmp/a.rs crates/runtime/src/lib.rs > /tmp/d", true),
+        (
+            "touch /tmp/../Users/steve/Projects/aigentic/src/lib.rs",
+            true,
+        ),
+        ("rm -rf /tmp/scratch", false),
+        ("mkdir -p /tmp/x && touch /tmp/x/y", false),
+        ("cp /tmp/a /tmp/b", false),
+        ("rm -f /Users/steve/Projects/aigentic-2/x.rs", false),
+        ("cp /tmp/a crates/runtime/src/lib.rs 2>&1", true),
+    ] {
+        assert_eq!(is_an_edit(command, Path::new(REPO)), wanted, "{command}");
+    }
+}
+
+/// T7: an `edit_file` or `write_file` is read by where its path lands: a
+/// path outside the root is not an edit, a repo path and a call that
+/// names no path are.
+#[test]
+fn e4_reads_the_tools_writes_by_where_they_land() {
+    for (path, is_edit) in [
+        (Some("/tmp/scaffold/x.rs"), false),
+        (Some("/Users/steve/Projects/aigentic-2/x.rs"), false),
+        (Some("crates/runtime/src/x.rs"), true),
+        (None, true),
+    ] {
+        let mut log = Log::new();
+        healthy_gate(&mut log, false);
+        let args = match path {
+            Some(path) => json!({"path": path, "content": "x"}),
+            None => json!({"content": "x"}),
+        };
+        let call = log.call(7, "edit_file", args);
+        log.ok(8, &call, "wrote");
+        let got = verdict_of(&log.take(), "E4");
+        if is_edit {
+            let detail = got.expect_err("an edit after the gate");
+            assert!(detail.contains("edit after the gate"), "{path:?}: {detail}");
+        } else {
+            assert_eq!(got, Ok(()), "{path:?} writes outside the repo");
         }
     }
 }

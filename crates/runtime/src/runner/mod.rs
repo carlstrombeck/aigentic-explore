@@ -828,6 +828,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             named_subjects: &named,
             model: &model,
             uncommitted: &uncommitted,
+            root: self.repo.root(),
         };
         let checks = match run_checks(&step.checks, &input) {
             Ok(checks) => checks,

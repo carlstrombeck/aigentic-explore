@@ -81,6 +81,9 @@ pub struct CheckInput<'a> {
     /// Tracked paths git reports modified at check time, untracked files
     /// excluded: the tested tree must be the committed tree (E4).
     pub uncommitted: &'a [String],
+    /// The repo root a path is read against: E4 calls a write outside it
+    /// no edit, since it cannot have touched the tested tree.
+    pub root: &'a Path,
 }
 
 /// A check id the dispatcher does not have.
@@ -226,15 +229,19 @@ impl Call {
     }
 
     /// The E4 edit table: `edit_file` and `write_file` write, a bash call
-    /// writes when any of its segments does. A file write to a temp path
-    /// is not an edit: the gate writes its log to `/tmp` (#65), and a
-    /// scratch file outside the repo changes nothing the gate checked.
-    /// A missing path stays an edit: it names nothing that is provably
-    /// outside the repo.
-    fn is_edit(&self) -> bool {
+    /// writes when any of its segments does. A file write to a path
+    /// outside the repo root is not an edit: the gate writes its log to
+    /// `/tmp`, and a scratch file outside the repo changes nothing the
+    /// gate checked. A missing path stays an edit: it names nothing that
+    /// is provably outside the repo, and neither does a relative one.
+    fn is_edit(&self, root: &Path) -> bool {
         match self.name.as_str() {
-            "edit_file" | "write_file" => !self.path().is_some_and(to_temp),
-            "bash" => self.command().is_some_and(is_an_edit),
+            "edit_file" | "write_file" => {
+                !self.path().is_some_and(|path| outside_the_repo(path, root))
+            }
+            "bash" => self
+                .command()
+                .is_some_and(|command| is_an_edit(command, root)),
             _ => false,
         }
     }
@@ -310,7 +317,7 @@ fn e4_gate(input: &CheckInput<'_>) -> Result<(), String> {
     // the formatted tree, so `cargo fmt` itself is not an edit here.
     if let Some(edit) = calls
         .iter()
-        .find(|call| call.is_edit() && call.seq > format.seq && call.seq < suite.seq)
+        .find(|call| call.is_edit(input.root) && call.seq > format.seq && call.seq < suite.seq)
     {
         return Err(format!(
             "edit between the gate's `cargo fmt` and its `cargo test`: {} (seq {})",
@@ -320,7 +327,7 @@ fn e4_gate(input: &CheckInput<'_>) -> Result<(), String> {
     }
     if let Some(edit) = calls
         .iter()
-        .find(|call| call.is_edit() && call.seq > suite.seq)
+        .find(|call| call.is_edit(input.root) && call.seq > suite.seq)
     {
         return Err(format!(
             "edit after the gate: {} (seq {})",
@@ -355,7 +362,7 @@ fn e5_full_suites(input: &CheckInput<'_>) -> Result<(), String> {
         let (first, second) = (pair[0], pair[1]);
         let edited = calls
             .iter()
-            .any(|call| call.is_edit() && call.seq > first.seq && call.seq < second.seq);
+            .any(|call| call.is_edit(input.root) && call.seq > first.seq && call.seq < second.seq);
         if !edited {
             return Err(format!(
                 "consecutive full-suite runs at seq {} and seq {} with no edit between",
@@ -653,16 +660,18 @@ fn failed_count(output: &str) -> u64 {
         .sum()
 }
 
-/// A bash call is an edit unless every segment is harmless or read-only.
-/// The command-head rows win over the classify-based ones (`## Plan
-/// amendment` item 4): `cargo fmt` is allow-listed, so it classifies
-/// read-only, and it is still an edit.
-pub fn is_an_edit(command: &str) -> bool {
+/// A bash call is an edit unless every segment is harmless or read-only,
+/// or names only paths outside the repo root. The command-head rows win
+/// over the classify-based ones (`## Plan amendment` item 4): `cargo fmt`
+/// is allow-listed, so it classifies read-only, and it is still an edit.
+pub fn is_an_edit(command: &str, root: &Path) -> bool {
     let segments = scan(&without_heredocs(command));
     if segments.is_empty() {
         return true;
     }
-    segments.iter().any(segment_is_an_edit)
+    segments
+        .iter()
+        .any(|segment| segment_is_an_edit(segment, root))
 }
 
 /// The command with heredoc bodies removed: the lines between a `<<WORD`
@@ -735,7 +744,17 @@ fn strip_heredocs(line: &str) -> (String, Vec<String>) {
     (kept, terminators)
 }
 
-fn segment_is_an_edit(segment: &ScanSegment) -> bool {
+/// Commands whose whole effect is on the paths they are given: a segment
+/// whose head is one of these and whose every path-like word and
+/// redirection target lies outside the repo root cannot have touched the
+/// tree. Any other command may write anywhere on its own (`python3
+/// /tmp/cleanup.py` still runs from the repo as its cwd), so it stays an
+/// edit.
+const PATH_ARGUMENT_COMMANDS: &[&str] = &[
+    "rm", "rmdir", "mkdir", "touch", "mv", "cp", "ln", "chmod", "chown",
+];
+
+fn segment_is_an_edit(segment: &ScanSegment, root: &Path) -> bool {
     let head = segment.words.as_slice();
     if head.starts_with(&["cargo".to_string(), "fmt".to_string()]) {
         return true;
@@ -746,22 +765,44 @@ fn segment_is_an_edit(segment: &ScanSegment) -> bool {
     {
         return false;
     }
-    // A `Write` whose every redirection lands in a temp directory, and
+    // A path-like word is one with a `/` in it: a bare word names
+    // something in the tree, so the segment stays an edit. Every
+    // redirection target is read the same way, and a relative path or a
+    // `..` anywhere is inside, so those ways fail safe.
+    let names_only_outside_paths = segment
+        .words
+        .iter()
+        .filter(|word| word.contains('/'))
+        .all(|word| outside_the_repo(word, root))
+        && segment
+            .redirects
+            .iter()
+            .all(|target| outside_the_repo(target, root));
+    if head
+        .first()
+        .is_some_and(|word| PATH_ARGUMENT_COMMANDS.contains(&word.as_str()))
+        && names_only_outside_paths
+    {
+        return false;
+    }
+    // A `Write` whose every redirection lands outside the repo root, and
     // whose command read without those redirections is read-only or
-    // harmless, is not an edit: the report and pty scratch files of a
-    // real build. A write that came from the command (or from a `$(…)`
-    // inside it) is always an edit, the redirection only collects it
-    // (#56's first review); so is a command the classifier cannot read,
-    // since a temp redirection must not launder `cp`, `tee` or
-    // `python3 -c` into a non-edit (#56's second review); and so is a
-    // relative target: it resolves inside the repo, so that way fails
-    // safe.
+    // harmless, is not an edit: the gate's own `cargo test > /tmp/x 2>&1`
+    // and the report and pty scratch files of a real build. A write that
+    // came from the command (or from a `$(…)` inside it) is always an
+    // edit, the redirection only collects it (#56's first review); so is
+    // a command the classifier cannot read, since an outside redirection
+    // must not launder `cp`, `tee` or `python3 -c` into a non-edit
+    // (#56's second review).
     // The scan leaves descriptor duplications (`2>&1`) out of
     // `redirects`: they write no file. A digit target of a plain
     // redirection (`> 1`) is a file in the repo and stays.
     if segment.kind == Kind::Write
         && !segment.write_from_command
-        && segment.redirects.iter().all(|target| to_temp(target))
+        && segment
+            .redirects
+            .iter()
+            .all(|target| outside_the_repo(target, root))
         && reads_only_without_redirects(segment)
     {
         return false;
@@ -800,17 +841,16 @@ fn reads_only_without_redirects(segment: &ScanSegment) -> bool {
             .all(|segment| matches!(segment.kind, Kind::ReadOnly | Kind::Harmless))
 }
 
-/// An absolute path under a temp directory, with no `..` in it:
-/// `/tmp/../Users/…` names the repo, not the temp directory (#56's
-/// second review). A `.` cannot leave a prefix, and `components()`
-/// drops it anyway.
-fn to_temp(target: &str) -> bool {
+/// An absolute path that does not lie under `root`, with no `..` in it:
+/// `/tmp/…` and a scaffold beside the repo, not a file in the tree. The
+/// check is lexical — `starts_with` compares components, so a sibling
+/// `…/aigentic-2` is not under `…/aigentic` — and a `..` anywhere keeps
+/// the path an edit (it can climb into the tree), so that way fails safe.
+pub fn outside_the_repo(target: &str, root: &Path) -> bool {
     let path = Path::new(target);
     path.is_absolute()
         && !path.components().any(|c| c == Component::ParentDir)
-        && (path.starts_with("/tmp")
-            || path.starts_with("/var/folders")
-            || path.starts_with(std::env::temp_dir()))
+        && !path.starts_with(root)
 }
 
 fn elide(text: &str, limit: usize) -> String {
