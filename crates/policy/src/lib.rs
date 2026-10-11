@@ -597,6 +597,10 @@ mod tests {
         // (#15).
         assert!(command_matches("cat some/path", "cat"));
         assert!(command_matches("grep -n x some/path", "grep"));
+        assert!(command_matches(
+            "git rev-list --count 3e99082..HEAD",
+            "git rev-list"
+        ));
         assert!(!command_matches("git branch some/path", "git branch"));
     }
 
