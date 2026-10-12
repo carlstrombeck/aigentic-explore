@@ -144,7 +144,8 @@ pub(crate) struct Forwarder {
     /// Options that take a value, written as a short option (`-u`) or a
     /// long name (`--user`).
     pub(crate) values: &'static [&'static str],
-    /// Options that take no value and still run the command.
+    /// Options that take no value: the read carries on to the word
+    /// behind them.
     pub(crate) flags: &'static [&'static str],
     /// Options after which the wrapper runs no command of its own
     /// (`command -v`, `sudo -l`): the read ends at the option.
@@ -946,10 +947,10 @@ pub(crate) struct SegRead {
     /// literal-only guard, so a word holding an unresolved `$var` or a
     /// substitution is not a path it can read.
     pub literal: Vec<String>,
-    /// The command word, or a `-c` payload, is broken, a substitution or
-    /// an unresolved `$var`, or one of its words could not be read: the
-    /// causes are those, an option no table knows, and an option or
-    /// positional word its table expects but the line does not have.
+    /// One of the segment's words could not be read: the command word,
+    /// or a `-c` payload, is broken, a substitution or an unresolved
+    /// `$var`; a forwarder or `git` was given an option no table knows;
+    /// or a table's expected option value or positional word is missing.
     /// Nothing about what would run can be read.
     pub unreadable: bool,
 }

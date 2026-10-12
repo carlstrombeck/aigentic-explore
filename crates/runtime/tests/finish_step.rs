@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use aigentic_core::{
@@ -15,6 +16,7 @@ use aigentic_log::{
 };
 use aigentic_policy::{Decision, Policy, Rule};
 use aigentic_runtime::harness_tools::BODY_REQUIRED;
+use aigentic_runtime::workflow::{WorkflowFile, WorkflowRoots};
 use aigentic_runtime::{Answer, Approver, ProjectContext, Runtime, RuntimeError, STEP_REPORTED};
 use aigentic_tools::ToolRegistry;
 use common::{done, scripted};
@@ -902,4 +904,83 @@ async fn t7_with_step_propagates_a_bad_entry() {
     };
     assert_eq!(error.entry, "git obliterate");
     assert!(error.to_string().contains("git obliterate"), "{error}");
+}
+
+/// T11: the run path refuses a wrapped push in auto, under the deny list
+/// the *bundled* workflow gives its writing step. The policy tests read
+/// the overlay over a list a test chose; this reads the one a run ships
+/// with, so a wrapper that hides the command word is refused where the
+/// runner's "one push by construction" clause (§6.4) depends on it.
+#[tokio::test]
+async fn a_wrapped_push_is_refused_by_the_shipped_deny_list() {
+    let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("workflows");
+    let loaded = WorkflowFile::load(
+        "build",
+        &WorkflowRoots {
+            project: None,
+            user: None,
+            bundled: Some(bundled),
+        },
+    )
+    .expect("the bundled build workflow loads");
+    let deny = loaded
+        .step("implement-alone")
+        .expect("the bundled workflow has the writing step")
+        .deny
+        .clone();
+    let deny: Vec<&str> = deny.iter().map(String::as_str).collect();
+
+    // Every line hides the command word behind something: a wrapper, a
+    // path, `env`, or a shell that runs the line.
+    let commands = [
+        "sudo git push",
+        "time git push",
+        "timeout 5 git push",
+        "nice -n 5 git push",
+        "nohup git push",
+        "exec git push",
+        "/usr/bin/git push",
+        "/usr/bin/env git push",
+        "stdbuf -o0 git push",
+        "./git push",
+        "/bin/sh -c 'git push'",
+    ];
+    let script: Vec<ProviderEvent> = commands
+        .iter()
+        .enumerate()
+        .map(|(i, command)| bash(&format!("c{i}"), command))
+        .chain(std::iter::once(done("tool_use")))
+        .collect();
+    let mut r = rig(vec![script, vec![text("ok"), done("stop")]], Some(&deny));
+    r.runtime.set_mode(aigentic_runtime::Mode::Auto);
+    r.runtime
+        .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
+        .await
+        .unwrap();
+
+    let results = results(&r);
+    assert_eq!(results.len(), commands.len());
+    for (i, command) in commands.iter().enumerate() {
+        assert!(
+            results[i].result.is_error,
+            "{command}: {}",
+            results[i].result.content
+        );
+        assert!(
+            matches!(
+                &results[i].policy,
+                Some(PolicyRecord::Rule { rule, decision, .. })
+                    if rule == "step deny git push" && decision == "deny"
+            ),
+            "{command}: {:?}",
+            results[i].policy
+        );
+    }
+    assert!(
+        r.ran.lock().unwrap().is_empty(),
+        "the recording bash never ran: {:?}",
+        r.ran.lock().unwrap()
+    );
 }
