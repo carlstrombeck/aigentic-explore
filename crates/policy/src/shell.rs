@@ -626,6 +626,16 @@ fn fold_sub(w: &mut Worst, sub: &str, allow: &[String], grants: &[String], depth
     }
 }
 
+/// A word that assigns `GIT_INDEX_FILE=...`: the name before the first
+/// `=` is exactly that, and nothing in the word hides what it assigns.
+fn assigns_index(w: &Word) -> bool {
+    w.subs.is_empty()
+        && !w.broken
+        && w.text
+            .split_once('=')
+            .is_some_and(|(name, _)| name == "GIT_INDEX_FILE")
+}
+
 /// `NAME=value` before the command: the environment for one command,
 /// harmless on its own.
 fn is_assignment(w: &Word) -> bool {
@@ -953,6 +963,11 @@ pub(crate) struct SegRead {
     /// or a table's expected option value or positional word is missing.
     /// Nothing about what would run can be read.
     pub unreadable: bool,
+    /// One of the segment's raw words assigns `GIT_INDEX_FILE`, so a git
+    /// command here works on a scratch index the runner's tree check
+    /// never sees. Read off the raw words: the inline assignment is gone
+    /// from `words` and the `export` form's is not leading there.
+    pub sets_index: bool,
 }
 
 /// Every segment of a command line, its substitutions expanded, as the
@@ -971,6 +986,7 @@ fn reads_within(src: &str, out: &mut Vec<SegRead>, depth: usize) {
             words: Vec::new(),
             literal: Vec::new(),
             unreadable: true,
+            sets_index: false,
         });
         return;
     }
@@ -989,6 +1005,11 @@ fn reads_within(src: &str, out: &mut Vec<SegRead>, depth: usize) {
 /// (substitutions, and a `sh -c` payload).
 fn read_segment(seg: &Segment) -> (SegRead, Vec<String>) {
     let mut unreadable = false;
+    // A word that assigns `GIT_INDEX_FILE` is the scratch-index escape
+    // however it is spelled: quoted, bare or an unresolved variable all
+    // assign in bash, and `is_assignment` excludes the last two because
+    // it is about command words.
+    let sets_index = seg.words.iter().any(assigns_index);
     let mut nested: Vec<String> = Vec::new();
     // Every substitution runs, whatever the word is for.
     for word in &seg.words {
@@ -1127,6 +1148,7 @@ fn read_segment(seg: &Segment) -> (SegRead, Vec<String>) {
             words: effective,
             literal,
             unreadable,
+            sets_index,
         },
         nested,
     )

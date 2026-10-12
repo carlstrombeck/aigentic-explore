@@ -23,9 +23,13 @@
 //! push`); `env -S <line>`, whose value is a command line the reader
 //! does not split; a here-document body fed to a shell (`bash <<EOF`
 //! with the command inside); `PATH` shadowing, where the reader reads
-//! the word `git` and never the program it resolves to; and `git pull
-//! --rebase`, which names no entry yet. A word that mixes literal text
-//! with a substitution is refused rather than read: `$cmd push` reads as
+//! the word `git` and never the program it resolves to; a variable set
+//! in an earlier call, which is not on the line the reader reads
+//! (`export GIT_INDEX_FILE=/tmp/idx` alone, then `git read-tree HEAD`
+//! in the next call); and a word that looks like an assignment where
+//! git takes an argument, refused along with the real thing (`git log
+//! GIT_INDEX_FILE=<blob>`). A word that mixes literal text with a
+//! substitution is refused rather than read: `$cmd push` reads as
 //! `step deny unreadable`, and `cat $( git push )` as `step deny git
 //! push`.
 
@@ -74,6 +78,9 @@ const COMMANDS: &[(&str, &[&str], &str)] = &[
     ("git commit", &["git", "commit"], READ_ONLY_REASON),
     ("git add", &["git", "add"], READ_ONLY_REASON),
 ];
+
+/// The one environment variable entry: a scratch index in front of git.
+const INDEX: &str = "GIT_INDEX_FILE";
 
 /// The one symbolic entry: the `.env` file, read or written.
 const COPY_ENV: &str = "copy .env";
@@ -168,6 +175,11 @@ impl StepOverlay {
             if reads.iter().any(|read| read.unreadable) {
                 return Some(deny(UNREADABLE, UNREADABLE_REASON));
             }
+            // A scratch index in front of git is a tree no other check
+            // sees, so no deny list is needed to refuse it.
+            if index_in_front(&reads) {
+                return Some(deny(INDEX, TREE_REASON));
+            }
             if let Some((label, reason)) = self.command(&reads) {
                 return Some(deny(label, reason));
             }
@@ -221,6 +233,32 @@ fn deny(entry: &str, reason: &str) -> Outcome {
 /// `.env.example` and `dir.env/x` never match.
 fn is_env(word: &str) -> bool {
     word == ".env" || word.ends_with("/.env")
+}
+
+/// Whether a `GIT_INDEX_FILE` assignment on the line feeds a git
+/// command: the assignment's own segment runs git, or a later segment of
+/// the line does. Reading the whole line, rather than only the segment
+/// the assignment sits in, is the fail-closed direction: the reader
+/// cannot tell a variable exported for later from one set for git alone.
+fn index_in_front(reads: &[SegRead]) -> bool {
+    reads
+        .iter()
+        .enumerate()
+        .any(|(i, read)| read.sets_index && (runs_git(read) || reads[i + 1..].iter().any(runs_git)))
+}
+
+/// Whether a segment runs `git`, judged from its effective words. A
+/// value the reader cannot fold into an assignment (quoted, or holding a
+/// substitution) leaves the assignment word in the effective list, so
+/// the git word is the second one; the assignment is skipped to see it.
+fn runs_git(read: &SegRead) -> bool {
+    let mut words = read.words.as_slice();
+    if let Some((name, _)) = words.first().and_then(|w| w.split_once('='))
+        && name == INDEX
+    {
+        words = &words[1..];
+    }
+    starts_with(words, &["git"])
 }
 
 /// A bash segment carrying the literal word or redirection target `.env`
@@ -771,6 +809,62 @@ mod tests {
         }
     }
 
+    /// A scratch index hides the tree the runner checks: a step that
+    /// commits through `GIT_INDEX_FILE` moves refs over an index no one
+    /// else sees. The rule is the overlay's own, so it fires whatever
+    /// the step's list names, and it reads the raw words: the assignment
+    /// counts where git takes an argument and on a later segment of the
+    /// line, both of them the fail-closed direction.
+    #[test]
+    fn t17_a_scratch_index_in_front_of_a_git_command_is_refused() {
+        let blob = "0f1e2d3c4b5a69788796a5b4c3d2e1f00a1b2c3d";
+        let tree = "1234567890abcdef1234567890abcdef12345678";
+        let commit = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let overlay = policy_with(&["git push"]);
+        for line in [
+            "GIT_INDEX_FILE=/tmp/idx git read-tree HEAD".to_owned(),
+            "GIT_INDEX_FILE=/tmp/idx git status".to_owned(),
+            "GIT_INDEX_FILE=\"/tmp/idx\" git read-tree HEAD".to_owned(),
+            "GIT_INDEX_FILE=/tmp/idx cat x; git status".to_owned(),
+            "export GIT_INDEX_FILE=/tmp/idx; git read-tree HEAD".to_owned(),
+            "env GIT_INDEX_FILE=/tmp/idx git log --oneline -3".to_owned(),
+            "sh -c 'GIT_INDEX_FILE=/tmp/idx git commit-tree HEAD^{tree}'".to_owned(),
+            format!("GIT_INDEX_FILE=/tmp/idx ./git update-index --cacheinfo 100644,{blob},x"),
+            format!(
+                "export GIT_INDEX_FILE=/tmp/idx; git read-tree HEAD; \
+                 git update-index --cacheinfo 100644,{blob},x; git write-tree; \
+                 git commit-tree {tree} -m x; git update-ref refs/heads/main {commit}"
+            ),
+        ] {
+            assert_eq!(
+                denied(&overlay, &bash(&line)),
+                format!("step deny {INDEX}"),
+                "{line}"
+            );
+        }
+        // Nothing here runs git, or the assignment follows the line's
+        // last git command: the flag alone changes nothing.
+        for line in [
+            "export GIT_INDEX_FILE=/tmp/idx",
+            "rm -f /tmp/idx",
+            "cat GIT_INDEX_FILE=x",
+            "git status --short; GIT_INDEX_FILE=/tmp/idx cat x",
+        ] {
+            assert_eq!(overlay.decide(&bash(line)), None, "{line}");
+        }
+        // Where git takes an argument that looks like an assignment, the
+        // reader cannot tell the two apart, so it refuses both. The
+        // overlay says nothing about `git log`, so the rule is the
+        // overlay's own and not a deny-list entry.
+        assert_eq!(
+            denied(
+                &policy_with(&["git push"]),
+                &bash(&format!("git log GIT_INDEX_FILE={blob}"))
+            ),
+            format!("step deny {INDEX}")
+        );
+    }
+
     /// One row per form the module doc's limits paragraph names, quoted
     /// here as the rows' source:
     ///
@@ -782,8 +876,12 @@ mod tests {
     /// > whose value is a command line the reader does not split; a
     /// > here-document body fed to a shell (`bash <<EOF` with the command
     /// > inside); `PATH` shadowing, where the reader reads the word `git`
-    /// > and never the program it resolves to; and `git pull --rebase`,
-    /// > which names no entry yet.
+    /// > and never the program it resolves to; a variable set in an
+    /// > earlier call, which is not on the line the reader reads (`export
+    /// > GIT_INDEX_FILE=/tmp/idx` alone, then `git read-tree HEAD` in the
+    /// > next call); and a word that looks like an assignment where git
+    /// > takes an argument, refused along with the real thing (`git log
+    /// > GIT_INDEX_FILE=<blob>`).
     ///
     /// A form that stays outside the guard reads as `None`; the `PATH`
     /// row denies because the reader reads the word and never the program
@@ -810,7 +908,7 @@ mod tests {
             "script -q /dev/null git push",
             "env -S 'git push'",
             "bash <<'EOF'\ngit push\nEOF",
-            "git pull --rebase",
+            "export GIT_INDEX_FILE=/tmp/idx",
         ] {
             assert_eq!(overlay.decide(&bash(line)), None, "{line}");
         }
