@@ -1051,6 +1051,7 @@ fn read_segment(seg: &Segment) -> (SegRead, Vec<String>) {
     }
 
     let mut effective: Vec<String> = Vec::new();
+    let git_at = at;
     if words.get(at).is_some_and(|w| names(w, &["git"])) {
         effective.push("git".to_owned());
         let mut j = at + 1;
@@ -1130,6 +1131,17 @@ fn read_segment(seg: &Segment) -> (SegRead, Vec<String>) {
     {
         effective[2] = "-A".to_owned();
     }
+    // pull's own options are the rebase the `git pull --rebase` entry
+    // names, so the rewrite feeds that entry rather than a rule of its
+    // own: a list that names no pull entry refuses nothing.
+    if effective.len() >= 2
+        && effective[0] == "git"
+        && effective[1] == "pull"
+        && pull_rebase(&words[git_at..])
+    {
+        effective.truncate(2);
+        effective.push("--rebase".to_owned());
+    }
 
     if words
         .get(at)
@@ -1152,6 +1164,39 @@ fn read_segment(seg: &Segment) -> (SegRead, Vec<String>) {
         },
         nested,
     )
+}
+
+/// Whether pull's own options ask for a rebase: `-c pull.rebase`,
+/// `-c pull.rebase=<value>`, `--rebase=<value>` or `-r=<value>`. The
+/// last such word decides, as it would for git; anything but `false`,
+/// `no`, `off` or `0` asks for one. `words` starts at the segment's
+/// `git`, so a word before `pull` counts (`git -c pull.rebase=true
+/// pull`), and a bare `--rebase` or `-r` needs no reading — an entry
+/// matches it as written.
+fn pull_rebase(words: &[&Word]) -> bool {
+    let mut asked = false;
+    for (i, w) in words.iter().enumerate().skip(1) {
+        let text = w.text.as_str();
+        let after_c = words[i - 1].text == "-c";
+        let value = if text == "pull.rebase" && after_c {
+            Some("true")
+        } else if let Some(value) = text.strip_prefix("pull.rebase=")
+            && after_c
+        {
+            Some(value)
+        } else if let Some(value) = text.strip_prefix("--rebase=") {
+            Some(value)
+        } else {
+            text.strip_prefix("-r=")
+        };
+        if let Some(value) = value {
+            asked = !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "false" | "no" | "off" | "0"
+            );
+        }
+    }
+    asked
 }
 
 /// Read one forwarder's own words from `at`: how many words its name,

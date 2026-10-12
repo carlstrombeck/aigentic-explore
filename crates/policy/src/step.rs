@@ -865,6 +865,48 @@ mod tests {
         );
     }
 
+    /// The rebase spelled as pull's own option: the reader rewrites the
+    /// segment, so the entry refuses it and a list that names no pull
+    /// entry refuses nothing.
+    #[test]
+    fn t18_a_pull_rebase_spelled_as_an_option_reads_as_the_entry() {
+        let overlay = policy_with(&["git pull --rebase"]);
+        for line in [
+            "git -c pull.rebase=true pull",
+            "git -c pull.rebase=merges pull",
+            "git -c pull.rebase=interactive pull",
+            "git -c pull.rebase pull",
+            "git pull -c pull.rebase=true",
+            "git pull --rebase=true",
+            "git pull --rebase=merges",
+            "git pull -r=true",
+            "cd /repo && git -c pull.rebase=1 pull",
+        ] {
+            assert_eq!(
+                denied(&overlay, &bash(line)),
+                "step deny git pull --rebase",
+                "{line}"
+            );
+        }
+        for line in [
+            "git pull",
+            "git fetch",
+            "git -c pull.rebase=false pull",
+            "git -c pull.rebase=off pull",
+            "git -c pull.rebase=0 pull",
+            "git pull --rebase=false",
+            "git pull -r=false",
+            "git pull --no-rebase",
+            "git log -c pull.rebase=true",
+        ] {
+            assert_eq!(overlay.decide(&bash(line)), None, "{line}");
+        }
+        assert_eq!(
+            policy_with(&["git push"]).decide(&bash("git -c pull.rebase=true pull")),
+            None
+        );
+    }
+
     /// One row per form the module doc's limits paragraph names, quoted
     /// here as the rows' source:
     ///
