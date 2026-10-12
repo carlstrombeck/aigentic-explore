@@ -47,6 +47,30 @@ const COMMANDS: &[(&str, &[&str], &str)] = &[
     ("git stash", &["git", "stash"], TREE_REASON),
     ("git clean", &["git", "clean"], TREE_REASON),
     ("git add -A", &["git", "add", "-A"], TREE_REASON),
+    ("git update-ref", &["git", "update-ref"], TREE_REASON),
+    ("git commit-tree", &["git", "commit-tree"], TREE_REASON),
+    ("git read-tree", &["git", "read-tree"], TREE_REASON),
+    ("git update-index", &["git", "update-index"], TREE_REASON),
+    ("git replace", &["git", "replace"], TREE_REASON),
+    ("git filter-branch", &["git", "filter-branch"], TREE_REASON),
+    ("git filter-repo", &["git", "filter-repo"], TREE_REASON),
+    (
+        "git reflog expire",
+        &["git", "reflog", "expire"],
+        TREE_REASON,
+    ),
+    (
+        "git reflog delete",
+        &["git", "reflog", "delete"],
+        TREE_REASON,
+    ),
+    ("git symbolic-ref", &["git", "symbolic-ref"], TREE_REASON),
+    (
+        "git pull --rebase",
+        &["git", "pull", "--rebase"],
+        TREE_REASON,
+    ),
+    ("git pull -r", &["git", "pull", "-r"], TREE_REASON),
     ("git commit", &["git", "commit"], READ_ONLY_REASON),
     ("git add", &["git", "add"], READ_ONLY_REASON),
 ];
@@ -672,10 +696,79 @@ mod tests {
             ("git stash", &["git", "stash"], TREE_REASON),
             ("git clean", &["git", "clean"], TREE_REASON),
             ("git add -A", &["git", "add", "-A"], TREE_REASON),
+            ("git update-ref", &["git", "update-ref"], TREE_REASON),
+            ("git commit-tree", &["git", "commit-tree"], TREE_REASON),
+            ("git read-tree", &["git", "read-tree"], TREE_REASON),
+            ("git update-index", &["git", "update-index"], TREE_REASON),
+            ("git replace", &["git", "replace"], TREE_REASON),
+            ("git filter-branch", &["git", "filter-branch"], TREE_REASON),
+            ("git filter-repo", &["git", "filter-repo"], TREE_REASON),
+            (
+                "git reflog expire",
+                &["git", "reflog", "expire"],
+                TREE_REASON,
+            ),
+            (
+                "git reflog delete",
+                &["git", "reflog", "delete"],
+                TREE_REASON,
+            ),
+            ("git symbolic-ref", &["git", "symbolic-ref"], TREE_REASON),
+            (
+                "git pull --rebase",
+                &["git", "pull", "--rebase"],
+                TREE_REASON,
+            ),
+            ("git pull -r", &["git", "pull", "-r"], TREE_REASON),
             ("git commit", &["git", "commit"], READ_ONLY_REASON),
             ("git add", &["git", "add"], READ_ONLY_REASON),
         ];
         assert_eq!(COMMANDS, expected);
+    }
+
+    /// Reading history and amending a commit are what a writing step is
+    /// for, so the entries that move history must not catch them: the
+    /// overlay denies only the entries the step's list names, and a
+    /// `git commit` entry would deny `git commit --amend` because
+    /// matching is a word prefix. The two `reflog` entries are `expire`
+    /// and `delete` rather than the bare word for the same reason: a
+    /// reflog stays readable. `git write-tree` writes a loose object and
+    /// moves no ref, so it names no entry.
+    #[test]
+    fn t19_the_history_reading_and_amending_forms_stay_unlisted() {
+        // `COMMANDS` minus the read-only rows: the two entries a reading
+        // step carries instead of `git rebase` and `git add -A`.
+        let deny: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|(_, _, reason)| *reason != READ_ONLY_REASON)
+            .map(|(label, _, _)| *label)
+            .collect();
+        let overlay = policy_with(&deny);
+        for line in [
+            "git write-tree",
+            "git write-tree --missing-ok",
+            "git commit --amend --no-edit",
+            "git log --oneline -3",
+            "git status --short",
+            "git reflog show",
+            "git reflog --all",
+            "git diff --stat",
+            "git show --stat",
+            "git fetch --prune",
+            "git rev-parse HEAD",
+        ] {
+            assert_eq!(overlay.decide(&bash(line)), None, "{line}");
+        }
+        for line in [
+            "git symbolic-ref HEAD refs/heads/main",
+            "git symbolic-ref -q HEAD",
+        ] {
+            assert_eq!(
+                denied(&overlay, &bash(line)),
+                "step deny git symbolic-ref",
+                "{line}"
+            );
+        }
     }
 
     /// One row per form the module doc's limits paragraph names, quoted
