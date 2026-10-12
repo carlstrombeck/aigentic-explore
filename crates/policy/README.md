@@ -15,7 +15,8 @@ segment (#15): the scanner reads quoting, so `grep -n "a|b"` is one
 command and not a pipe, and splits at `|`, `||`, `&&`, `&`, `;`,
 newlines and grouping parens. A line runs without asking when every
 segment is an allow-list command without its writing flags (`sed -i`,
-`find -delete`, `git branch -d`, `sort -o`, `git diff --output`, an
+`find -delete`, `git branch -d`, `sort -o`, `git diff --output`,
+`git grep -O`, `git grep --textconv`, an
 awk program with `system(` or a redirection, `gh api` without GET),
 `cd`, an assignment, or a substitution that is itself read-only.
 `2>&1`, `>/dev/null` and `2>/dev/null` are harmless; any other `>` or

@@ -602,6 +602,19 @@ mod tests {
             "git rev-list"
         ));
         assert!(!command_matches("git branch some/path", "git branch"));
+        assert!(command_matches(
+            "git grep -n verdict -- crates/",
+            "git grep"
+        ));
+        assert!(!command_matches("git grep -O vim verdict", "git grep"));
+        assert!(!command_matches(
+            "git grep --open-files-in-pager=vim verdict",
+            "git grep"
+        ));
+        assert!(!command_matches(
+            "git grep --textconv -n verdict",
+            "git grep"
+        ));
     }
 
     #[test]

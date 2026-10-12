@@ -535,6 +535,7 @@ fn writing_flag(command: &str, rest: &[&Word]) -> bool {
         }),
         "git" => match rest.get(1).map(|w| w.text.as_str()) {
             Some("branch") => git_branch_writes(&rest[2..]),
+            Some("grep") => git_grep_runs_program(&rest[2..]),
             Some("diff") => rest.iter().skip(2).any(|w| w.text.starts_with("--output")),
             _ => false,
         },
@@ -578,6 +579,27 @@ fn git_branch_writes(args: &[&Word]) -> bool {
         );
     }
     false
+}
+
+/// `git grep`'s `-O`/`--open-files-in-pager[=<program>]` runs the
+/// program it names on every matching file, and `--textconv` runs the
+/// one repository data names (`.gitattributes` and
+/// `diff.<driver>.textconv`), so a line carrying either asks. The short
+/// form takes its value attached and clusters with other flags
+/// (`-nOcat`), and git accepts any unambiguous prefix of a long name
+/// (`--open`), so both are read loosely: a `--no-` spelling opens
+/// nothing and is not one.
+fn git_grep_runs_program(args: &[&Word]) -> bool {
+    args.iter().any(|w| {
+        let t = w.text.as_str();
+        if let Some(long) = t.strip_prefix("--") {
+            let name = long.split('=').next().unwrap_or(long);
+            !name.is_empty()
+                && ("open-files-in-pager".starts_with(name) || "textconv".starts_with(name))
+        } else {
+            t.starts_with('-') && t.len() > 1 && t[1..].contains('O')
+        }
+    })
 }
 
 /// A sed script can write a file or run a command: `w file`, `W file`
@@ -675,7 +697,7 @@ fn flag_sensitive(command: &str, rest: &[&Word]) -> bool {
         "sed" | "find" | "sort" | "awk" => true,
         "git" => matches!(
             rest.get(1).map(|w| w.text.as_str()),
-            Some("branch" | "diff")
+            Some("branch" | "diff" | "grep")
         ),
         "gh" => rest.get(1).map(|w| w.text.as_str()) == Some("api"),
         _ => false,
@@ -1756,6 +1778,55 @@ mod tests {
         assert!(!allows("git branch -m renamed"));
         assert!(!allows("git branch --delete topic"));
         assert!(!allows("git branch new-branch"));
+    }
+
+    #[test]
+    fn git_grep_reads_without_running_a_program() {
+        assert!(allows("git grep -n verdict -- crates/"));
+        assert!(allows("git grep -n verdict"));
+        assert!(allows("git grep -n verdict | grep -i verdict | head"));
+        assert!(allows("git grep -e 'git grep' -- docs/"));
+        assert!(allows("git grep --cached -l TODO"));
+        assert!(allows("git grep -n verified && cargo test"));
+        assert!(allows("git grep --no-textconv -n verdict -- a.bin"));
+
+        // `-O` and `--textconv` name a program to run.
+        assert!(!allows("git grep -O vim verdict"));
+        assert!(!allows("git grep -Ovim verdict"));
+        assert!(!allows("git grep -nOcat verdict"));
+        assert!(!allows("git grep --open-files-in-pager=vim verdict"));
+        assert!(!allows("git grep --open-files-in-pager vim verdict"));
+        assert!(!allows("git grep --open verdict"));
+        assert!(!allows("git grep --textconv -n verdict -- a.bin"));
+
+        // An argument the rules cannot read might be one of the flags.
+        assert!(!allows("git grep -n x \"$opt\""));
+        assert!(!allows("git grep -n x \"$(cat opts)\""));
+    }
+
+    #[test]
+    fn git_grep_writes_only_through_its_program_flags() {
+        let read = scan("git grep -n verdict -- crates/");
+        assert_eq!(read[0].kind, Kind::Harmless);
+        assert!(!read[0].write_from_command);
+
+        let pager = scan("git grep -O vim verdict");
+        assert_eq!(pager[0].kind, Kind::Write);
+        assert!(pager[0].write_from_command);
+        assert_eq!(
+            scan("git grep --open-files-in-pager=vim verdict")[0].kind,
+            Kind::Write
+        );
+
+        let textconv = scan("git grep --textconv -n verdict -- a.bin");
+        assert_eq!(textconv[0].kind, Kind::Write);
+        assert!(textconv[0].write_from_command);
+
+        let off = scan("git grep --no-textconv -n verdict -- a.bin");
+        assert_eq!(off[0].kind, Kind::Harmless);
+        assert!(!off[0].write_from_command);
+
+        assert_eq!(scan("git grep -n x \"$opt\"")[0].kind, Kind::Unknown);
     }
 
     #[test]
