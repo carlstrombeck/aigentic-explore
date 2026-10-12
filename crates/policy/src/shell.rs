@@ -133,6 +133,215 @@ struct Segment {
     piped: bool,
 }
 
+/// A program that runs the command word after its own words: `sudo git
+/// push` runs `git push`. The reader skips a forwarder's name, its
+/// option words and its positional words to read the command word
+/// behind it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Forwarder {
+    /// The name a word matches by its final path component.
+    pub(crate) name: &'static str,
+    /// Options that take a value, written as a short option (`-u`) or a
+    /// long name (`--user`).
+    pub(crate) values: &'static [&'static str],
+    /// Options that take no value and still run the command.
+    pub(crate) flags: &'static [&'static str],
+    /// Options after which the wrapper runs no command of its own
+    /// (`command -v`, `sudo -l`): the read ends at the option.
+    pub(crate) stops: &'static [&'static str],
+    /// Words of the wrapper's own after its options: `timeout`'s
+    /// duration.
+    pub(crate) positional: usize,
+}
+
+/// The forwarders the reader unwraps. A row's three option lists are
+/// pairwise disjoint, so a name is read one way whatever order the
+/// reader checks them in; a name added to one list has to leave the
+/// others. Each list was read off that command's `--help`, or its man
+/// page where only the man page names the option.
+pub(crate) const FORWARDERS: &[Forwarder] = &[
+    Forwarder {
+        name: "sudo",
+        values: &[
+            "-u",
+            "-g",
+            "-h",
+            "-p",
+            "-C",
+            "-T",
+            "-R",
+            "-D",
+            "-U",
+            "--user",
+            "--group",
+            "--host",
+            "--prompt",
+            "--close-from",
+            "--command-timeout",
+            "--chroot",
+            "--chdir",
+            "--other-user",
+        ],
+        flags: &[
+            "-A",
+            "-b",
+            "-B",
+            "-E",
+            "-e",
+            "-H",
+            "-i",
+            "-k",
+            "-n",
+            "-N",
+            "-P",
+            "-S",
+            "-s",
+            "--askpass",
+            "--background",
+            "--bell",
+            "--preserve-env",
+            "--edit",
+            "--set-home",
+            "--login",
+            "--reset-timestamp",
+            "--non-interactive",
+            "--no-update",
+            "--preserve-groups",
+            "--stdin",
+            "--shell",
+        ],
+        stops: &[
+            "-K",
+            "-l",
+            "-v",
+            "-V",
+            "--remove-timestamp",
+            "--list",
+            "--validate",
+            "--version",
+            "--help",
+        ],
+        positional: 0,
+    },
+    Forwarder {
+        name: "time",
+        values: &[],
+        flags: &["-p"],
+        stops: &[],
+        positional: 0,
+    },
+    Forwarder {
+        name: "timeout",
+        values: &["-k", "-s", "--kill-after", "--signal"],
+        flags: &["-v", "--verbose", "--preserve-status", "--foreground"],
+        stops: &["--help", "--version"],
+        positional: 1,
+    },
+    Forwarder {
+        name: "nice",
+        values: &["-n", "--adjustment"],
+        flags: &[],
+        stops: &["--help", "--version"],
+        positional: 0,
+    },
+    Forwarder {
+        name: "nohup",
+        values: &[],
+        flags: &[],
+        stops: &["--help", "--version"],
+        positional: 0,
+    },
+    Forwarder {
+        name: "exec",
+        values: &["-a"],
+        flags: &["-c", "-l"],
+        stops: &[],
+        positional: 0,
+    },
+    Forwarder {
+        name: "stdbuf",
+        values: &["-i", "-o", "-e", "--input", "--output", "--error"],
+        flags: &[],
+        stops: &["--help", "--version"],
+        positional: 0,
+    },
+    Forwarder {
+        name: "env",
+        values: &[
+            "-u",
+            "-C",
+            "-S",
+            "-a",
+            "--unset",
+            "--chdir",
+            "--split-string",
+            "--argv0",
+        ],
+        flags: &[
+            "-i",
+            "-0",
+            "-v",
+            "--ignore-environment",
+            "--null",
+            "--debug",
+        ],
+        stops: &["--help", "--version"],
+        positional: 0,
+    },
+    Forwarder {
+        name: "command",
+        values: &[],
+        flags: &["-p"],
+        stops: &["-v", "-V"],
+        positional: 0,
+    },
+    Forwarder {
+        name: "builtin",
+        values: &[],
+        flags: &[],
+        stops: &[],
+        positional: 0,
+    },
+];
+
+/// `git`'s global options that take a value, as a short option or a
+/// long name.
+pub(crate) const GIT_VALUES: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+    "--config-env",
+    "--attr-source",
+    "--super-prefix",
+];
+
+/// `git`'s global options that take no value.
+pub(crate) const GIT_FLAGS: &[&str] = &[
+    "-p",
+    "--paginate",
+    "-P",
+    "--no-pager",
+    "-v",
+    "--version",
+    "-h",
+    "--help",
+    "--html-path",
+    "--man-path",
+    "--info-path",
+    "--literal-pathspecs",
+    "--glob-pathspecs",
+    "--noglob-pathspecs",
+    "--icase-pathspecs",
+    "--bare",
+    "--no-replace-objects",
+    "--no-lazy-fetch",
+    "--no-optional-locks",
+    "--no-advice",
+];
+
 /// Cap on recursion into nested substitutions; past it, ask.
 const MAX_DEPTH: usize = 8;
 
@@ -722,17 +931,16 @@ fn segments(pieces: Vec<Piece>) -> Vec<Segment> {
 }
 
 /// One segment of a step thread's command line, read for the deny
-/// overlay (issue #55): the words a command entry is matched against,
-/// the substitutions inside it, and whether its command word could not
-/// be read.
+/// overlay: the words a command entry is matched against, the literal
+/// words among them, and whether its command word could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SegRead {
-    /// The effective words: leading assignments and introducers,
-    /// `command`/`builtin`, `env`'s own words and `git`'s global options
-    /// are gone, and `git add --all` reads as `git add -A`. A
-    /// redirection's target is kept, on the end, because the overlay's
-    /// `.env` rule reads the same list and the command entries only look
-    /// at the front.
+    /// The effective words: leading assignments and introducers, the
+    /// forwarders ([`FORWARDERS`]) with their own words and options, and
+    /// `git`'s global options are gone, and `git add --all` reads as
+    /// `git add -A`. A redirection's target is kept, on the end, because
+    /// the overlay's `.env` rule reads the same list and the command
+    /// entries only look at the front.
     pub words: Vec<String>,
     /// The literal words only, paths among them: the `.env` rule is a
     /// literal-only guard, so a word holding an unresolved `$var` or a
@@ -743,12 +951,15 @@ pub(crate) struct SegRead {
     /// command lines of their own.
     pub subs: Vec<String>,
     /// The command word, or a `-c` payload, is broken, a substitution or
-    /// an unresolved `$var`: nothing about what would run can be read.
+    /// an unresolved `$var`, or one of its words could not be read: the
+    /// causes are those, an option no table knows, and an option or
+    /// positional word its table expects but the line does not have.
+    /// Nothing about what would run can be read.
     pub unreadable: bool,
 }
 
 /// Every segment of a command line, its substitutions expanded, as the
-/// deny overlay reads it (issue #55). One read serves every entry.
+/// deny overlay reads it. One read serves every entry.
 pub(crate) fn segment_reads(command: &str) -> Vec<SegRead> {
     let mut out = Vec::new();
     reads_within(command, &mut out, 0);
@@ -800,25 +1011,22 @@ fn read_segment(seg: &Segment) -> (SegRead, Vec<String>) {
             literal.push(target.text.clone());
         }
     }
+
     subs.extend(nested.iter().cloned());
 
-    // The command word, past leading assignments and introducers, the
-    // two builtins that only forward to it, and `env`'s own words.
+    // The command word, past leading assignments and introducers and the
+    // forwarders ([`FORWARDERS`]) with all their own words. The first
+    // word that is none of the three is the command word.
     let words: Vec<&Word> = seg.words.iter().collect();
     let mut at = 0;
-    while at < words.len() && (is_assignment(words[at]) || introduces(words[at])) {
-        at += 1;
-    }
-    while at < words.len() && names(words[at], &["command", "builtin"]) {
-        at += 1;
-    }
-    if at < words.len() && names(words[at], &["env"]) {
-        at += 1;
-        while at < words.len()
-            && (is_assignment(words[at])
-                || (words[at].literal() && words[at].text.starts_with('-')))
-        {
+    while at < words.len() {
+        if is_assignment(words[at]) || introduces(words[at]) {
             at += 1;
+        } else if let Some((consumed, bad)) = forward(&words, at) {
+            unreadable |= bad;
+            at += consumed;
+        } else {
+            break;
         }
     }
     if words
@@ -833,26 +1041,60 @@ fn read_segment(seg: &Segment) -> (SegRead, Vec<String>) {
         effective.push("git".to_owned());
         let mut j = at + 1;
         while let Some(opt) = words.get(j) {
-            let takes_value = opt.literal()
-                && matches!(
-                    opt.text.as_str(),
-                    "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
-                );
-            let joined = opt.literal()
-                && ["--git-dir=", "--work-tree=", "--namespace=", "--exec-path="]
-                    .iter()
-                    .any(|p| opt.text.starts_with(p));
-            if takes_value {
-                if words.get(j + 1).is_none() {
-                    // The option swallowed what would have followed.
+            let text = opt.text.as_str();
+            if !text.starts_with('-') {
+                // A non-option word is the command word.
+                break;
+            }
+            if text == "--" {
+                j += 1;
+                break;
+            }
+            if !opt.literal() {
+                // A quoted or substituted option word: no table reads it.
+                unreadable = true;
+                break;
+            }
+            if text.starts_with("--") {
+                let (name, has_value) = match text.split_once('=') {
+                    Some((name, _)) => (name, true),
+                    None => (text, false),
+                };
+                if GIT_FLAGS.contains(&name) {
+                    j += 1;
+                } else if GIT_VALUES.contains(&name) {
+                    if has_value {
+                        j += 1;
+                    } else if words.get(j + 1).is_some() {
+                        j += 2;
+                    } else {
+                        // The option swallowed what would have followed.
+                        unreadable = true;
+                        break;
+                    }
+                } else {
+                    // An option no table knows may take the next word.
                     unreadable = true;
                     break;
                 }
-                j += 2;
-            } else if joined {
-                j += 1;
             } else {
-                break;
+                let head = &text[..text.len().min(2)];
+                if GIT_VALUES.contains(&head) {
+                    if text.len() > 2 {
+                        // The rest of the word is the value.
+                        j += 1;
+                    } else if words.get(j + 1).is_some() {
+                        j += 2;
+                    } else {
+                        unreadable = true;
+                        break;
+                    }
+                } else if GIT_FLAGS.contains(&head) {
+                    j += 1;
+                } else {
+                    unreadable = true;
+                    break;
+                }
             }
         }
         at = j;
@@ -898,6 +1140,111 @@ fn read_segment(seg: &Segment) -> (SegRead, Vec<String>) {
     )
 }
 
+/// Read one forwarder's own words from `at`: how many words its name,
+/// options and positional words consume, and whether a word its table
+/// expects is missing. `None` when the word at `at` names no forwarder.
+fn forward(words: &[&Word], at: usize) -> Option<(usize, bool)> {
+    let row = FORWARDERS.iter().find(|f| names(words[at], &[f.name]))?;
+    let start = at;
+    let mut i = at + 1;
+    let mut bad = false;
+    while let Some(w) = words.get(i) {
+        if w.text == "--" && w.literal() {
+            // The options end here; the positional words follow.
+            i += 1;
+            break;
+        }
+        if !w.text.starts_with('-') {
+            break;
+        }
+        if !w.literal() {
+            // A quoted or substituted option word: no table reads it.
+            bad = true;
+            i += 1;
+            break;
+        }
+        if w.text.starts_with("--") {
+            let (name, has_value) = match w.text.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (w.text.as_str(), false),
+            };
+            if row.flags.contains(&name) {
+                i += 1;
+            } else if row.values.contains(&name) {
+                if has_value {
+                    i += 1;
+                } else if i + 1 < words.len() {
+                    i += 2;
+                } else {
+                    bad = true;
+                    break;
+                }
+            } else if row.stops.contains(&name) {
+                // The wrapper runs nothing of its own: no command word
+                // follows.
+                return Some((i - start, bad));
+            } else {
+                bad = true;
+                break;
+            }
+        } else {
+            // A short cluster: `-n5`, `-uroot`, `-abc`.
+            let letters: Vec<char> = w.text[1..].chars().collect();
+            if !letters.is_empty() && letters.iter().all(|c| c.is_ascii_digit()) {
+                // `nice -5`: the wrapper's numeric option.
+                i += 1;
+                continue;
+            }
+            let mut takes_next = false;
+            let mut stopped = false;
+            let mut unknown = false;
+            for (k, ch) in letters.iter().enumerate() {
+                let short = format!("-{ch}");
+                if row.values.contains(&short.as_str()) {
+                    // The rest of the word is the value when it has one.
+                    takes_next = k + 1 == letters.len();
+                    break;
+                } else if row.flags.contains(&short.as_str()) {
+                    continue;
+                } else if row.stops.contains(&short.as_str()) {
+                    stopped = true;
+                    break;
+                } else {
+                    unknown = true;
+                    break;
+                }
+            }
+            if unknown {
+                bad = true;
+                break;
+            }
+            if stopped {
+                return Some((i - start, bad));
+            }
+            if takes_next {
+                if i + 1 < words.len() {
+                    i += 2;
+                } else {
+                    bad = true;
+                    break;
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    // The wrapper's own positional words.
+    for _ in 0..row.positional {
+        if i < words.len() {
+            i += 1;
+        } else {
+            bad = true;
+            break;
+        }
+    }
+    Some((i - start, bad))
+}
+
 /// The word a `sh -c` option gives the shell to run: the first option
 /// cluster carrying a `c` (`-c`, `-lc`), and the word after it.
 fn dash_c<'a>(rest: &[&'a Word]) -> Option<&'a Word> {
@@ -914,9 +1261,21 @@ fn dash_c<'a>(rest: &[&'a Word]) -> Option<&'a Word> {
     None
 }
 
-/// A word that is exactly one of `names`, and nothing else.
+/// A word whose final path component is exactly one of `names`, and
+/// nothing else: `/usr/bin/git` and `./git` name `git` too, since PATH
+/// decides which program a bare name reaches. Accepted over-match: a
+/// directory named `git` (`dir.git/git`) names it too, which is the safe
+/// direction. A word carrying a substitution never matches.
 fn names(word: &Word, names: &[&str]) -> bool {
-    word.literal() && names.contains(&word.text.as_str())
+    !word.var
+        && word.subs.is_empty()
+        && names.iter().any(|name| {
+            word.text == *name
+                || word
+                    .text
+                    .strip_suffix(name)
+                    .is_some_and(|head| head.ends_with('/'))
+        })
 }
 
 /// A line the old marker check would have called compound: more than

@@ -217,6 +217,7 @@ fn env_path(call: &ToolCall) -> bool {
 mod tests {
     use super::*;
     use crate::Policy;
+    use crate::shell::{FORWARDERS, Forwarder, GIT_FLAGS, GIT_VALUES};
     use aigentic_core::{RiskClass, ToolCall};
     use serde_json::json;
 
@@ -341,7 +342,9 @@ mod tests {
     /// The A/B: a command the overlay does not cover reads exactly as it
     /// does with no overlay at all, so a step thread is an ordinary
     /// thread for everything else. `git commit --amend` is the caller's
-    /// own example of work that stays allowed.
+    /// own example of work that stays allowed. The last two rows reach the
+    /// command word past a wrapper's stop option and past a global option,
+    /// neither of which is the command.
     #[test]
     fn t5_an_uncovered_command_reads_as_without_the_overlay() {
         let overlay = StepOverlay::parse(&strings(&["git push"])).unwrap();
@@ -350,6 +353,8 @@ mod tests {
             "git commit --amend -m x",
             "cargo test",
             "git log --oneline -3",
+            "command -v git push",
+            "git --no-pager log",
         ] {
             let call = bash(command);
             let plain = plain.decide(&call, RiskClass::Exec, None);
@@ -452,5 +457,246 @@ mod tests {
         let err = StepOverlay::parse(&strings(&["git obliterate"])).unwrap_err();
         assert_eq!(err.entry, "git obliterate");
         assert!(err.to_string().contains("git obliterate"), "{err}");
+    }
+
+    /// The positional words a row's wrapper takes of its own, as the `1`
+    /// placeholders a line writes them with. `timeout`'s duration is the
+    /// only one today.
+    fn positional_filler(row: &Forwarder) -> String {
+        " 1".repeat(row.positional)
+    }
+
+    /// Every option [`FORWARDERS`] lists is read past its wrapper, in
+    /// every spelling the reader handles, so the command word behind it
+    /// is the one the overlay matches.
+    #[test]
+    fn t8_every_listed_forwarder_option_reads_past_the_forwarder() {
+        let overlay = policy_with(&["git push"]);
+        for row in FORWARDERS {
+            let filler = positional_filler(row);
+            for opt in row.values {
+                let mut lines = vec![format!("{} {opt} v{filler} git push", row.name)];
+                if opt.starts_with("--") {
+                    lines.push(format!("{} {opt}=v{filler} git push", row.name));
+                } else {
+                    lines.push(format!("{} {opt}v{filler} git push", row.name));
+                }
+                for line in lines {
+                    assert_eq!(
+                        denied(&overlay, &bash(&line)),
+                        "step deny git push",
+                        "{line}"
+                    );
+                }
+            }
+            for opt in row.flags {
+                let line = format!("{} {opt}{filler} git push", row.name);
+                assert_eq!(
+                    denied(&overlay, &bash(&line)),
+                    "step deny git push",
+                    "{line}"
+                );
+            }
+        }
+    }
+
+    /// Every entry denies behind every wrapper, so the unwrapping is a
+    /// property of the reader and not of the push.
+    #[test]
+    fn t9_a_wrapped_entry_denies_under_every_forwarder() {
+        for row in FORWARDERS {
+            let filler = positional_filler(row);
+            for (label, words, _) in COMMANDS {
+                let overlay = policy_with(&[label]);
+                let line = format!("{}{filler} {}", row.name, words.join(" "));
+                assert_eq!(
+                    denied(&overlay, &bash(&line)),
+                    format!("step deny {label}"),
+                    "{line}"
+                );
+            }
+        }
+    }
+
+    /// Which words name a program: a path's final component decides, and
+    /// quoting it changes nothing, because the shell strips the quotes
+    /// before the name is used. The words that merely contain a name do
+    /// not match it.
+    #[test]
+    fn t10_a_command_word_matches_by_its_final_path_component() {
+        let overlay = policy_with(&["git push"]);
+        for line in [
+            "/usr/bin/git push",
+            "./git push",
+            "dir/git push",
+            "\"/usr/bin/git\" push",
+            "\\git push",
+            "\"git\" push",
+            "\"sudo\" git push",
+            "/usr/bin/sudo /usr/bin/git push",
+            "/usr/bin/env git push",
+            "/bin/sh -c 'git push'",
+        ] {
+            assert_eq!(
+                denied(&overlay, &bash(line)),
+                "step deny git push",
+                "{line}"
+            );
+        }
+        for line in [
+            "mygit push",
+            "foo.git push",
+            "git.exe push",
+            "git pushy",
+            "echo /usr/bin/git push",
+        ] {
+            assert_eq!(overlay.decide(&bash(line)), None, "{line}");
+        }
+    }
+
+    /// An option's value is not the command word: a reader that took the
+    /// first option word for the command would read `git` here and deny a
+    /// line that runs `push`.
+    #[test]
+    fn t11_a_forwarders_value_word_is_not_its_command_word() {
+        let overlay = policy_with(&["git push"]);
+        for row in FORWARDERS.iter().filter(|r| !r.values.is_empty()) {
+            let filler = positional_filler(row);
+            for opt in row.values {
+                let line = format!("{} {opt} git{filler} push", row.name);
+                assert_eq!(overlay.decide(&bash(&line)), None, "{line}");
+            }
+        }
+    }
+
+    /// An option no table knows may be taking the next word as its value,
+    /// which is exactly the hiding the reader closes: the line is refused
+    /// rather than read past. So is a wrapper whose own word is missing.
+    #[test]
+    fn t12_an_option_no_table_knows_refuses_the_line() {
+        let overlay = policy_with(&["git push"]);
+        for line in [
+            "sudo --definitely-not-a-sudo-option git push",
+            "timeout --whatever 5 git push",
+            "git --whatever push",
+            "env -Q git push",
+            "sudo -u",
+            "timeout",
+        ] {
+            assert_eq!(
+                denied(&overlay, &bash(line)),
+                "step deny unreadable",
+                "{line}"
+            );
+        }
+    }
+
+    /// `git`'s own global options stand between the name and the command
+    /// word; the reader steps over each spelling of each of them.
+    #[test]
+    fn t13_every_listed_git_global_option_reads_past_git() {
+        let overlay = policy_with(&["git push"]);
+        let mut lines = Vec::new();
+        for opt in GIT_VALUES {
+            lines.push(format!("git {opt} v push"));
+            if opt.starts_with("--") {
+                lines.push(format!("git {opt}=v push"));
+            } else {
+                lines.push(format!("git {opt}v push"));
+            }
+        }
+        for flag in GIT_FLAGS {
+            lines.push(format!("git {flag} push"));
+        }
+        for line in lines {
+            assert_eq!(
+                denied(&overlay, &bash(&line)),
+                "step deny git push",
+                "{line}"
+            );
+        }
+    }
+
+    /// A wrapper's stop option means it runs no command of its own, so
+    /// nothing after it is a command word. The two `sudo` options that
+    /// look like stops but are not (`-k`, `--reset-timestamp`) run the
+    /// command, and are listed as flags.
+    #[test]
+    fn t14_an_option_that_runs_nothing_ends_the_read() {
+        let overlay = policy_with(&["git push"]);
+        for row in FORWARDERS {
+            for opt in row.stops {
+                let line = format!("{} {opt} git push", row.name);
+                assert_eq!(overlay.decide(&bash(&line)), None, "{line}");
+            }
+        }
+        for line in [
+            "sudo -K git push",
+            "timeout --help git push",
+            "timeout --version git push",
+        ] {
+            assert_eq!(overlay.decide(&bash(line)), None, "{line}");
+        }
+        for line in ["sudo -k git push", "sudo --reset-timestamp git push"] {
+            assert_eq!(
+                denied(&overlay, &bash(line)),
+                "step deny git push",
+                "{line}"
+            );
+        }
+    }
+
+    /// The entry table is what the tests above say it is. `t1`, `t2` and
+    /// `t9` derive their rows from `COMMANDS`, so without this pin
+    /// dropping an entry would shrink the parser and its tests together.
+    #[test]
+    fn t15_the_entry_table_matches_the_list_written_out() {
+        let expected: &[(&str, &[&str], &str)] = &[
+            ("git push", &["git", "push"], PUSH_REASON),
+            ("git rebase", &["git", "rebase"], TREE_REASON),
+            ("git reset", &["git", "reset"], TREE_REASON),
+            ("git checkout --", &["git", "checkout", "--"], TREE_REASON),
+            ("git stash", &["git", "stash"], TREE_REASON),
+            ("git clean", &["git", "clean"], TREE_REASON),
+            ("git add -A", &["git", "add", "-A"], TREE_REASON),
+            ("git commit", &["git", "commit"], READ_ONLY_REASON),
+            ("git add", &["git", "add"], READ_ONLY_REASON),
+        ];
+        assert_eq!(COMMANDS, expected);
+    }
+
+    /// The limits the module doc states, one row per form it names. Each
+    /// row's answer is what the reader does with it: a form that stays
+    /// outside the guard reads as `None`, and `PATH` shadowing denies
+    /// because the reader reads the word and never the program it
+    /// resolves to. A change that closes one of these forms fails a row,
+    /// which is where the paragraph is updated with it.
+    #[test]
+    fn t16_the_stated_limits_still_escape_the_overlay() {
+        let overlay = policy_with(&["git push"]);
+        for line in [
+            "xargs git push",
+            "find . -exec git push \\;",
+            "eval 'git push'",
+            "python3 -c 'print(1)'",
+            "busybox git push",
+            "doas git push",
+            "setsid git push",
+            "run0 git push",
+            "ionice git push",
+            "chrt 5 git push",
+            "flock /tmp/lock git push",
+            "unbuffer git push",
+            "script -q /dev/null git push",
+            "env -S 'git push'",
+            "bash <<'EOF'\ngit push\nEOF",
+            "git pull --rebase",
+        ] {
+            assert_eq!(overlay.decide(&bash(line)), None, "{line}");
+        }
+        assert_eq!(
+            denied(&overlay, &bash("PATH=/tmp/bin:$PATH git push")),
+            "step deny git push"
+        );
     }
 }
