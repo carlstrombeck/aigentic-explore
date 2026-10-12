@@ -1,22 +1,33 @@
-//! The per-step deny overlay (issue #55).
+//! The per-step deny overlay.
 //!
 //! PLAN-layer2 §6.4 splits a task between a step thread and the runner:
 //! the step writes and commits, the runner checks the tree, pushes once
 //! and installs. A few commands and files belong to the runner alone, so
 //! a step that runs them is a defect whatever the rules, the project or
 //! the mode say. The runner supplies the list (`deny`), [`StepOverlay`]
-//! parses it, and the runtime asks it *before* the rules — see
-//! `Runtime::policy_check`.
+//! parses it, and the runtime consults it once the rules have spoken —
+//! its answer stands in theirs. See `Runtime::policy_check`.
 //!
 //! The grammar is small and closed on purpose: anything the overlay does
 //! not recognise is a [`DenyParseError`] where the overlay is built, never
 //! a silent no-op at call time.
 //!
-//! This is a lexical guard, not a sandbox (that is phase 7). Stated
-//! limits: backslash quoting tricks (`\git`), `PATH` shadowing, a
-//! command reached through `xargs`/`find -exec`, `python -c`, `eval`,
-//! and a word that mixes literal text with a substitution (read by its
-//! literal fragment).
+//! This is a lexical guard, not a sandbox (that is phase 7). A word
+//! names a program by its final path component and quoting it changes
+//! nothing, so `\git push` and `"git" push` deny as `git push`. Stated
+//! limits: a command reached through `xargs`, `find -exec`, `eval` or
+//! `python -c`; a wrapper with no row in
+//! [`FORWARDERS`](crate::shell::FORWARDERS) (`doas`, `setsid`, `run0`,
+//! `ionice`, `chrt`, `flock`, `unbuffer`, `script`) or a multi-call
+//! binary that chooses its command from its own words (`busybox git
+//! push`); `env -S <line>`, whose value is a command line the reader
+//! does not split; a here-document body fed to a shell (`bash <<EOF`
+//! with the command inside); `PATH` shadowing, where the reader reads
+//! the word `git` and never the program it resolves to; and `git pull
+//! --rebase`, which names no entry yet. A word that mixes literal text
+//! with a substitution is refused rather than read: `$cmd push` reads as
+//! `step deny unreadable`, and `cat $( git push )` as `step deny git
+//! push`.
 
 use std::fmt;
 
@@ -119,9 +130,9 @@ impl StepOverlay {
         Ok(overlay)
     }
 
-    /// What the overlay says about a call, before the rules and whatever
-    /// the mode is: `None` means the call is not its business, a `Deny`
-    /// is final.
+    /// What the overlay says about a call, whatever the rules and the
+    /// mode say: `None` means the call is not its business, a `Deny` is
+    /// final.
     pub fn decide(&self, call: &ToolCall) -> Option<Outcome> {
         if call.name == "bash" {
             let command = call.args.get("command")?.as_str()?;
@@ -631,9 +642,11 @@ mod tests {
             }
         }
         for line in [
+            "sudo -l git push",
             "sudo -K git push",
+            "command -v git push",
+            "command -V git push",
             "timeout --help git push",
-            "timeout --version git push",
         ] {
             assert_eq!(overlay.decide(&bash(line)), None, "{line}");
         }
@@ -665,12 +678,26 @@ mod tests {
         assert_eq!(COMMANDS, expected);
     }
 
-    /// The limits the module doc states, one row per form it names. Each
-    /// row's answer is what the reader does with it: a form that stays
-    /// outside the guard reads as `None`, and `PATH` shadowing denies
-    /// because the reader reads the word and never the program it
-    /// resolves to. A change that closes one of these forms fails a row,
-    /// which is where the paragraph is updated with it.
+    /// One row per form the module doc's limits paragraph names, quoted
+    /// here as the rows' source:
+    ///
+    /// > Stated limits: a command reached through `xargs`, `find -exec`,
+    /// > `eval` or `python -c`; a wrapper with no row in `FORWARDERS`
+    /// > (`doas`, `setsid`, `run0`, `ionice`, `chrt`, `flock`,
+    /// > `unbuffer`, `script`) or a multi-call binary that chooses its
+    /// > command from its own words (`busybox git push`); `env -S <line>`,
+    /// > whose value is a command line the reader does not split; a
+    /// > here-document body fed to a shell (`bash <<EOF` with the command
+    /// > inside); `PATH` shadowing, where the reader reads the word `git`
+    /// > and never the program it resolves to; and `git pull --rebase`,
+    /// > which names no entry yet.
+    ///
+    /// A form that stays outside the guard reads as `None`; the `PATH`
+    /// row denies because the reader reads the word and never the program
+    /// it resolves to. A change that closes one of these forms fails a row,
+    /// which is where the paragraph is updated with it. The paragraph's
+    /// clause about a word that mixes literal text with a substitution is
+    /// pinned by `t4`.
     #[test]
     fn t16_the_stated_limits_still_escape_the_overlay() {
         let overlay = policy_with(&["git push"]);

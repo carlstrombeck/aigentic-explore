@@ -95,10 +95,15 @@ fn bash_command(call: &ToolCall) -> Option<String> {
 }
 
 impl Runtime {
-    /// The policy seam. Rules decide first; an `Ask` consults the mode,
-    /// then the session grants, then `Decisions` when set (the turn parks
-    /// until someone decides or `cancel` fires) or else the approver,
-    /// appending `permission_requested` and
+    /// The policy seam. The file boundary is asked first, before the
+    /// overlay: nothing but a person may let a file tool reach another
+    /// project. The rules decide next, and when the thread has a step
+    /// overlay its outcome replaces theirs — unless the boundary asked,
+    /// which the overlay never answers — so an overlay deny never reaches
+    /// the mode, the grants or the approver. What is left an `Ask`
+    /// consults the mode, then the session grants, then `Decisions` when
+    /// set (the turn parks until someone decides or `cancel` fires) or
+    /// else the approver, appending `permission_requested` and
     /// `permission_decided` so every human answer is an attributed event.
     pub async fn policy_check(
         &mut self,
