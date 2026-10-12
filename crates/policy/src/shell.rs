@@ -946,10 +946,6 @@ pub(crate) struct SegRead {
     /// literal-only guard, so a word holding an unresolved `$var` or a
     /// substitution is not a path it can read.
     pub literal: Vec<String>,
-    /// The text of every `$(...)` and backtick substitution in the
-    /// segment — and of a `sh -c` payload — for the caller to read as
-    /// command lines of their own.
-    pub subs: Vec<String>,
     /// The command word, or a `-c` payload, is broken, a substitution or
     /// an unresolved `$var`, or one of its words could not be read: the
     /// causes are those, an option no table knows, and an option or
@@ -973,7 +969,6 @@ fn reads_within(src: &str, out: &mut Vec<SegRead>, depth: usize) {
         out.push(SegRead {
             words: Vec::new(),
             literal: Vec::new(),
-            subs: Vec::new(),
             unreadable: true,
         });
         return;
@@ -994,7 +989,6 @@ fn reads_within(src: &str, out: &mut Vec<SegRead>, depth: usize) {
 fn read_segment(seg: &Segment) -> (SegRead, Vec<String>) {
     let mut unreadable = false;
     let mut nested: Vec<String> = Vec::new();
-    let mut subs: Vec<String> = Vec::new();
     // Every substitution runs, whatever the word is for.
     for word in &seg.words {
         unreadable |= word.broken;
@@ -1011,8 +1005,6 @@ fn read_segment(seg: &Segment) -> (SegRead, Vec<String>) {
             literal.push(target.text.clone());
         }
     }
-
-    subs.extend(nested.iter().cloned());
 
     // The command word, past leading assignments and introducers and the
     // forwarders ([`FORWARDERS`]) with all their own words. The first
@@ -1133,7 +1125,6 @@ fn read_segment(seg: &Segment) -> (SegRead, Vec<String>) {
         SegRead {
             words: effective,
             literal,
-            subs,
             unreadable,
         },
         nested,
