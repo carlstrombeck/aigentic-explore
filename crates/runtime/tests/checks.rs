@@ -573,6 +573,11 @@ fn e4_edit_table_row_by_row() {
         ("git commit -F /tmp/msg.txt", false),
         ("cat > /tmp/56-msg.txt <<'MSG'\nhi\nMSG", false),
         ("git rev-parse --show-toplevel", false),
+        ("git grep -n verdict -- crates/", false),
+        ("git grep -n verdict | grep -i verdict | head", false),
+        ("git grep -O vim verdict", true),
+        ("git grep --open-files-in-pager=vim verdict", true),
+        ("git grep --textconv -n verdict -- a.bin", true),
         // A temp-directory redirect exempts a redirection, not the
         // command that wrote through it (issue #56's review item 1).
         (
@@ -626,6 +631,9 @@ fn e4_edit_table_row_by_row() {
         ("cp /tmp/evil.rs crates/runtime/src/lib.rs > /tmp/d", true),
         ("echo payload > 1", true),
         ("git log --oneline -5", false),
+        ("git grep -n verdict -- crates/", false),
+        ("git grep -O vim verdict", true),
+        ("git grep --textconv -n verdict -- a.bin", true),
     ] {
         let mut log = Log::new();
         let format = log.bash(1, "cargo fmt");
