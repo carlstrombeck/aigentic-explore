@@ -984,3 +984,187 @@ async fn a_wrapped_push_is_refused_by_the_shipped_deny_list() {
         r.ran.lock().unwrap()
     );
 }
+
+/// The shipped list refuses what the new entries name, one row per entry,
+/// and the scratch index answers as the overlay's own rule before any
+/// entry does. The policy tests read a list a test chose; this reads the
+/// one a run ships with.
+#[tokio::test]
+async fn the_new_entries_are_refused_by_the_shipped_deny_list() {
+    let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("workflows");
+    let loaded = WorkflowFile::load(
+        "build",
+        &WorkflowRoots {
+            project: None,
+            user: None,
+            bundled: Some(bundled),
+        },
+    )
+    .expect("the bundled build workflow loads");
+    let deny = loaded
+        .step("implement-alone")
+        .expect("the bundled workflow has the writing step")
+        .deny
+        .clone();
+    let deny: Vec<&str> = deny.iter().map(String::as_str).collect();
+
+    // Every row is its entry's label spelled as a line, so the rule the
+    // result carries is the label the list must carry too. The last row
+    // is the rebase pull accepts as its own option: it reads as the
+    // `git pull --rebase` entry and as no other.
+    let mut entry_rows: Vec<(&str, &str)> = [
+        "git update-ref",
+        "git commit-tree",
+        "git read-tree",
+        "git update-index",
+        "git replace",
+        "git filter-branch",
+        "git filter-repo",
+        "git reflog expire",
+        "git reflog delete",
+        "git symbolic-ref",
+        "git pull --rebase",
+        "git pull -r",
+    ]
+    .into_iter()
+    .map(|label| (label, label))
+    .collect();
+    entry_rows.push(("git -c pull.rebase=true pull", "git pull --rebase"));
+
+    // The scratch index is the overlay's own rule, not a label, and it
+    // answers before the entries: the `read-tree` row would name both.
+    let index_rows = [
+        "export GIT_INDEX_FILE=/tmp/idx; git read-tree HEAD",
+        "GIT_INDEX_FILE=/tmp/idx cat x; git status",
+        "export GIT_INDEX_FILE=/tmp/idx; git read-tree HEAD; git update-index --cacheinfo 100644,0123456789012345678901234567890123456789,x; git write-tree; git commit-tree 0123456789012345678901234567890123456789 -m x; git update-ref refs/heads/main 0123456789012345678901234567890123456789",
+    ];
+
+    let commands: Vec<&str> = entry_rows
+        .iter()
+        .map(|(command, _)| *command)
+        .chain(index_rows)
+        .collect();
+    let script: Vec<ProviderEvent> = commands
+        .iter()
+        .enumerate()
+        .map(|(i, command)| bash(&format!("c{i}"), command))
+        .chain(std::iter::once(done("tool_use")))
+        .collect();
+    let mut r = rig(vec![script, vec![text("ok"), done("stop")]], Some(&deny));
+    r.runtime.set_mode(aigentic_runtime::Mode::Auto);
+    r.runtime
+        .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
+        .await
+        .unwrap();
+
+    let results = results(&r);
+    assert_eq!(results.len(), commands.len());
+    for (i, (command, label)) in entry_rows.iter().enumerate() {
+        assert!(
+            deny.contains(label),
+            "{label} is not in the shipped list: {deny:?}"
+        );
+        let rule = format!("step deny {label}");
+        assert!(
+            results[i].result.is_error,
+            "{command}: {}",
+            results[i].result.content
+        );
+        assert!(
+            matches!(
+                &results[i].policy,
+                Some(PolicyRecord::Rule { rule: seen, decision, .. })
+                    if seen == &rule && decision == "deny"
+            ),
+            "{command}: {:?}",
+            results[i].policy
+        );
+    }
+    for (i, command) in index_rows.iter().enumerate() {
+        let i = entry_rows.len() + i;
+        assert!(
+            results[i].result.is_error,
+            "{command}: {}",
+            results[i].result.content
+        );
+        assert!(
+            matches!(
+                &results[i].policy,
+                Some(PolicyRecord::Rule { rule, decision, .. })
+                    if rule == "step deny GIT_INDEX_FILE" && decision == "deny"
+            ),
+            "{command}: {:?}",
+            results[i].policy
+        );
+    }
+    assert!(
+        r.ran.lock().unwrap().is_empty(),
+        "the recording bash never ran: {:?}",
+        r.ran.lock().unwrap()
+    );
+}
+
+/// The other half of the same list: what a writing step still does. The
+/// commits it makes are unpushed, so amending them is its own work, and
+/// reading history is what its report and its log rest on.
+#[tokio::test]
+async fn a_writing_step_still_amends_and_reads() {
+    let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("workflows");
+    let loaded = WorkflowFile::load(
+        "build",
+        &WorkflowRoots {
+            project: None,
+            user: None,
+            bundled: Some(bundled),
+        },
+    )
+    .expect("the bundled build workflow loads");
+    let deny = loaded
+        .step("implement-alone")
+        .expect("the bundled workflow has the writing step")
+        .deny
+        .clone();
+    let deny: Vec<&str> = deny.iter().map(String::as_str).collect();
+
+    let commands = [
+        "git commit --amend --no-edit",
+        "git log --oneline -3",
+        "git status --short",
+    ];
+    let script: Vec<ProviderEvent> = commands
+        .iter()
+        .enumerate()
+        .map(|(i, command)| bash(&format!("c{i}"), command))
+        .chain(std::iter::once(done("tool_use")))
+        .collect();
+    let mut r = rig(vec![script, vec![text("ok"), done("stop")]], Some(&deny));
+    r.runtime.set_mode(aigentic_runtime::Mode::Auto);
+    r.runtime
+        .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
+        .await
+        .unwrap();
+
+    let results = results(&r);
+    assert_eq!(results.len(), commands.len());
+    for (i, command) in commands.iter().enumerate() {
+        assert!(
+            !results[i].result.is_error,
+            "{command}: {}",
+            results[i].result.content
+        );
+        assert!(
+            !matches!(
+                &results[i].policy,
+                Some(PolicyRecord::Rule { decision, .. }) if decision == "deny"
+            ),
+            "{command}: {:?}",
+            results[i].policy
+        );
+    }
+    let ran = r.ran.lock().unwrap().clone();
+    assert_eq!(ran, commands, "the recording bash ran every line");
+}
