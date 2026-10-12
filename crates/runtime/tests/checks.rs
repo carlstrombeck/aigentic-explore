@@ -578,6 +578,18 @@ fn e4_edit_table_row_by_row() {
         ("git grep -O vim verdict", true),
         ("git grep --open-files-in-pager=vim verdict", true),
         ("git grep --textconv -n verdict -- a.bin", true),
+        ("git reflog -8", false),
+        ("git reflog show HEAD", false),
+        ("git reflog --all", false),
+        ("git reflog list", false),
+        ("git reflog -8 | head -3", false),
+        ("git reflog expire --expire=now --all", true),
+        ("git reflog delete HEAD@{1}", true),
+        ("git reflog -n 3 expire --all", true),
+        (
+            "git reflog expire --expire=now --all > /tmp/reflog.txt",
+            true,
+        ),
         // A temp-directory redirect exempts a redirection, not the
         // command that wrote through it (issue #56's review item 1).
         (
@@ -634,6 +646,8 @@ fn e4_edit_table_row_by_row() {
         ("git grep -n verdict -- crates/", false),
         ("git grep -O vim verdict", true),
         ("git grep --textconv -n verdict -- a.bin", true),
+        ("git reflog -8", false),
+        ("git reflog expire --expire=now --all", true),
     ] {
         let mut log = Log::new();
         let format = log.bash(1, "cargo fmt");
