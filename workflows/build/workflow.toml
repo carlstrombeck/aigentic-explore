@@ -137,6 +137,18 @@ deny = [
     "git stash",
     "git clean",
     "git add -A",
+    "git update-ref",
+    "git commit-tree",
+    "git read-tree",
+    "git update-index",
+    "git replace",
+    "git filter-branch",
+    "git filter-repo",
+    "git reflog expire",
+    "git reflog delete",
+    "git symbolic-ref",
+    "git pull --rebase",
+    "git pull -r",
     "copy .env",
 ]
 next = "done"

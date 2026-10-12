@@ -687,8 +687,8 @@ pub(crate) mod tests {
         load(root, "test").expect("the fixture loads")
     }
 
-    /// T15 — the bundled `workflows/build` is checked in and loads: its deny
-    /// list is the issue's eight entries, and both its templates render
+    /// The bundled `workflows/build` is checked in and loads: its deny list
+    /// is the entries a writing step carries, and both its templates render
     /// from a slot map of every required slot (no optional one) and again
     /// with every optional slot present, leaving no tag and no run of
     /// blank lines behind.
@@ -718,7 +718,7 @@ pub(crate) mod tests {
             }
         );
 
-        // The deny list is `## Templates`'s eight entries, verbatim.
+        // The deny list is the entries a writing step carries, verbatim.
         let step = loaded.step("implement-alone").expect("the step is there");
         assert_eq!(
             step.deny,
@@ -730,6 +730,18 @@ pub(crate) mod tests {
                 "git stash",
                 "git clean",
                 "git add -A",
+                "git update-ref",
+                "git commit-tree",
+                "git read-tree",
+                "git update-index",
+                "git replace",
+                "git filter-branch",
+                "git filter-repo",
+                "git reflog expire",
+                "git reflog delete",
+                "git symbolic-ref",
+                "git pull --rebase",
+                "git pull -r",
                 "copy .env",
             ]
         );
