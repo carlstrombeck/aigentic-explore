@@ -756,6 +756,7 @@ fn writing_flag(command: &str, rest: &[&Word]) -> bool {
         "git" => match rest.get(1).map(|w| w.text.as_str()) {
             Some("branch") => git_branch_writes(&rest[2..]),
             Some("grep") => git_grep_runs_program(&rest[2..]),
+            Some("reflog") => git_reflog_writes(&rest[2..]),
             Some("diff") => rest.iter().skip(2).any(|w| w.text.starts_with("--output")),
             _ => false,
         },
@@ -820,6 +821,15 @@ fn git_grep_runs_program(args: &[&Word]) -> bool {
             t.starts_with('-') && t.len() > 1 && t[1..].contains('O')
         }
     })
+}
+
+/// `git reflog`'s read forms take options and a ref; `expire`, `delete`
+/// and `drop` rewrite the log. The three are matched in any position:
+/// the rules read words, not git's option parser.
+fn git_reflog_writes(args: &[&Word]) -> bool {
+    ["expire", "delete", "drop"]
+        .iter()
+        .any(|w| args.iter().any(|a| a.text == *w))
 }
 
 /// A sed script can write a file or run a command: `w file`, `W file`
@@ -917,7 +927,7 @@ fn flag_sensitive(command: &str, rest: &[&Word]) -> bool {
         "sed" | "find" | "sort" | "awk" => true,
         "git" => matches!(
             rest.get(1).map(|w| w.text.as_str()),
-            Some("branch" | "diff" | "grep")
+            Some("branch" | "diff" | "grep" | "reflog")
         ),
         "gh" => rest.get(1).map(|w| w.text.as_str()) == Some("api"),
         _ => false,
@@ -2220,6 +2230,70 @@ mod tests {
         // An argument the rules cannot read might be one of the flags.
         assert!(!allows("git grep -n x \"$opt\""));
         assert!(!allows("git grep -n x \"$(cat opts)\""));
+    }
+
+    #[test]
+    fn git_reflog_reads_without_expiring_or_deleting() {
+        assert!(allows("git reflog"));
+        assert!(allows("git reflog -8"));
+        assert!(allows("git reflog show HEAD"));
+        assert!(allows("git reflog show HEAD@{1}"));
+        assert!(allows("git reflog --all"));
+        assert!(allows("git reflog -n 5"));
+        assert!(allows("git reflog --date=iso"));
+        assert!(allows("git reflog list"));
+        assert!(allows("git reflog -8 | head -3"));
+        assert!(allows("git reflog | head -20"));
+        assert!(allows("git reflog --no-pager -8"));
+        assert!(allows("git reflog -8 && cargo test"));
+
+        // The three subcommands that rewrite the log.
+        assert!(!allows("git reflog expire"));
+        assert!(!allows("git reflog expire --expire=now --all"));
+        assert!(!allows("git reflog -n 3 expire --expire=now --all"));
+        assert!(!allows("git reflog delete HEAD@{1}"));
+        assert!(!allows("git reflog drop HEAD@{1}"));
+        assert!(!allows("git reflog show drop"));
+        assert!(!allows("git reflog 'expire'"));
+
+        // The subcommand word is what the rules read, so one they cannot
+        // read may be a writing one.
+        assert!(!allows("git reflog $sub"));
+        assert!(!allows("git reflog \"$(echo expire)\""));
+
+        assert!(!allows(
+            "git reflog expire --expire=now --all > /tmp/reflog.txt"
+        ));
+
+        // A `git` global option is not skipped by the classifier.
+        assert!(!allows("git --no-pager reflog -8"));
+    }
+
+    #[test]
+    fn git_reflog_writes_only_through_its_subcommands() {
+        let read = scan("git reflog -8");
+        assert_eq!(read[0].kind, Kind::Harmless);
+        assert!(!read[0].write_from_command);
+
+        let show = scan("git reflog show HEAD");
+        assert_eq!(show[0].kind, Kind::Harmless);
+        assert!(!show[0].write_from_command);
+
+        for command in [
+            "git reflog expire --expire=now --all",
+            "git reflog delete HEAD@{1}",
+            "git reflog -n 3 expire --all",
+        ] {
+            let seg = scan(command);
+            assert_eq!(seg[0].kind, Kind::Write, "{command}");
+            assert!(seg[0].write_from_command, "{command}");
+        }
+
+        let redirected = scan("git reflog expire --expire=now --all > /tmp/reflog.txt");
+        assert_eq!(redirected[0].kind, Kind::Write);
+        assert!(redirected[0].write_from_command);
+
+        assert_eq!(scan("git reflog $sub")[0].kind, Kind::Unknown);
     }
 
     #[test]

@@ -173,6 +173,7 @@ pub fn default_bash_allow() -> Vec<String> {
         "git rev-list",
         "git blame",
         "git grep",
+        "git reflog",
         // Read-only GitHub through the gh CLI; creating, commenting,
         // merging and pushing still ask.
         "gh issue list",

@@ -615,6 +615,24 @@ mod tests {
             "git grep --textconv -n verdict",
             "git grep"
         ));
+        assert!(default_bash_allow().contains(&"git reflog".to_owned()));
+        assert!(command_matches("git reflog -8", "git reflog"));
+        assert!(command_matches("git reflog show HEAD", "git reflog"));
+        assert!(command_matches("git reflog --all", "git reflog"));
+        assert!(!command_matches(
+            "git reflog expire --expire=now --all",
+            "git reflog"
+        ));
+        assert!(!command_matches("git reflog delete HEAD@{1}", "git reflog"));
+        assert!(!command_matches("git reflog drop HEAD@{1}", "git reflog"));
+        assert!(matches!(
+            Policy::defaults().decide(
+                &bash("git reflog expire --expire=now --all"),
+                RiskClass::Exec,
+                None
+            ),
+            Outcome::Ask { .. }
+        ));
     }
 
     #[test]
