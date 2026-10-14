@@ -221,8 +221,9 @@ with.
   handoff and the log is the machine one. Reports stay claims; section 6
   checks them.
 - **Missing report.** A turn that ends `done` without `finish_step` is a
-  recoverable stop: the runner posts "call finish_step" once, then
-  escalates.
+  recoverable stop: the runner posts "Your turn ended without calling
+  `finish_step`, so the step has no report. The step is not finished" once,
+  then escalates.
 - **End.** The runner closes each child when its step ends.
 
 ## 5. Human checkpoints
@@ -354,7 +355,7 @@ to `max_raise` with a reason). A fix round draws on the issue budget.
 | Per-turn cap | `continue` in the same thread (warm cache), once | Second time asks |
 | `context_saturated` | Steers the child to hand off at the next commit | Fresh thread from the handoff |
 | Provider transport or 5xx | `doctor --probe`, back off, `continue`, up to 3 times | Then asks |
-| Turn `done` without `finish_step` | Posts "call finish_step" once | Then escalates |
+| Turn `done` without `finish_step` | Posts "Your turn ended without calling `finish_step`, so the step has no report. The step is not finished" once | Then escalates |
 | Issue at 80% | Lets the current step finish | Asks before the next step |
 | Issue at 100% | Starts no new step | Asks |
 | Tool calls several times slower than their usual (watchdog) | Flags with the reason (disk, load, sleep) | Slice 5 |
