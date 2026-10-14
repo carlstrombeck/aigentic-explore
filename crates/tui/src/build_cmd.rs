@@ -506,10 +506,10 @@ mod tests {
         assert_eq!(EXIT_FAILED, 1, "a run stopped by an error maps to 1");
     }
 
-    /// T6 — a live `run_errored` stops the command: the bounded reason
-    /// goes to stderr, `outcome.reason` carries it and the code is
-    /// `EXIT_FAILED`, because the error is the provider's or the work's,
-    /// not a person's to answer.
+    /// A live `run_errored` stops the command: the bounded reason goes to
+    /// stderr, `outcome.reason` carries it and the code is `EXIT_FAILED`,
+    /// because the error is the provider's or the work's, not a person's
+    /// to answer.
     #[tokio::test]
     async fn a_live_run_errored_answers_exit_failed_and_prints_the_reason() {
         use crate::run_view::fake_daemon::{FakeDaemon, Script};

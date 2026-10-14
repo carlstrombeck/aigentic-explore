@@ -150,8 +150,9 @@ pub struct RunState {
     /// `run_finished`: the run's own turn ended in an error, and the run
     /// has not ended.
     pub errored: Option<RunErroredPayload>,
-    /// The last event that decides a move. `BudgetWarned` never becomes
-    /// this: a warning is not a decision.
+    /// The last event that decides a move. `BudgetWarned` and
+    /// `RunErrored` never become this: a warning and a note are not
+    /// decisions.
     last: Option<EventKind>,
     /// The last answered checkpoint: the gate that was open when the
     /// answer came, and the answer itself.
@@ -468,6 +469,10 @@ pub fn run_state(events: &[Event]) -> Result<RunState, LogError> {
             }
             RunnerKind::RunErrored => {
                 st.errored = Some(payload(event)?);
+                // A note is not a decision either: `last` keeps the move
+                // of the event before it, so the run resumes where it
+                // stood rather than replaying as "not a run".
+                continue;
             }
         }
         st.last = Some(event.kind);
@@ -704,6 +709,16 @@ mod tests {
         )
     }
 
+    fn run_errored(reason: &str, cost_usd: f64) -> Event {
+        at(
+            EventKind::RunErrored,
+            RunErroredPayload {
+                reason: reason.into(),
+                cost_usd,
+            },
+        )
+    }
+
     fn run_finished(outcome: RunOutcome) -> Event {
         at(
             EventKind::RunFinished,
@@ -917,6 +932,34 @@ mod tests {
         // And the step's warnings folded onto the step that was open.
         assert_eq!(st.steps[0].warned.len(), 2);
         assert_eq!(st.warned, vec![]);
+    }
+
+    /// A note reports the move of the event before it: a run that stopped
+    /// mid-step still resumes that step instead of replaying as "not a
+    /// run".
+    #[test]
+    fn a_note_does_not_change_the_move() {
+        const REASON: &str = "turn: provider_error: HTTP 400";
+
+        let mid_step = numbered(vec![run_started(), step_started(1, child())]);
+        let before = run_state(&mid_step).unwrap().next_move();
+        let mut noted = mid_step;
+        noted.push(run_errored(REASON, 0.4));
+        let st = run_state(&noted).unwrap();
+        assert_eq!(st.next_move(), before, "a note moves no run");
+        assert_eq!(
+            st.errored.as_ref().map(|e| e.reason.as_str()),
+            Some(REASON),
+            "and the stop is on the record"
+        );
+        assert_eq!(st.outcome, None, "the run has not ended");
+
+        // A note after the run ended does not un-end it either.
+        let ended = numbered(vec![run_started(), run_finished(RunOutcome::Closed)]);
+        let done = run_state(&ended).unwrap().next_move();
+        let mut ended_with_note = ended;
+        ended_with_note.push(run_errored(REASON, 0.4));
+        assert_eq!(run_state(&ended_with_note).unwrap().next_move(), done);
     }
 
     /// T15: a finished run is done.

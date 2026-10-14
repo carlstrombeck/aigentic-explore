@@ -54,10 +54,15 @@ pub struct Step {
 /// flight. Reads no file, no clock and no price book.
 pub fn run_status(lead: &[Event], child: &[Event], now: OffsetDateTime) -> Option<RunStatus> {
     let state = run_state(lead).ok()?;
+    let next = state.next_move();
     // A stopped run reads as stopped before it reads as the move it was
     // in: the step it died in is not live, and the reason is the fact a
-    // person needs. A later `step_started` cleared it in the fold.
-    if let Some(errored) = &state.errored {
+    // person needs. A later `step_started` cleared it in the fold, and a
+    // note appended after the run ended is not a stop either: a done run
+    // keeps the `None` the move below gives it.
+    if let Some(errored) = &state.errored
+        && !matches!(next, NextMove::Done { .. })
+    {
         let phase = Phase::Stopped {
             reason: errored.reason.clone(),
         };
@@ -68,7 +73,7 @@ pub fn run_status(lead: &[Event], child: &[Event], now: OffsetDateTime) -> Optio
             idle_secs,
         });
     }
-    let phase = match state.next_move() {
+    let phase = match next {
         NextMove::NotARun | NextMove::Done { .. } => return None,
         NextMove::StartFirstStep => Phase::Move("starting the first step".to_owned()),
         NextMove::ReAwait { step, attempt, .. } => {
@@ -521,7 +526,7 @@ mod tests {
         assert_eq!(move_of(answered), "resuming after decide");
     }
 
-    /// T4: a run stopped by an error reads as stopped, with the reason,
+    /// A run stopped by an error reads as stopped, with the reason,
     /// until a later step supersedes the stop.
     #[test]
     fn a_stopped_run_reads_stopped_and_a_later_step_supersedes_it() {
@@ -602,5 +607,33 @@ mod tests {
             ),
         ];
         assert_eq!(run_status(&finished, &[], at(10)), None);
+    }
+
+    /// A note appended after the run ended is not a stop: the run is done,
+    /// so there is no live status to report either way.
+    #[test]
+    fn a_finished_run_has_no_status_after_a_late_note() {
+        const REASON: &str = "turn: provider_error: HTTP 400";
+        let mut finished = vec![
+            run_started(0, 0),
+            lead_event(
+                1,
+                EventKind::RunFinished,
+                5,
+                json!({"outcome": "closed", "cost_usd": 1.0}),
+            ),
+        ];
+        assert_eq!(run_status(&finished, &[], at(10)), None);
+        finished.push(lead_event(
+            2,
+            EventKind::RunErrored,
+            6,
+            json!({"reason": REASON, "cost_usd": 1.0}),
+        ));
+        assert_eq!(
+            run_status(&finished, &[], at(10)),
+            None,
+            "a done run stays done"
+        );
     }
 }

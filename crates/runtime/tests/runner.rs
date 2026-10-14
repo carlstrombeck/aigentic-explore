@@ -3475,8 +3475,8 @@ async fn t6b_a_close_that_fails_is_retried_without_a_second_comment() {
     assert_eq!(run_finished_all(&fx.lead_events()).len(), 1);
 }
 
-/// T2: an error the runner hit is written to the lead once, without
-/// ending the run: the fold still moves, so the next build resumes it.
+/// An error the runner hit is written to the lead once, without ending
+/// the run: the fold still moves, so the next build resumes it.
 #[tokio::test]
 async fn a_runner_error_is_noted_once_and_the_move_still_resumes() {
     let h = happy_path();
@@ -3517,10 +3517,14 @@ async fn a_runner_error_is_noted_once_and_the_move_still_resumes() {
     let state = runner.state().expect("the lead folds");
     assert!(state.errored.is_some(), "the stop is on the record");
     assert!(state.outcome.is_none(), "the run is not final");
-    assert!(
-        !matches!(state.next_move(), aigentic_log::NextMove::Done { .. }),
-        "a later build resumes it: {:?}",
-        state.next_move()
+    // The note decided nothing: the move is the one the log gave before it
+    // was appended, and a rebuild off that log carries the run on instead
+    // of refusing the lead as "not a run".
+    let without_the_note = aigentic_log::run_state(&events[..before_len]).expect("the lead folds");
+    assert_eq!(
+        state.next_move(),
+        without_the_note.next_move(),
+        "a note moves no run"
     );
 
     // The same error seen twice writes nothing the second time.
@@ -3528,6 +3532,15 @@ async fn a_runner_error_is_noted_once_and_the_move_still_resumes() {
         .note_run_error(&reason)
         .expect("the lead is writable");
     assert_eq!(fx.lead_events().len(), events.len(), "one event per error");
+
+    let mut resumed = fx.runner();
+    assert_eq!(
+        drive(fx, &mut resumed).await,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the run stopped, not the issue's work"
+    );
 }
 
 /// T6c: the closing comment and the close both landed, and the process

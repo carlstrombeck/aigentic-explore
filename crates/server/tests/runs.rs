@@ -2352,9 +2352,10 @@ async fn t14b_a_runner_error_leaves_no_hold() {
     assert_eq!(guard.holds(), 0, "an error leaves nothing held");
 }
 
-/// T3 — a provider error stops the run: the lead's log names it, the
-/// stop reaches a watcher as the event and as the note, and the next
-/// build attaches to the same lead, because an error does not end a run.
+/// A provider error stops the run: the lead's log names it, the stop
+/// reaches a watcher as the event and as the note, and the next build
+/// attaches to the same lead and carries on from where it stood, because
+/// an error does not end a run.
 ///
 /// The error is the one a real run hit: a 400 from the provider on a
 /// step child's first call, not a synthesised `RunnerError`.
@@ -2452,6 +2453,17 @@ async fn a_provider_error_lands_in_the_log_and_the_next_build_resumes_it() {
     let resumed = daemon.build(&client, "steve", ISSUE).await;
     assert_eq!(resumed.lead, built.lead, "the same run");
     assert!(resumed.resumed, "not a second run for the issue");
+
+    // And it carries on from where it stood: the note decided nothing, so
+    // the claim's first move lands an event after it instead of refusing
+    // the lead as "not a run".
+    let advanced = daemon
+        .wait_until(|| daemon.lead_events(resumed.lead).len() > events.len())
+        .await;
+    assert!(
+        advanced,
+        "the resumed run moved on from the stop, not refused the lead"
+    );
 }
 
 /// T15 — two daemons over one project: the lead's OS lock lets one drive
