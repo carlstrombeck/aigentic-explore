@@ -43,8 +43,9 @@ use crate::{LENGTH_STOP, Runtime, RuntimeError, STEP_REPORTED, Signal};
 const RUNNER: &str = "runner";
 
 /// What a step's next attempt is told when the last one ended without a
-/// report: it stopped on its own, so it must call `finish_step`.
-pub const CALL_FINISH_STEP: &str = "call finish_step";
+/// report: the step is unfinished, so it asks for the work that is left
+/// and for `finish_step` once that is done.
+pub const CALL_FINISH_STEP: &str = "Your turn ended without calling `finish_step`, so the step has no report. The step is not finished: continue it where it stopped, do the rest of the work the prompt asks for — its gate and its commits, where it names them — and only then call `finish_step` with the report.";
 
 /// What a step's next attempt is told when the last one was cut off by a
 /// cap: the work is not finished, so it continues.

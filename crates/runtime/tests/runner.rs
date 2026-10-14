@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use aigentic_core::Budget;
-use aigentic_core::{AgentId, Author, ContentBlock, Event, EventKind, ProviderEvent, UserId};
+use aigentic_core::{
+    AgentId, Author, ContentBlock, Event, EventKind, ProviderError, ProviderEvent, UserId,
+};
 use aigentic_log::{
     NextMove, PermissionRequestedPayload, RunStartedPayload, StepReport, StepStatus, ThreadLog,
     ThreadStartedPayload, run_state,
@@ -20,7 +22,8 @@ use aigentic_runtime::runner::{
 use aigentic_runtime::workflow::{LoadedWorkflow, SlotKind, WorkflowFile, WorkflowOrigin};
 use aigentic_runtime::{Answer, Approver, LENGTH_STOP, Prices, Runtime};
 use aigentic_runtime::{
-    STEP_REPORTED,
+    RuntimeError, STEP_REPORTED,
+    harness_tools::FINISH_STEP,
     runner::{CALL_FINISH_STEP, CONTINUE_PROMPT, REPORT_AGAIN_PROMPT, REPORT_WITHOUT_BODY},
 };
 use aigentic_tools::ToolRegistry;
@@ -1823,7 +1826,48 @@ async fn t5_a_second_cap_escalates() {
     assert_eq!(fx.forge.posted().len(), 1, "only the brief reported");
 }
 
-/// T6: `done` without a report → `call finish_step` posted, then the report.
+/// The nudge asks for the step's remaining work, not only for a report: it
+/// names the tool, says the step is unfinished, and names the gate and the
+/// commits a step's prompt may ask for.
+#[test]
+fn the_finish_step_nudge_asks_for_the_rest_of_the_work() {
+    assert!(
+        CALL_FINISH_STEP.contains(FINISH_STEP),
+        "the nudge names the tool the step must call: {CALL_FINISH_STEP}"
+    );
+    assert_ne!(
+        CALL_FINISH_STEP, FINISH_STEP,
+        "the nudge is more than the tool's name: {CALL_FINISH_STEP}"
+    );
+    assert_ne!(
+        CALL_FINISH_STEP, CONTINUE_PROMPT,
+        "a turn that stopped on its own is told more than a capped one: {CALL_FINISH_STEP}"
+    );
+    assert!(
+        CALL_FINISH_STEP.contains("continue"),
+        "it asks the step to continue where it stopped: {CALL_FINISH_STEP}"
+    );
+    assert!(
+        CALL_FINISH_STEP.contains("gate"),
+        "the rest of the work includes the prompt's gate: {CALL_FINISH_STEP}"
+    );
+    assert!(
+        CALL_FINISH_STEP.contains("commit"),
+        "the rest of the work includes the prompt's commits: {CALL_FINISH_STEP}"
+    );
+    assert!(
+        !CALL_FINISH_STEP.contains('#'),
+        "the nudge carries no issue number: {CALL_FINISH_STEP}"
+    );
+    assert!(
+        !CALL_FINISH_STEP.contains('\n'),
+        "the nudge is one line, like the other prompts: {CALL_FINISH_STEP}"
+    );
+}
+
+/// A turn that stops without reporting earns one nudge, and the report that
+/// follows it finishes the step: the nudge asks for the work the step has
+/// left, not only for the report.
 #[tokio::test]
 async fn t6_a_turn_that_stops_without_reporting_is_told_to_finish() {
     let brief_child = Ulid::generate();
@@ -1857,6 +1901,16 @@ async fn t6_a_turn_that_stops_without_reporting_is_told_to_finish() {
     let finished = step_finished(run.lead());
     assert_eq!(finished[1].end_reason, "done");
     assert_eq!(finished[1].status, StepStatus::Partial);
+    assert_eq!(
+        finished[2].status,
+        StepStatus::Done,
+        "the report that follows one nudge finishes the step"
+    );
+    assert_eq!(finished[2].end_reason, STEP_REPORTED);
+    assert!(
+        finished[2].reported_event.is_some(),
+        "the finish points at the report it posted"
+    );
 }
 
 /// T7: a second missing report → `step_stop`.
@@ -1924,6 +1978,75 @@ async fn t7_a_length_stop_is_partial_and_does_not_escalate() {
     assert_eq!(started[2].child_thread, implementer_child);
     let messages = prompts(&fx.child_events_of(implementer_child));
     assert_eq!(messages[1], CONTINUE_PROMPT);
+}
+
+/// A child whose turn dies on a provider error surfaces that error and is
+/// told nothing: the provider, not the step, failed, so the runner returns
+/// the error for the caller to act on instead of nudging the step.
+#[tokio::test]
+async fn a_child_provider_error_posts_no_nudge() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let fx = Fixture::new(vec![
+        (brief_child, vec![report("r1", brief_report())]),
+        (
+            implementer_child,
+            vec![vec![ProviderEvent::Error(ProviderError::Http {
+                status: 500,
+                body: "boom".into(),
+            })]],
+        ),
+    ]);
+
+    let mut runner = fx.runner();
+    let error = loop {
+        match runner.advance().await {
+            Ok(Advanced::Moved) => {}
+            Ok(other) => panic!("the run ended without the provider's error: {other:?}"),
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        matches!(
+            error,
+            RunnerError::Turn(RuntimeError::Provider(ProviderError::Http {
+                status: 500,
+                ..
+            }))
+        ),
+        "the provider's error surfaces from the run: {error:?}"
+    );
+
+    let child = fx.child_events_of(implementer_child);
+    assert_eq!(
+        prompts(&child).len(),
+        1,
+        "the child holds the rendered prompt and no nudge after it"
+    );
+    let ended = child
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::TurnEnded)
+        .expect("the turn ended");
+    let reason = ended.payload["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.starts_with("provider_error: http 500"),
+        "the turn ended on the provider's error, not on the model's: {reason}"
+    );
+
+    let lead = fx.lead_events();
+    let started: Vec<_> = step_started(&lead)
+        .into_iter()
+        .filter(|started| started.step == "implement-alone")
+        .collect();
+    assert_eq!(started.len(), 1, "no second attempt started");
+    assert_eq!(started[0].attempt, 1);
+    assert!(
+        !step_finished(&lead)
+            .iter()
+            .any(|finished| finished.step == "implement-alone"),
+        "the step has no end, so nothing was posted after the error"
+    );
 }
 
 /// T13: `resumed` treated as `done`.
@@ -2320,6 +2443,64 @@ async fn t8c_a_rebuild_before_the_continue_posts_it_once() {
         "the `continue` is posted once, after the rendered prompt"
     );
     assert_eq!(messages.iter().filter(|m| *m == CONTINUE_PROMPT).count(), 1);
+    let terminal = drive(&fx, &mut runner).await;
+    assert_eq!(
+        terminal, run.terminal,
+        "and the run carries on rather than escalating"
+    );
+}
+
+/// A rebuild in the window between `step_started(2)` and its nudge posts
+/// the nudge once, and the step goes on to report: the nudge is the next
+/// attempt's prompt, so a crash cannot double it.
+#[tokio::test]
+async fn the_nudge_is_posted_once_on_the_retry() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let fx = Fixture::new(vec![
+        (brief_child, vec![report("r1", brief_report())]),
+        (
+            implementer_child,
+            vec![stop("done"), report("r2", implementer_report())],
+        ),
+    ]);
+    let run = trace(&fx).await;
+    assert_eq!(
+        run.terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the run closes"
+    );
+
+    // The lead has `step_started(2)`; the child's log holds attempt 1's
+    // prompt and its end, but not the nudge.
+    let k = run
+        .lead()
+        .iter()
+        .rposition(|event| {
+            event.kind == EventKind::StepStarted
+                && serde_json::from_value::<aigentic_log::StepStartedPayload>(event.payload.clone())
+                    .is_ok_and(|payload| payload.attempt == 2)
+        })
+        .expect("attempt 2 started");
+    let snapshot = run.after(k + 1);
+    // The child's log ends after attempt 1's turn: the crash landed
+    // between `step_started` and the nudge.
+    fx.restore_child_prefix(snapshot, implementer_child, |events| turn_ends(events) <= 1);
+
+    let (advanced, mut runner) = replay(&fx, snapshot).await;
+    assert_eq!(advanced, Advanced::Moved, "no escalation");
+    let messages = prompts(&fx.child_events_of(implementer_child));
+    assert_eq!(
+        messages,
+        vec![messages[0].clone(), CALL_FINISH_STEP.to_owned()],
+        "the nudge is posted once, after the rendered prompt"
+    );
+    assert_eq!(
+        messages.iter().filter(|m| *m == CALL_FINISH_STEP).count(),
+        1
+    );
     let terminal = drive(&fx, &mut runner).await;
     assert_eq!(
         terminal, run.terminal,
