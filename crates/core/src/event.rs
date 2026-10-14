@@ -127,6 +127,12 @@ pub enum EventKind {
     /// payload carries the outcome, the cost and the release impact.
     /// The last lead-thread event of a run.
     RunFinished,
+    /// A turn of the run ended in an error and the run was stopped
+    /// (layer 2). Author `agent:runner`; the payload carries the error's
+    /// text and the run's cost when it was noticed. Not final: the run
+    /// is unfinished, so the next `/build` resumes it, and a later
+    /// `step_started` or `run_finished` supersedes the event.
+    RunErrored,
     /// A child step reported through `finish_step` (layer 2, issue #53).
     /// Lives in the child thread, not the lead one; the payload is the
     /// section 4 field table, every field optional because each step
@@ -369,6 +375,14 @@ mod tests {
             Author::System,
             json!({"through_seq": 3}),
         ));
+        // A run stopped by an error sits after every kind the wire-shape
+        // test reads by position.
+        events.push(event(
+            26,
+            EventKind::RunErrored,
+            runner(),
+            json!({"reason": "turn: provider_error: HTTP 400", "cost_usd": 0.4}),
+        ));
         events
     }
 
@@ -417,9 +431,9 @@ mod tests {
         }
     }
 
-    /// T1 (issue #53): the eleven new kinds round-trip and land on the
-    /// wire under the enum's snake_case rule — the name comes from the
-    /// variant, not from a hand-written pair.
+    /// The runner's kinds round-trip and land on the wire under the
+    /// enum's snake_case rule — the name comes from the variant, not
+    /// from a hand-written pair.
     #[test]
     fn the_runner_kinds_round_trip_under_the_snake_case_rule() {
         let kinds = [
@@ -433,6 +447,7 @@ mod tests {
             EventKind::BudgetWarned,
             EventKind::Pushed,
             EventKind::RunFinished,
+            EventKind::RunErrored,
             EventKind::StepReported,
         ];
         let mut names: Vec<String> = Vec::new();
@@ -451,7 +466,7 @@ mod tests {
             assert_eq!(serde_json::from_str::<Event>(&line).unwrap(), event);
             names.push(expected);
         }
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 12);
         let mut unique = names.clone();
         unique.sort();
         unique.dedup();

@@ -53,6 +53,9 @@ const IDLE_SHOWN: Duration = Duration::seconds(60);
 
 /// A title is cut to this many characters.
 pub(crate) const TITLE_CHARS: usize = 40;
+/// A stopped run's reason is cut to this many: the log keeps the whole
+/// error, a run cell does not.
+pub(crate) const REASON_CHARS: usize = 200;
 /// A tool call's arguments are cut to this many.
 const ARGS_CHARS: usize = 60;
 

@@ -14,8 +14,8 @@ use ulid::Ulid;
 use crate::payload::{
     BudgetScope, BudgetWarnedPayload, CheckOutcome, CheckResult, CheckpointAnswer,
     CheckpointAnsweredPayload, CheckpointAskedPayload, ChecksRunPayload, CommitRef, PushedPayload,
-    ReleaseImpact, RouteTakenPayload, RunFinishedPayload, RunOutcome, RunStartedPayload,
-    StepFinishedPayload, StepStartedPayload, StepStatus,
+    ReleaseImpact, RouteTakenPayload, RunErroredPayload, RunFinishedPayload, RunOutcome,
+    RunStartedPayload, StepFinishedPayload, StepStartedPayload, StepStatus,
 };
 use crate::store::LogError;
 
@@ -146,6 +146,10 @@ pub struct RunState {
     pub pending_checkpoint: Option<String>,
     pub outcome: Option<RunOutcome>,
     pub release_impact: Option<ReleaseImpact>,
+    /// The newest `run_errored` since the last `step_started` or
+    /// `run_finished`: the run's own turn ended in an error, and the run
+    /// has not ended.
+    pub errored: Option<RunErroredPayload>,
     /// The last event that decides a move. `BudgetWarned` never becomes
     /// this: a warning is not a decision.
     last: Option<EventKind>,
@@ -278,6 +282,7 @@ fn runner_kind(kind: EventKind) -> Option<RunnerKind> {
         EventKind::BudgetWarned => Some(RunnerKind::BudgetWarned),
         EventKind::Pushed => Some(RunnerKind::Pushed),
         EventKind::RunFinished => Some(RunnerKind::RunFinished),
+        EventKind::RunErrored => Some(RunnerKind::RunErrored),
         EventKind::UserMessage
         | EventKind::AssistantMessage
         | EventKind::ToolResult
@@ -322,6 +327,7 @@ enum RunnerKind {
     BudgetWarned,
     Pushed,
     RunFinished,
+    RunErrored,
 }
 
 /// Fold a lead thread's log into the run's state. Runner events out of
@@ -341,6 +347,7 @@ pub fn run_state(events: &[Event]) -> Result<RunState, LogError> {
         pending_checkpoint: None,
         outcome: None,
         release_impact: None,
+        errored: None,
         last: None,
         answered: None,
     };
@@ -365,6 +372,7 @@ pub fn run_state(events: &[Event]) -> Result<RunState, LogError> {
                 st.budget_usd = p.budget_usd;
             }
             RunnerKind::StepStarted => {
+                st.errored = None;
                 if let Some(i) = opened {
                     return Err(ordering(
                         event,
@@ -456,6 +464,10 @@ pub fn run_state(events: &[Event]) -> Result<RunState, LogError> {
                 let p: RunFinishedPayload = payload(event)?;
                 st.outcome = Some(p.outcome);
                 st.release_impact = p.release_impact;
+                st.errored = None;
+            }
+            RunnerKind::RunErrored => {
+                st.errored = Some(payload(event)?);
             }
         }
         st.last = Some(event.kind);

@@ -886,6 +886,14 @@ pub struct RunFinishedPayload {
     pub release_impact: Option<ReleaseImpact>,
 }
 
+/// Payload of a `run_errored` event: the error's text as the runner
+/// spelled it, and the run's cost when it was noticed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunErroredPayload {
+    pub reason: String,
+    pub cost_usd: f64,
+}
+
 /// One planned test: its id, what it checks, and how its expected value
 /// is derived (§4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2097,6 +2105,64 @@ mod tests {
         };
         let value = serde_json::to_value(&uninstalled).unwrap();
         assert!(value.get("installed").is_none(), "{value}");
+    }
+
+    /// A stopped run's payload carries the error's text and the cost the
+    /// fold held when it was noticed — and a log that never held one
+    /// folds exactly as it did before the kind existed.
+    #[test]
+    fn a_run_errored_round_trips_and_a_log_without_one_still_folds() {
+        const REASON: &str = "turn: provider_error: HTTP 400 from the endpoint";
+        const COST: f64 = 1.25;
+
+        let p = RunErroredPayload {
+            reason: REASON.into(),
+            cost_usd: COST,
+        };
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(value, json!({"reason": REASON, "cost_usd": COST}));
+        assert_eq!(
+            serde_json::from_value::<RunErroredPayload>(value).unwrap(),
+            p
+        );
+
+        // The log `run_finished_payload_round_trips` freezes, with a
+        // `run_started` in front of it, folds to the state it always
+        // did: nothing errored.
+        let events: Vec<aigentic_core::Event> = serde_json::from_value(json!([
+            {
+                "id": "01J8ZQ00000000000000000001",
+                "thread_id": "01J8ZQ00000000000000000000",
+                "seq": 0,
+                "created_at": "2026-09-23T10:00:00Z",
+                "kind": "run_started",
+                "author": {"kind": "agent", "id": "runner"},
+                "payload": {
+                    "issue": 53,
+                    "workflow": "build",
+                    "version": 1,
+                    "content_hash": "abc123",
+                    "budget_usd": 3.0,
+                },
+            },
+            {
+                "id": "01J8ZQ00000000000000000002",
+                "thread_id": "01J8ZQ00000000000000000000",
+                "seq": 1,
+                "created_at": "2026-09-23T10:01:00Z",
+                "kind": "run_finished",
+                "author": {"kind": "agent", "id": "runner"},
+                "payload": {
+                    "outcome": "closed",
+                    "cost_usd": 1.25,
+                    "release_impact": "none",
+                },
+            },
+        ]))
+        .unwrap();
+        let state = crate::run_state::run_state(&events).unwrap();
+        assert_eq!(state.errored, None);
+        assert_eq!(state.outcome, Some(RunOutcome::Closed));
     }
 
     #[test]

@@ -2883,6 +2883,7 @@ impl ClientRepl {
             | EventKind::BudgetWarned
             | EventKind::Pushed
             | EventKind::RunFinished
+            | EventKind::RunErrored
             | EventKind::StepReported => {}
         }
     }

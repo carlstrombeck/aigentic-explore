@@ -28,10 +28,10 @@ pub use payload::{
     MemoryLine, MemoryRememberedPayload, PermissionDecidedPayload, PermissionRequestedPayload,
     PinnedPayload, PlannedTest, PolicyRecord, ProjectSwitchedPayload, ProviderRetriedPayload,
     PushedPayload, ReleaseImpact, ReportStatus, ResultsStubbedPayload, RevealMark, Route,
-    RouteTakenPayload, RunFinishedPayload, RunOutcome, RunStartedPayload, STARTUP_PREFIX,
-    SkillLoadedPayload, StepFinishedPayload, StepReport, StepStartedPayload, StepStatus,
-    ThreadRenamedPayload, ThreadStartedPayload, ToolResultPayload, TurnEndedPayload, Usage,
-    UserMessagePayload, Verdict, is_startup_call,
+    RouteTakenPayload, RunErroredPayload, RunFinishedPayload, RunOutcome, RunStartedPayload,
+    STARTUP_PREFIX, SkillLoadedPayload, StepFinishedPayload, StepReport, StepStartedPayload,
+    StepStatus, ThreadRenamedPayload, ThreadStartedPayload, ToolResultPayload, TurnEndedPayload,
+    Usage, UserMessagePayload, Verdict, is_startup_call,
 };
 pub use projection::{
     Projection, STUB_ARG_MAX_CHARS, project, project_body, shorten_call_args, skill_marker,

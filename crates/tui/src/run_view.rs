@@ -16,11 +16,13 @@ use aigentic_api::{Request, Response};
 use aigentic_runtime::aigentic_core::{Event, EventKind};
 use aigentic_runtime::aigentic_log::{
     CheckResult, CheckpointAnsweredPayload, CheckpointAskedPayload, ChecksRunPayload,
-    PushedPayload, RouteTakenPayload, RunFinishedPayload, RunOutcome, StepFinishedPayload,
-    StepStartedPayload,
+    PushedPayload, RouteTakenPayload, RunErroredPayload, RunFinishedPayload, RunOutcome,
+    StepFinishedPayload, StepStartedPayload,
 };
 use anyhow::{Context, bail};
 use ulid::Ulid;
+
+use crate::progress;
 
 /// The daemon refused to open a lead's log, with its reason.
 ///
@@ -57,6 +59,15 @@ pub(crate) async fn fetch_backlog(client: &Client, lead: Ulid) -> anyhow::Result
         Response::Refused { reason } => Err(anyhow::Error::new(Refused(reason))),
         other => bail!("unexpected reply to opening the lead: {other:?}"),
     }
+}
+
+/// A stopped run's reason, as one line.
+///
+/// The log holds the error's whole text; a line drawn from it is the
+/// error's first line, cut to the crate's `REASON_CHARS`, so a provider
+/// that answers with a page of HTML cannot widen a run cell.
+pub(crate) fn reason_line(reason: &str) -> String {
+    progress::clip(reason.lines().next().unwrap_or(""), progress::REASON_CHARS)
 }
 
 /// The outcome as one lowercase word.
@@ -169,6 +180,10 @@ pub(crate) fn render(event: &Event) -> Option<String> {
         EventKind::RunFinished => {
             let payload: RunFinishedPayload = serde_json::from_value(event.payload.clone()).ok()?;
             Some(format!("run finished: {}", outcome_line(&payload.outcome)))
+        }
+        EventKind::RunErrored => {
+            let payload: RunErroredPayload = serde_json::from_value(event.payload.clone()).ok()?;
+            Some(format!("run stopped: {}", reason_line(&payload.reason)))
         }
         _ => None,
     }
@@ -429,5 +444,50 @@ pub(crate) mod fake_daemon {
         pub(crate) fn stop(self) {
             self.handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A `run_errored` event as the runner writes it.
+    fn errored(reason: &str, cost_usd: f64) -> Event {
+        serde_json::from_value(json!({
+            "id": Ulid::generate(),
+            "thread_id": Ulid::generate(),
+            "seq": 0,
+            "created_at": "2026-09-23T10:00:00Z",
+            "kind": EventKind::RunErrored,
+            "author": {"kind": "agent", "id": "runner"},
+            "payload": {"reason": reason, "cost_usd": cost_usd},
+            "parent_event": null,
+        }))
+        .expect("the fixture event reads")
+    }
+
+    /// The reason's first line is all a line carries: the rest of the
+    /// error stays in the log, and the first line is cut to the crate's
+    /// own bound.
+    #[test]
+    fn an_oversized_reason_renders_as_one_bounded_line() {
+        const FIRST: &str = "turn: provider_error: HTTP 400 from the endpoint";
+        const PREFIX: &str = "run stopped: ";
+        let reason = format!("{FIRST}\n{}", "x".repeat(400));
+        let line = render(&errored(&reason, 0.4)).expect("a stopped run has a line");
+        assert_eq!(line, format!("{PREFIX}{FIRST}"), "the first line, whole");
+        assert!(!line.contains('\n'), "and only that line: {line}");
+
+        // One line longer than the bound reads the bound's characters and
+        // the cut's mark, and no more.
+        let long = "y".repeat(progress::REASON_CHARS * 2);
+        let line = render(&errored(&long, 0.0)).expect("a stopped run has a line");
+        assert_eq!(
+            line.chars().count(),
+            PREFIX.chars().count() + progress::REASON_CHARS + 1,
+            "{line}"
+        );
+        assert!(line.ends_with('…'), "{line}");
     }
 }

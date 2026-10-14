@@ -474,6 +474,7 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             | EventKind::BudgetWarned
             | EventKind::Pushed
             | EventKind::RunFinished
+            | EventKind::RunErrored
             | EventKind::StepReported
             // Decisions (issue #74) are bookkeeping kept out of the
             // model's context: the outcome of a decision reaches the
