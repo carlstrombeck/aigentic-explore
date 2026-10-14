@@ -3475,6 +3475,61 @@ async fn t6b_a_close_that_fails_is_retried_without_a_second_comment() {
     assert_eq!(run_finished_all(&fx.lead_events()).len(), 1);
 }
 
+/// T2: an error the runner hit is written to the lead once, without
+/// ending the run: the fold still moves, so the next build resumes it.
+#[tokio::test]
+async fn a_runner_error_is_noted_once_and_the_move_still_resumes() {
+    let h = happy_path();
+    let fx = &h.fx;
+    let run = trace(fx).await;
+    let snapshot = run.after_where(EventKind::Pushed, 1);
+    fx.restore(snapshot);
+    fx.rewind_forge(snapshot);
+
+    fx.forge.fail_close(1);
+    let mut runner = fx.runner();
+    let err = runner
+        .advance()
+        .await
+        .expect_err("the forge is down for a moment");
+    let reason = err.to_string();
+
+    // What the log says before the note: the cost the event carries, and
+    // a run that has not ended.
+    let events = fx.lead_events();
+    let before_len = events.len();
+    let before = aigentic_log::run_state(&events).expect("the lead folds");
+    assert!(before.outcome.is_none(), "the run has not ended");
+    assert!(before.errored.is_none(), "and nothing errored yet");
+
+    runner
+        .note_run_error(&reason)
+        .expect("the lead is writable");
+    let events = fx.lead_events();
+    assert_eq!(events.len(), before_len + 1, "one event");
+    let last = events.last().expect("the note is the last event");
+    assert_eq!(last.kind, EventKind::RunErrored);
+    let payload: aigentic_log::RunErroredPayload =
+        serde_json::from_value(last.payload.clone()).unwrap();
+    assert_eq!(payload.reason, reason, "the error's own text");
+    assert_eq!(payload.cost_usd, before.cost_usd, "the fold's cost");
+
+    let state = runner.state().expect("the lead folds");
+    assert!(state.errored.is_some(), "the stop is on the record");
+    assert!(state.outcome.is_none(), "the run is not final");
+    assert!(
+        !matches!(state.next_move(), aigentic_log::NextMove::Done { .. }),
+        "a later build resumes it: {:?}",
+        state.next_move()
+    );
+
+    // The same error seen twice writes nothing the second time.
+    runner
+        .note_run_error(&reason)
+        .expect("the lead is writable");
+    assert_eq!(fx.lead_events().len(), events.len(), "one event per error");
+}
+
 /// T6c: the closing comment and the close both landed, and the process
 /// died before `run_finished`; the rebuild repeats neither.
 #[tokio::test]

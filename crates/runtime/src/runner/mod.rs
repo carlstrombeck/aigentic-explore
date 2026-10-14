@@ -26,9 +26,9 @@ use aigentic_core::{AgentId, Author, ContentBlock, Event, EventKind};
 use aigentic_log::{
     CheckOutcome, CheckResult, CheckpointAnswer, CheckpointAnsweredPayload, CheckpointAskedPayload,
     ChecksOutcome, ChecksRunPayload, CommitRef, LogError, NewEvent, NextMove, PushedPayload,
-    ReleaseImpact, ReportStatus, RouteTakenPayload, RunFinishedPayload, RunOutcome,
-    RunStartedPayload, RunState, StepFinishedPayload, StepReport, StepStartedPayload, StepStatus,
-    ThreadLog, TurnEndedPayload, Verdict, run_state,
+    ReleaseImpact, ReportStatus, RouteTakenPayload, RunErroredPayload, RunFinishedPayload,
+    RunOutcome, RunStartedPayload, RunState, StepFinishedPayload, StepReport, StepStartedPayload,
+    StepStatus, ThreadLog, TurnEndedPayload, Verdict, run_state,
 };
 use serde_json::Value;
 use ulid::Ulid;
@@ -1289,6 +1289,27 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         )?;
         self.lock = None;
         Ok(Advanced::Finished { outcome })
+    }
+
+    /// Note that the run's turn ended in an error, without ending the run.
+    ///
+    /// One event per error: a second call before the next `step_started`
+    /// or `run_finished` appends nothing, because the fold's own window —
+    /// the newest `run_errored` since either — already holds this one. A
+    /// log the fold cannot read writes nothing and returns that error.
+    pub fn note_run_error(&mut self, reason: &str) -> Result<(), RunnerError> {
+        let state = self.state()?;
+        if state.errored.is_some() {
+            return Ok(());
+        }
+        self.append(
+            EventKind::RunErrored,
+            &RunErroredPayload {
+                reason: reason.to_owned(),
+                cost_usd: state.cost_usd,
+            },
+        )?;
+        Ok(())
     }
 
     /// A human answered a gate: `stop` ends the run. At a checkpoint step,
