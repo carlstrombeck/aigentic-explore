@@ -21,8 +21,9 @@ use ulid::Ulid;
 /// asked to answer; version 4 adds `Front`/`NewFront` and
 /// `Response::Front`; version 5 lets `ListThreads` omit its project;
 /// version 6 adds `Notice::RunStatus`, which an older client cannot
-/// decode.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// decode; version 7 adds `RunPhase::Stopped`, which an older client
+/// would render as a move, so a mismatched pair must refuse loudly.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// One line on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -495,6 +496,11 @@ pub enum RunPhase {
     },
     Move {
         what: String,
+    },
+    /// The run's own turn ended in an error and the run has not ended:
+    /// a later step supersedes it, and the next build resumes the run.
+    Stopped {
+        reason: String,
     },
 }
 
@@ -1188,7 +1194,7 @@ mod tests {
     /// its log and the client cannot tell.
     #[test]
     fn t7_front_asked_round_trips_and_the_old_frame_still_decodes() {
-        assert_eq!(PROTOCOL_VERSION, 6, "the run-status notice moved it");
+        assert_eq!(PROTOCOL_VERSION, 7, "the stopped phase moved it");
         let asked = StartAsk {
             offered: "web".into(),
             chosen: "api".into(),
@@ -1240,7 +1246,7 @@ mod tests {
     /// (which always named one) still decodes.
     #[test]
     fn t1_list_threads_project_is_optional_on_the_wire() {
-        assert_eq!(PROTOCOL_VERSION, 6, "the run-status notice moved it");
+        assert_eq!(PROTOCOL_VERSION, 7, "the stopped phase moved it");
         let some = Frame::request(
             1,
             Request::ListThreads {
@@ -1473,8 +1479,8 @@ mod tests {
         assert!(decode("").is_err());
     }
 
-    /// The run-status notice round-trips, its three phase shapes are
-    /// tagged `step`/`gate`/`move`, and a frame with an unknown tag fails
+    /// The run-status notice round-trips, its four phase shapes are
+    /// tagged `step`/`gate`/`move`/`stopped`, and a frame with an unknown tag fails
     /// to decode whole rather than as one skipped frame — which is why the
     /// version had to move.
     #[test]
@@ -1535,11 +1541,26 @@ mod tests {
         assert_eq!(v["notice"]["status"]["phase"]["phase"], "move");
         assert_eq!(decode(&line).unwrap(), moved, "{line}");
 
+        let stopped = Frame::notice(Notice::RunStatus {
+            thread,
+            status: RunStatus {
+                issue: 139,
+                phase: RunPhase::Stopped {
+                    reason: "turn: provider_error: HTTP 400".into(),
+                },
+                idle_secs: 0,
+            },
+        });
+        let line = encode(&stopped);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["notice"]["status"]["phase"]["phase"], "stopped");
+        assert_eq!(decode(&line).unwrap(), stopped, "{line}");
+
         // A frame from a client that knows the kind's name but not its
         // shape, and one that knows neither: both fail whole.
         assert!(
             decode(r#"{"notice":{"kind":"run_status","thread":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":{"issue":1,"phase":{"phase":"teleported"},"idle_secs":0}}}"#).is_err()
         );
-        assert_eq!(PROTOCOL_VERSION, 6, "the run-status notice moved it");
+        assert_eq!(PROTOCOL_VERSION, 7, "the stopped phase moved it");
     }
 }

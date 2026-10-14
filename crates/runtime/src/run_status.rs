@@ -29,6 +29,10 @@ pub enum Phase {
     Gate { gate: String },
     /// The runner is between moves; the sentence names the move.
     Move(String),
+    /// The run's own turn ended in an error and the run has not ended:
+    /// a later step supersedes the stop, and the next build resumes the
+    /// run where it stood.
+    Stopped { reason: String },
 }
 
 /// A live step's figures, read from the child's open turn.
@@ -50,6 +54,20 @@ pub struct Step {
 /// flight. Reads no file, no clock and no price book.
 pub fn run_status(lead: &[Event], child: &[Event], now: OffsetDateTime) -> Option<RunStatus> {
     let state = run_state(lead).ok()?;
+    // A stopped run reads as stopped before it reads as the move it was
+    // in: the step it died in is not live, and the reason is the fact a
+    // person needs. A later `step_started` cleared it in the fold.
+    if let Some(errored) = &state.errored {
+        let phase = Phase::Stopped {
+            reason: errored.reason.clone(),
+        };
+        let idle_secs = idle_secs(lead, child, &phase, now);
+        return Some(RunStatus {
+            issue: state.issue,
+            phase,
+            idle_secs,
+        });
+    }
     let phase = match state.next_move() {
         NextMove::NotARun | NextMove::Done { .. } => return None,
         NextMove::StartFirstStep => Phase::Move("starting the first step".to_owned()),
@@ -501,6 +519,67 @@ mod tests {
             json!({"answer": "go"}),
         ));
         assert_eq!(move_of(answered), "resuming after decide");
+    }
+
+    /// T4: a run stopped by an error reads as stopped, with the reason,
+    /// until a later step supersedes the stop.
+    #[test]
+    fn a_stopped_run_reads_stopped_and_a_later_step_supersedes_it() {
+        const REASON: &str = "turn: provider_error: HTTP 400";
+        const COST: f64 = 0.4;
+        const STOPPED_AT: i64 = 30;
+        const NOW: i64 = 90;
+
+        // What the incident showed: the lead is mid-step and the run
+        // reads live.
+        let live = lead_on_a_step();
+        assert!(
+            matches!(
+                run_status(&live, &[], at(NOW)).unwrap().phase,
+                Phase::Step(_)
+            ),
+            "an open step reads as a live step"
+        );
+
+        let mut stopped = live.clone();
+        stopped.push(lead_event(
+            2,
+            EventKind::RunErrored,
+            STOPPED_AT,
+            json!({"reason": REASON, "cost_usd": COST}),
+        ));
+        let status = run_status(&stopped, &[], at(NOW)).unwrap();
+        assert_eq!(
+            status.phase,
+            Phase::Stopped {
+                reason: REASON.into()
+            }
+        );
+        assert_eq!(status.idle_secs, (NOW - STOPPED_AT) as u64);
+
+        // The next step supersedes the stop. The dead attempt is closed
+        // first, as the log demands: an attempt stays open until its
+        // `step_finished`.
+        let mut resumed = stopped;
+        resumed.push(step_finished(3, 40));
+        resumed.push(step_started(4, NOW, 2, CHILD));
+        assert!(
+            matches!(
+                run_status(&resumed, &[], at(NOW)).unwrap().phase,
+                Phase::Step(_)
+            ),
+            "the later step supersedes the stop"
+        );
+
+        // A `run_errored` on a thread that is not a run is the ordering
+        // error the fold already refuses, so there is no status.
+        let stray = vec![lead_event(
+            0,
+            EventKind::RunErrored,
+            0,
+            json!({"reason": REASON, "cost_usd": COST}),
+        )];
+        assert_eq!(run_status(&stray, &[], at(NOW)), None);
     }
 
     #[test]

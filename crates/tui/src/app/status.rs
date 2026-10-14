@@ -169,6 +169,9 @@ fn run_parts(status: &aigentic_api::RunStatus, named: bool) -> Vec<String> {
         }
         aigentic_api::RunPhase::Gate { gate } => parts.push(format!("waiting at {gate}")),
         aigentic_api::RunPhase::Move { what } => parts.push(what.clone()),
+        aigentic_api::RunPhase::Stopped { reason } => {
+            parts.push(format!("stopped: {}", crate::run_view::reason_line(reason)))
+        }
     }
     // Two idle minutes is the point the run reads as stopped rather than
     // slow, so the figure appears only then.

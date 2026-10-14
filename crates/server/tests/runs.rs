@@ -23,11 +23,12 @@ use std::time::Duration;
 use aigentic_api::client::{Addr, Client};
 use aigentic_api::{CheckpointAnswer, Notice, Request, Response};
 use aigentic_runtime::aigentic_core::{
-    Author, Capabilities, CompletionRequest, Event, EventKind, Message, Provider, ProviderEvent,
-    RiskClass, ToolCall,
+    Author, Capabilities, CompletionRequest, Event, EventKind, Message, Provider, ProviderError,
+    ProviderEvent, RiskClass, ToolCall,
 };
 use aigentic_runtime::aigentic_log::{
-    NewEvent, Repair, RunOutcome, StepStartedPayload, ThreadLog, ThreadStartedPayload,
+    NewEvent, Repair, RunErroredPayload, RunOutcome, StepStartedPayload, ThreadLog,
+    ThreadStartedPayload,
 };
 use aigentic_runtime::runner::RunnerHost;
 use aigentic_runtime::runner::forge::{FakeForge, Forge, IssueView};
@@ -2349,6 +2350,108 @@ async fn t14b_a_runner_error_leaves_no_hold() {
         .await;
     assert!(stopped, "the run reported the error as a note");
     assert_eq!(guard.holds(), 0, "an error leaves nothing held");
+}
+
+/// T3 — a provider error stops the run: the lead's log names it, the
+/// stop reaches a watcher as the event and as the note, and the next
+/// build attaches to the same lead, because an error does not end a run.
+///
+/// The error is the one a real run hit: a 400 from the provider on a
+/// step child's first call, not a synthesised `RunnerError`.
+#[tokio::test]
+async fn a_provider_error_lands_in_the_log_and_the_next_build_resumes_it() {
+    const ISSUE: u64 = 163;
+    const BODY: &str = "the endpoint refused this turn";
+    let error = ProviderError::Http {
+        status: 400,
+        body: BODY.into(),
+    };
+    let daemon = Fixture::new(Vec::new())
+        .daemon(
+            Scripts::of([
+                vec![report("r1", brief_report())],
+                vec![Act::Reply(vec![ProviderEvent::Error(error.clone())])],
+            ]),
+            false,
+        )
+        .await;
+    let (client, _) = daemon.connect("steve").await;
+    let mut notices = client.take_notices().expect("the notice stream");
+
+    // The build subscribes this client to the lead it starts, so the
+    // notices below arrive.
+    let built = daemon.build(&client, "steve", ISSUE).await;
+    assert!(
+        daemon
+            .wait_until(|| daemon
+                .lead_events(built.lead)
+                .iter()
+                .any(|event| event.kind == EventKind::RunErrored))
+            .await,
+        "the lead's log records the stop"
+    );
+
+    let events = daemon.lead_events(built.lead);
+    let last = events.last().expect("the lead holds events");
+    assert_eq!(
+        last.kind,
+        EventKind::RunErrored,
+        "the stop is the last thing the run wrote"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == EventKind::RunFinished),
+        "an error does not end the run"
+    );
+    let payload: RunErroredPayload =
+        serde_json::from_value(last.payload.clone()).expect("the payload parses");
+    assert!(
+        payload.reason.contains(&error.to_string()),
+        "the log names the provider's own error, got {:?}",
+        payload.reason
+    );
+    assert_eq!(
+        payload.cost_usd, 0.0,
+        "nothing was spent on the stopped run"
+    );
+
+    // Both the event and the note reach the watcher: the daemon writes
+    // the log first, then says what it wrote.
+    let mut seen_events: Vec<Event> = Vec::new();
+    let mut seen_notes: Vec<String> = Vec::new();
+    let both = daemon
+        .wait_until(|| {
+            while let Ok(notice) = notices.try_recv() {
+                match notice {
+                    Notice::Event { thread, event } if thread == built.lead => {
+                        seen_events.push(event);
+                    }
+                    Notice::Note { thread, text } if thread == built.lead => {
+                        seen_notes.push(text);
+                    }
+                    _ => {}
+                }
+            }
+            seen_events
+                .iter()
+                .any(|event| event.kind == EventKind::RunErrored)
+                && seen_notes
+                    .iter()
+                    .any(|text| text.starts_with("run stopped"))
+        })
+        .await;
+    assert!(both, "the stop reached the watcher, as event and as note");
+    assert!(
+        seen_events.iter().any(|event| event == last),
+        "the watcher saw the log's own event"
+    );
+
+    // The run is unfinished, so the next build attaches to the same lead
+    // instead of starting a second run.
+    let resumed = daemon.build(&client, "steve", ISSUE).await;
+    assert_eq!(resumed.lead, built.lead, "the same run");
+    assert!(resumed.resumed, "not a second run for the issue");
 }
 
 /// T15 — two daemons over one project: the lead's OS lock lets one drive

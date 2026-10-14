@@ -786,6 +786,7 @@ fn wire_status(status: aigentic_runtime::RunStatus) -> aigentic_api::RunStatus {
         },
         aigentic_runtime::Phase::Gate { gate } => aigentic_api::RunPhase::Gate { gate },
         aigentic_runtime::Phase::Move(what) => aigentic_api::RunPhase::Move { what },
+        aigentic_runtime::Phase::Stopped { reason } => aigentic_api::RunPhase::Stopped { reason },
     };
     aigentic_api::RunStatus {
         issue: status.issue,
@@ -866,7 +867,24 @@ async fn run(
                 broadcast_new(&runs, lead, &runner, seen);
                 break Ok(());
             }
-            Err(e) => break Err(e),
+            Err(e) => {
+                // The log is the source of truth, so the run's own record
+                // of the error goes into it before the task ends: a log
+                // that stops at `step_started` replays as a run still
+                // working. What cannot be read cannot be written, and a
+                // failure to write is itself worth a note.
+                if let Err(write) = runner.note_run_error(&e.to_string()) {
+                    runs.broadcast(
+                        lead,
+                        Notice::Note {
+                            thread: lead,
+                            text: format!("could not write the lead's log while stopping: {write}"),
+                        },
+                    );
+                }
+                broadcast_new(&runs, lead, &runner, seen);
+                break Err(e);
+            }
         }
         seen = broadcast_new(&runs, lead, &runner, seen);
     };
