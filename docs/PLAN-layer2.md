@@ -384,8 +384,9 @@ lands where the run was. Added, never changed.
 | `budget_warned` | scope (`step` \| `issue`), spent, limit |
 | `pushed` | commits, remote ref before and after, installed binary's commit; appended after the push and install, which are idempotent |
 | `run_finished` | `closed` \| `stopped` \| `escalated`, cost, release impact |
+| `run_errored` | the error's text, cost; the runner's own turn died and the run did not end — a later `step_started` supersedes the stop, and the next `/build` resumes the run |
 
-**Replay.** The last lead-thread event decides the runner's next move: `run_started` → start the first step; `step_started` → await that child; `step_finished` → run the step's checks; `checks_run` → send back, push or route by the outcome; `pushed` → install, close or route on; `route_taken` → follow it (never re-derive: preconditions read git state that can change across a crash); `checkpoint_asked` → wait; `checkpoint_answered` → act on the answer; `budget_warned` → the move of the event before it; `run_finished` → nothing. Per-step state (checks, pushed commits, step warnings) is kept per attempt.
+**Replay.** The last lead-thread event decides the runner's next move: `run_started` → start the first step; `step_started` → await that child; `step_finished` → run the step's checks; `checks_run` → send back, push or route by the outcome; `pushed` → install, close or route on; `route_taken` → follow it (never re-derive: preconditions read git state that can change across a crash); `checkpoint_asked` → wait; `checkpoint_answered` → act on the answer; `budget_warned` → the move of the event before it; `run_errored` → the move of the event before it (`step_started`, or `run_started` before the first step), since the run has not ended; `run_finished` → nothing. Per-step state (checks, pushed commits, step warnings) is kept per attempt.
 
 **Child thread:** `step_reported`, written by `finish_step` (the tool's
 effect is its own kind, as `remember` writes `memory_remembered`).
