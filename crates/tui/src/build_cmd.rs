@@ -25,7 +25,7 @@ use crate::run_view::{Refused, fetch_backlog, outcome_line, render};
 
 /// The run finished `Closed`: the issue is done.
 pub const EXIT_OK: i32 = 0;
-/// The run stopped, or a runner error ended it: a human is needed.
+/// The run needs a person: it stopped, it escalated, or it waits at a gate.
 pub const EXIT_NEEDS_HUMAN: i32 = 3;
 /// The request itself failed.
 pub const EXIT_FAILED: i32 = 1;
@@ -116,9 +116,18 @@ pub async fn run(
                 }
                 printed = event.seq;
                 let line = render(&event);
-                if let Some(line) = line {
+                if let Some(line) = &line {
                     writeln!(err, "{line}")?;
                     err.flush()?;
+                }
+                if event.kind == EventKind::RunErrored {
+                    // The runner's own turn died. The run has not ended —
+                    // the next `build` resumes it — and only where the log
+                    // is can anyone read why it stopped. The line printed
+                    // above already carries the bounded reason.
+                    outcome.reason = line;
+                    outcome.code = EXIT_FAILED;
+                    return Ok(outcome);
                 }
                 // A gate is answered `stop`: `go` starts work nothing has
                 // briefed (slice 2's prompts do that).
@@ -495,6 +504,93 @@ mod tests {
 
         // A run stopped by a runner error: the note this command sees.
         assert_eq!(EXIT_FAILED, 1, "a run stopped by an error maps to 1");
+    }
+
+    /// T6 — a live `run_errored` stops the command: the bounded reason
+    /// goes to stderr, `outcome.reason` carries it and the code is
+    /// `EXIT_FAILED`, because the error is the provider's or the work's,
+    /// not a person's to answer.
+    #[tokio::test]
+    async fn a_live_run_errored_answers_exit_failed_and_prints_the_reason() {
+        use crate::run_view::fake_daemon::{FakeDaemon, Script};
+        use aigentic_api::Notice;
+
+        const REASON: &str = "turn: provider_error: HTTP 400 from the endpoint";
+
+        let dir = tempfile::tempdir().unwrap();
+        let lead = Ulid::generate();
+        // The lead as the incident left it: a step open, and the runner's
+        // own turn dead. The log holds the whole error; a line does not.
+        let backlog = vec![event_at(
+            EventKind::StepStarted,
+            0,
+            lead,
+            serde_json::json!({
+                "step": "implement",
+                "role": "implementer",
+                "profile": "flash",
+                "child_thread": Ulid::generate(),
+                "attempt": 1,
+                "budget_usd": 3.0,
+            }),
+        )];
+        let daemon = FakeDaemon::start(
+            dir.path(),
+            Script {
+                lead,
+                backlog,
+                resumed: true,
+                role: "admin",
+                refuse_build: None,
+                refuse_open: None,
+                missing: Vec::new(),
+                rows: Vec::new(),
+                children: Vec::new(),
+            },
+        )
+        .await;
+        let (client, _) = Client::connect(&daemon.addr(), "steve").await.unwrap();
+        let notices = client.take_notices().expect("the notice stream");
+        daemon.push(Notice::Event {
+            thread: lead,
+            event: event_at(
+                EventKind::RunErrored,
+                1,
+                lead,
+                serde_json::json!({"reason": REASON, "cost_usd": 0.4}),
+            ),
+        });
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = run(
+            &client,
+            notices,
+            "proj",
+            "steve",
+            &BuildArgs {
+                issue: 163,
+                workflow: None,
+                json: false,
+            },
+            &mut out,
+            &mut err,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.code, EXIT_FAILED,
+            "an error is not a person's to answer: {outcome:?}"
+        );
+        let line = outcome.reason.as_deref().unwrap_or_default();
+        assert!(
+            line.contains(REASON),
+            "the reason the runner noted is what the command answers with: {line}"
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains(line), "the same line reaches stderr: {err}");
+        daemon.stop();
     }
 
     /// One event with a chosen seq, as the log stores it.

@@ -2274,7 +2274,10 @@ impl ClientRepl {
                 true
             }
             Notice::Note { text, .. } if some_lead == Some(thread) => {
-                out.cell(Cell::Run(format!("note: {text}")), true);
+                out.cell(
+                    Cell::Run(format!("note: {}", crate::run_view::reason_line(text))),
+                    true,
+                );
                 // The runner says the run is over before its last
                 // events land; the follow ends here so nothing after
                 // it is drawn as live.
