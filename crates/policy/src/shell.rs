@@ -1458,6 +1458,345 @@ fn duplicates_a_descriptor(kind: Redir, target: &Word) -> bool {
         && target.text.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// The file a command writes, or the files it writes.
+///
+/// The reader is loose on purpose: a command it does not name contributes
+/// nothing, so what it cannot read keeps the ordinary rule and the file
+/// boundary in place rather than gaining a verdict of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Writer {
+    /// `tee`: every file word.
+    Tee,
+    /// `cp`, `mv`, `install`, `ln`: the last file word, or `-t`'s
+    /// directory.
+    LastFile,
+    /// `touch`, `mkdir`, `rmdir`, `rm`.
+    EveryFile,
+    /// `truncate`: as [`Writer::EveryFile`], but `-s`/`--size`/`-r`/
+    /// `--reference` name a length, not a file.
+    Truncate,
+    /// `sed`: its file words, and only while one of its words asks for an
+    /// in-place edit.
+    Sed,
+    /// `sort`: the value of `-o`/`--output`.
+    SortOutput,
+    /// `dd`: the value of an `of=` word.
+    DdOf,
+    /// `find`: the file of a `-fprint` family action always, and the path
+    /// words when the expression deletes what it finds.
+    Find,
+}
+
+/// The command word's writer, read off its final path component: `/bin/cp`
+/// and `cp` are the same command, as they are for the allow list.
+fn writer_of(word: &Word) -> Option<Writer> {
+    if word.broken || word.var || !word.subs.is_empty() {
+        return None;
+    }
+    match word.text.rsplit('/').next().unwrap_or(&word.text) {
+        "tee" => Some(Writer::Tee),
+        "cp" | "mv" | "install" | "ln" => Some(Writer::LastFile),
+        "touch" | "mkdir" | "rmdir" | "rm" => Some(Writer::EveryFile),
+        "truncate" => Some(Writer::Truncate),
+        "sed" => Some(Writer::Sed),
+        "sort" => Some(Writer::SortOutput),
+        "dd" => Some(Writer::DdOf),
+        "find" => Some(Writer::Find),
+        _ => None,
+    }
+}
+
+/// The words a command line writes through, in the order read, duplicates
+/// kept: a redirection that writes, the file arguments of the commands
+/// [`Writer`] names, and the same reading of every `$(…)` they hide.
+///
+/// The words come back as written, `~` and `$var` unexpanded, and nothing
+/// is canonicalised: resolving a word to a path is the caller's. What the
+/// reader cannot see is not reported, a miss rather than a verdict: a
+/// program named inside one word (`sh -c '…'`, an `xargs` program), a
+/// process substitution, a heredoc body, a forwarder whose table ran out,
+/// and a command no entry names.
+pub fn write_targets(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    targets_within(command, &mut out, 0);
+    out
+}
+
+fn targets_within(src: &str, out: &mut Vec<String>, depth: usize) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let mut nested: Vec<String> = Vec::new();
+    for seg in segments(Scanner::scan(src)) {
+        targets_of_segment(&seg, out, &mut nested);
+    }
+    for sub in nested {
+        targets_within(&sub, out, depth + 1);
+    }
+}
+
+/// One segment's write targets: its redirecting redirections first, then
+/// the files its command writes, then its substitutions for the caller to
+/// read as command lines of their own.
+fn targets_of_segment(seg: &Segment, out: &mut Vec<String>, nested: &mut Vec<String>) {
+    for (kind, target) in &seg.redirects {
+        let writes = match kind {
+            Redir::Out | Redir::Append => true,
+            Redir::Dup => !duplicates_a_descriptor(*kind, target),
+            // `<`, `<<`, `<<<` read, and `<(…)`/`>(…)` run a command the
+            // lexer has no kind for; neither names a file here.
+            Redir::In | Redir::Proc => false,
+        };
+        if writes {
+            push_target(out, target);
+        }
+        nested.extend(target.subs.iter().cloned());
+    }
+
+    // Every substitution inside a word runs, whatever the word is for.
+    let words: Vec<&Word> = seg.words.iter().collect();
+    for word in &words {
+        nested.extend(word.subs.iter().cloned());
+    }
+    let Some(rest) = command_words(&words) else {
+        return;
+    };
+    let Some(writer) = writer_of(rest[0]) else {
+        return;
+    };
+    written_files(writer, &rest[1..], out);
+}
+
+/// The words from the command word on: past the leading assignments and
+/// introducers, past the forwarders with all their own words (`sudo cp a
+/// f` is `cp a f`), as [`read_segment`] reads them. `None` when there is no
+/// command word, or when the forwarder's own table ran out: what would run
+/// behind an unknown forwarder suffix is not read.
+fn command_words<'a>(words: &[&'a Word]) -> Option<Vec<&'a Word>> {
+    let mut at = 0;
+    while at < words.len() {
+        if is_assignment(words[at]) || introduces(words[at]) {
+            at += 1;
+        } else if let Some((consumed, bad)) = forward(words, at) {
+            if bad {
+                return None;
+            }
+            at += consumed;
+        } else {
+            break;
+        }
+    }
+    words.get(at).map(|_| words[at..].to_vec())
+}
+
+/// Whether a word names a file argument: not an option word, unless `--`
+/// has ended the options, and not a word the lexer could not finish.
+fn file_word(word: &Word, options_ended: bool) -> bool {
+    !word.broken && !word.text.is_empty() && (options_ended || !word.text.starts_with('-'))
+}
+
+/// A target as written, when it is a word the lexer could finish reading.
+fn push_target(out: &mut Vec<String>, word: &Word) {
+    if !word.broken && !word.text.is_empty() {
+        out.push(word.text.clone());
+    }
+}
+
+/// The files one command's own words write, in the order read.
+fn written_files(writer: Writer, args: &[&Word], out: &mut Vec<String>) {
+    match writer {
+        Writer::Tee => every_file(args, &[], out),
+        Writer::EveryFile => every_file(args, &[], out),
+        Writer::Truncate => every_file(args, &["-s", "--size", "-r", "--reference"], out),
+        Writer::LastFile => last_file(args, out),
+        Writer::Sed => sed_files(args, out),
+        Writer::SortOutput => option_value(args, "-o", "--output", out),
+        Writer::DdOf => {
+            for word in args {
+                if let Some(value) = word.text.strip_prefix("of=") {
+                    push_text(out, word, value);
+                }
+            }
+        }
+        Writer::Find => find_files(args, out),
+    }
+}
+
+/// Every file word: `--` ends the options, and a value the lexer cannot
+/// read is no target.
+fn every_file(args: &[&Word], value_options: &[&str], out: &mut Vec<String>) {
+    let mut options_ended = false;
+    let mut value_follows = false;
+    for word in args {
+        if !options_ended && word.text == "--" {
+            options_ended = true;
+            continue;
+        }
+        if value_follows {
+            value_follows = false;
+            continue;
+        }
+        if !options_ended && value_options.contains(&word.text.as_str()) {
+            // `truncate -s 0 f`: the number is a length, not a file.
+            value_follows = true;
+            continue;
+        }
+        if file_word(word, options_ended) {
+            push_target(out, word);
+        }
+    }
+}
+
+/// `cp a b f`: the last file word, or the directory `-t` names.
+fn last_file(args: &[&Word], out: &mut Vec<String>) {
+    let mut options_ended = false;
+    let mut directory: Option<&Word> = None;
+    let mut last: Option<&Word> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let word = args[i];
+        if !options_ended && word.text == "--" {
+            options_ended = true;
+            i += 1;
+            continue;
+        }
+        if !options_ended {
+            if word.text.starts_with("--target-directory=") {
+                directory = Some(word);
+                i += 1;
+                continue;
+            }
+            if matches!(word.text.as_str(), "-t" | "--target-directory") {
+                if let Some(next) = args.get(i + 1) {
+                    directory = Some(next);
+                }
+                i += 2;
+                continue;
+            }
+        }
+        if file_word(word, options_ended) {
+            last = Some(word);
+        }
+        i += 1;
+    }
+    // `--target-directory=d` carries its own value, past the `=`; the
+    // separated form's value is the word behind it.
+    if let Some(word) = directory {
+        match word.text.split_once('=') {
+            Some((_, value)) => push_text(out, word, value),
+            None => push_target(out, word),
+        }
+    } else if let Some(word) = last {
+        push_target(out, word);
+    }
+}
+
+/// `sed -i s/a/b/ f g`: the file words, only while a word asks for the
+/// in-place edit. `-e`/`-f` name the script, so every other file word is a
+/// file; without them the first file word is the script.
+fn sed_files(args: &[&Word], out: &mut Vec<String>) {
+    let in_place = args.iter().any(|w| {
+        let t = w.text.as_str();
+        t.starts_with("--in-place")
+            || (t.starts_with('-') && !t.starts_with("--") && t[1..].contains('i'))
+    });
+    if !in_place {
+        return;
+    }
+    let script_option = args.iter().any(|w| {
+        let t = w.text.as_str();
+        matches!(t, "-e" | "--expression" | "-f" | "--file")
+            || t.starts_with("--expression=")
+            || t.starts_with("--file=")
+            || (t.starts_with('-')
+                && !t.starts_with("--")
+                && t.len() > 1
+                && t[1..].starts_with(['e', 'f']))
+    });
+    let mut options_ended = false;
+    let mut script_follows = false;
+    let mut script_seen = script_option;
+    for word in args {
+        if !options_ended && word.text == "--" {
+            options_ended = true;
+            continue;
+        }
+        if script_follows {
+            script_follows = false;
+            continue;
+        }
+        if !options_ended && matches!(word.text.as_str(), "-e" | "--expression" | "-f" | "--file") {
+            script_follows = true;
+            continue;
+        }
+        if !file_word(word, options_ended) {
+            continue;
+        }
+        if !script_seen {
+            // The first file word is the script itself.
+            script_seen = true;
+            continue;
+        }
+        push_target(out, word);
+    }
+}
+
+/// `sort -o f in`: the option's value, attached (`-of`, `--output=f`) or
+/// the word behind it.
+fn option_value(args: &[&Word], short: &str, long: &str, out: &mut Vec<String>) {
+    let mut i = 0;
+    while i < args.len() {
+        let text = args[i].text.as_str();
+        if let Some(value) = text.strip_prefix(&format!("{long}=")) {
+            push_text(out, args[i], value);
+        } else if text == long || text == short {
+            if let Some(next) = args.get(i + 1) {
+                push_target(out, next);
+            }
+            i += 2;
+            continue;
+        } else if let Some(value) = text.strip_prefix(short)
+            && !text.starts_with("--")
+            && !value.is_empty()
+        {
+            push_text(out, args[i], value);
+        }
+        i += 1;
+    }
+}
+
+/// `find f -delete`, `find f -fprint g`: the file a printing action names,
+/// and the path words when the expression deletes so that the targets are
+/// the files found.
+fn find_files(args: &[&Word], out: &mut Vec<String>) {
+    let printing = args
+        .iter()
+        .position(|w| is_fprint(w.text.as_str()))
+        .and_then(|at| args.get(at + 1));
+    if let Some(word) = printing {
+        push_target(out, word);
+    }
+    if args.iter().any(|w| w.text == "-delete") {
+        for word in args.iter().take_while(|w| !w.text.starts_with('-')) {
+            push_target(out, word);
+        }
+    }
+}
+
+/// `-fprint`, `-fprint0`, `-fprintf`, `-fls`: the find actions that name a
+/// file to write to.
+fn is_fprint(text: &str) -> bool {
+    matches!(text, "-fprint" | "-fprint0" | "-fprintf" | "-fls")
+}
+
+/// A value out of an option word: `--output=f` and `-of` carry it, and an
+/// empty one names no file.
+fn push_text(out: &mut Vec<String>, word: &Word, value: &str) {
+    if !word.broken && !value.is_empty() {
+        out.push(value.to_owned());
+    }
+}
+
 /// One segment of a command line, for callers that need the parts
 /// rather than the whole line's verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]

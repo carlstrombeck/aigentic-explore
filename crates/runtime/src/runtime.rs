@@ -519,8 +519,20 @@ impl Runtime {
     }
 
     pub fn with_policy(mut self, policy: Policy) -> Self {
-        self.policy = policy;
+        self.policy = self.policy_with_homes(policy);
         self
+    }
+
+    /// `policy` with the memory homes this thread's layers name. Layers
+    /// that name none leave it as given, so a caller's own homes survive
+    /// either order of `with_layers` and `with_policy`.
+    fn policy_with_homes(&self, policy: Policy) -> Policy {
+        let homes = memory_homes_of(&self.layers);
+        if homes.is_empty() {
+            policy
+        } else {
+            policy.with_memory_homes(homes)
+        }
     }
 
     /// Make this thread a step thread (issue #55): `step` is its name in
@@ -749,8 +761,12 @@ impl Runtime {
 
     /// The global and project layers; their instructions and memory join
     /// the stable prefix and their denials narrow the tools the model sees.
+    /// The memory homes the layers name join the policy here, so a thread
+    /// built with layers first gets them either way round.
     pub fn with_layers(mut self, layers: Layers) -> Self {
         self.layers = layers;
+        let policy = std::mem::take(&mut self.policy);
+        self.policy = self.policy_with_homes(policy);
         self.project_brief = self.layers.project.as_ref().and_then(crate::Project::brief);
         self.measured = None;
         // Knowledge cannot fail the constructor; an unreadable folder is
@@ -1182,6 +1198,18 @@ impl Runtime {
     pub fn budget(&self) -> &Budget {
         &self.budget
     }
+}
+
+/// The memory homes the layers name, in the order the extraction request
+/// names them (`Layers::extra_memory_homes`): the person's folder, then
+/// the workspace's. Empty for a thread with neither, which is a thread
+/// whose policy is untouched.
+fn memory_homes_of(layers: &Layers) -> Vec<std::path::PathBuf> {
+    layers
+        .extra_memory_homes()
+        .into_iter()
+        .filter_map(|home| layers.memory_home(home))
+        .collect()
 }
 
 /// A step thread's context (issue #55): the step's name in the group,

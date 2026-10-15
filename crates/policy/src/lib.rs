@@ -20,7 +20,7 @@ pub use rules::{
     Decision, MEMORY_HOME_RULE, MEMORY_PREFIX, MEMORY_REASON, Riskiest, Rule, default_bash_allow,
     default_rules, prefix_of, riskiest_segment,
 };
-pub use shell::{Kind, ScanSegment, main_segment, scan};
+pub use shell::{Kind, ScanSegment, main_segment, scan, write_targets};
 pub use step::{DenyParseError, StepOverlay};
 
 /// What policy says about one call.
@@ -193,10 +193,16 @@ impl Policy {
     /// The memory folders the model may not write under: the person's and
     /// each workspace's. Every home is canonicalised here, and appends,
     /// like [`with_boundary_roots`](Self::with_boundary_roots), so a
-    /// later call can only refuse more.
+    /// later call can only refuse more. A home already held is not added
+    /// twice, so the daemon's policy and a thread's runtime, each of
+    /// which names the homes it can see, end with the same list.
     pub fn with_memory_homes(mut self, homes: impl IntoIterator<Item = PathBuf>) -> Self {
-        self.memory_homes
-            .extend(homes.into_iter().map(|h| canonicalise(&h)));
+        for home in homes {
+            let home = canonicalise(&home);
+            if !self.memory_homes.contains(&home) {
+                self.memory_homes.push(home);
+            }
+        }
         self
     }
 
@@ -207,20 +213,66 @@ impl Policy {
 
     /// The memory home a call would write under, canonical, or `None`
     /// when it writes under none of them. A read is never a hit: only
-    /// `write_file` and `edit_file` are read.
+    /// `write_file`, `edit_file` and the files a `bash` command line
+    /// writes are read.
     fn memory_home_target(&self, call: &ToolCall, cwd: Option<&Path>) -> Option<PathBuf> {
         if self.memory_homes.is_empty() {
             return None;
         }
-        let path = match call.name.as_str() {
-            "write_file" | "edit_file" => match self.boundary_target(call, cwd) {
-                Some(Ok(path)) => path,
-                // An unchecked or unresolvable call reaches no home.
-                _ => return None,
-            },
-            _ => return None,
-        };
-        self.home_holding(&path)
+        match call.name.as_str() {
+            "write_file" | "edit_file" => {
+                let path = match self.boundary_target(call, cwd) {
+                    Some(Ok(path)) => path,
+                    // An unchecked or unresolvable call reaches no home.
+                    _ => return None,
+                };
+                self.home_holding(&path)
+            }
+            "bash" => self.bash_home_target(call, cwd),
+            _ => None,
+        }
+    }
+
+    /// The home a `bash` command line writes under, or `None` when it
+    /// writes under none of them. Every write target
+    /// [`shell::write_targets`] finds is resolved the way the command
+    /// line itself would — a leading `~` is `$HOME`, a relative word is
+    /// the working directory's — and the first home held by a target in
+    /// that order answers.
+    fn bash_home_target(&self, call: &ToolCall, cwd: Option<&Path>) -> Option<PathBuf> {
+        let command = call.args.get("command")?.as_str()?;
+        for target in shell::write_targets(command) {
+            for resolved in self.readings(&target, cwd) {
+                if let Some(home) = self.home_holding(&resolved) {
+                    return Some(home);
+                }
+            }
+        }
+        None
+    }
+
+    /// What one write target can name, each canonical: the word as it was
+    /// written, and, past its leading `~`, the path that expands to. A
+    /// word holding a `$var` is only ever tried as written, so a looser
+    /// reading of it can never refuse a file it does not name; a relative
+    /// word with no working directory to resolve it against answers with
+    /// nothing, since there is nothing to prove.
+    fn readings(&self, target: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
+        let mut words = vec![PathBuf::from(target)];
+        if let Some(expanded) = expand_home(target) {
+            words.push(expanded);
+        }
+        let cwd = cwd.or(self.cwd.as_deref());
+        words
+            .iter()
+            .filter_map(|word| {
+                if word.is_absolute() {
+                    Some(canonicalise(word))
+                } else {
+                    cwd.map(|cwd| canonicalise(&cwd.join(word)))
+                }
+            })
+            .collect()
     }
 
     /// The first configured home holding `path`, compared by component
@@ -420,6 +472,18 @@ fn normalise(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// `~` and `~/…` as the process's home, the way `[policy] allow_paths`
+/// reads them. Another `~name` names a user, and an unset `HOME` names
+/// nothing: both answer `None`, so the word stands as written.
+fn expand_home(word: &str) -> Option<PathBuf> {
+    let rest = word.strip_prefix('~')?;
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return None;
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(rest.trim_start_matches('/')))
 }
 
 /// How many symlink hops a hand resolution follows before giving up,

@@ -226,6 +226,123 @@ fn only_a_path_inside_a_home_is_refused() {
     }
 }
 
+/// A `bash` call as the loop hands it to policy: the command word and its
+/// words, with an explicit working directory in `decide`.
+fn bash(command: &str) -> ToolCall {
+    ToolCall {
+        id: "c2".into(),
+        name: "bash".into(),
+        args: json!({ "command": command }),
+    }
+}
+
+/// Whether a policy allowed the call.
+fn is_allow(outcome: &Outcome) -> bool {
+    matches!(outcome, Outcome::Allow { .. })
+}
+
+#[test]
+fn a_bash_write_target_under_a_home_is_denied() {
+    let f = Fixture::new();
+    let p = Policy::defaults()
+        .with_root(&f.project, &f.project)
+        .with_memory_homes(f.homes());
+    let without = Policy::defaults().with_root(&f.project, &f.project);
+    for home in f.homes() {
+        let facts = home.join("facts.md");
+        let rows = [
+            format!("tee {facts}", facts = facts.display()),
+            format!("echo x | tee {facts}", facts = facts.display()),
+            format!("sed -i s/a/b/ {facts}", facts = facts.display()),
+            format!("cp a {facts}", facts = facts.display()),
+            format!("mv a {facts}", facts = facts.display()),
+            format!("echo x >> {facts}", facts = facts.display()),
+        ];
+        for command in rows {
+            assert_eq!(
+                p.decide(&bash(&command), RiskClass::Write, None),
+                denied_in(&home),
+                "{command}"
+            );
+            assert!(
+                !is_memory_deny(&without.decide(&bash(&command), RiskClass::Write, None)),
+                "without the homes {command} is not this deny"
+            );
+        }
+    }
+    // The fixture's symlink reaches the person's folder from inside the
+    // project, so the write is still under that home.
+    assert_eq!(
+        p.decide(&bash("echo x >> link/facts.md"), RiskClass::Write, None),
+        denied_in(&f.person)
+    );
+    // A read of a home and a write outside every home are what they were:
+    // the `bash` allow-list allows the first, the boundary asks about the
+    // second.
+    let facts = f.person.join("facts.md");
+    let read = bash(&format!("cat {}", facts.display()));
+    assert!(
+        is_allow(&p.decide(&read, RiskClass::Write, None)),
+        "the `bash` allow rule still allows a read of a home"
+    );
+    let outside = bash("echo x > /tmp/out");
+    assert_eq!(
+        p.decide(&outside, RiskClass::Write, None),
+        without.decide(&outside, RiskClass::Write, None),
+        "a write outside every home is unchanged"
+    );
+}
+
+#[test]
+fn a_tilde_write_target_is_expanded_against_home() {
+    let f = Fixture::new();
+    // `HOME` is process-wide and `set_var` is unsafe; this test is the only
+    // reader of it in the crate, and the window closes before any assertion
+    // so a failure cannot leave it set.
+    let previous = std::env::var_os("HOME");
+    let p = Policy::defaults()
+        .with_root(&f.project, &f.project)
+        .with_memory_homes(f.homes());
+    let without = Policy::defaults().with_root(&f.project, &f.project);
+    let tilde = "~/person-memory/facts.md";
+    let decisions = {
+        unsafe { std::env::set_var("HOME", &f.base) };
+        let rows = [
+            p.decide(&bash(&format!("cat {tilde}")), RiskClass::Write, None),
+            p.decide(&bash(&format!("tee {tilde}")), RiskClass::Write, None),
+            without.decide(&bash(&format!("tee {tilde}")), RiskClass::Write, None),
+            without.decide(
+                &bash(&format!("tee {}", f.person.join("facts.md").display())),
+                RiskClass::Write,
+                None,
+            ),
+        ];
+        match previous.clone() {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        rows
+    };
+    assert!(
+        is_allow(&decisions[0]),
+        "reading through `~` is a read, got {:?}",
+        decisions[0]
+    );
+    assert_eq!(
+        decisions[1],
+        denied_in(&f.person),
+        "`~` resolved against HOME is a write under the home"
+    );
+    assert!(
+        !is_memory_deny(&decisions[2]),
+        "without the homes the same `~` command is not this deny"
+    );
+    assert_eq!(
+        decisions[2], decisions[3],
+        "without the homes, `~` and the path it names decide alike"
+    );
+}
+
 #[test]
 fn the_boundary_still_decides_reads_around_a_home() {
     let f = Fixture::new();
