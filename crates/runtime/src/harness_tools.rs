@@ -292,12 +292,59 @@ impl<'de> Deserialize<'de> for AskHumanArgs {
 }
 
 /// One checklist item as the model sends it.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Task {
     pub text: String,
-    #[serde(default)]
     pub state: TaskState,
+}
+
+/// A row names its state `state`, or `status` as the other spelling of the
+/// same field: a model mixes the two within one call. Exactly one of the
+/// two is accepted — a row carrying both is refused, naming both, because
+/// which one it meant is not in the row — and a row that carries neither is
+/// `Pending`. Every other key is refused, and so is either spelling sent as
+/// `null`.
+///
+/// Hand-written rather than `#[serde(alias = "status")]`, which reads two
+/// spellings of one field as one field and so cannot report a row that
+/// carries both as anything but a duplicate.
+impl<'de> Deserialize<'de> for Task {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, expecting = "struct Task")]
+        struct Raw {
+            text: String,
+            #[serde(default, deserialize_with = "deserialize_present")]
+            state: Option<TaskState>,
+            #[serde(default, deserialize_with = "deserialize_present")]
+            status: Option<TaskState>,
+        }
+        let raw = Raw::deserialize(d)?;
+        let state = match (raw.state, raw.status) {
+            (Some(state), None) | (None, Some(state)) => state,
+            (None, None) => TaskState::default(),
+            (Some(_), Some(_)) => {
+                return Err(serde::de::Error::custom(
+                    "a row carries both `state` and `status`; send one",
+                ));
+            }
+        };
+        Ok(Self {
+            text: raw.text,
+            state,
+        })
+    }
+}
+
+/// Reads a field so that a value that is present reads as `Some`, `null`
+/// included. A plain `Option` would read `null` as absent, which would let
+/// a row send `null` and be silently `Pending` instead of refused.
+fn deserialize_present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -1841,6 +1888,94 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    // --- A row's other spelling of `state` -----------------------------
+
+    /// The `update_tasks` row as the model is shown it, so an expectation
+    /// drawn from the schema moves with the tool.
+    fn row_schema() -> serde_json::Value {
+        harness_specs(false, false, false)
+            .into_iter()
+            .find(|s| s.name == UPDATE_TASKS)
+            .expect("the runtime always offers update_tasks")
+            .schema["properties"]["tasks"]["items"]
+            .clone()
+    }
+
+    /// The state spellings the schema advertises, in its own order.
+    fn advertised_states() -> Vec<String> {
+        row_schema()["properties"]["state"]["enum"]
+            .as_array()
+            .expect("a row's state is an enum")
+            .iter()
+            .map(|v| v.as_str().expect("a spelling is a string").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_row_takes_status_for_each_of_the_three_states() {
+        let states = [TaskState::Pending, TaskState::Active, TaskState::Done];
+        let spellings = advertised_states();
+        assert_eq!(spellings.len(), states.len(), "{spellings:?}");
+        for (spelling, state) in spellings.iter().zip(states) {
+            let task = serde_json::from_value::<Task>(json!({"text": "t", "status": spelling}))
+                .unwrap_or_else(|e| panic!("a row's `status: {spelling}` is refused: {e}"));
+            assert_eq!(
+                task,
+                Task {
+                    text: "t".into(),
+                    state
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_that_spells_both_state_and_status_is_refused_naming_both() {
+        let err = serde_json::from_value::<Task>(json!({
+            "text": "t",
+            "state": "done",
+            "status": "pending",
+        }))
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("state") && message.contains("status"),
+            "a row that spells both names both: {message}"
+        );
+    }
+
+    #[test]
+    fn a_row_without_either_spelling_is_pending() {
+        let task = serde_json::from_value::<Task>(json!({"text": "t"})).unwrap();
+        assert_eq!(task.state, TaskState::Pending);
+    }
+
+    #[test]
+    fn a_row_with_a_null_or_an_unknown_key_is_still_refused() {
+        for row in [
+            json!({"text": "t", "state": null}),
+            json!({"text": "t", "status": null}),
+        ] {
+            let err = serde_json::from_value::<Task>(row.clone()).unwrap_err();
+            assert!(err.to_string().contains("null"), "{row}: {err}");
+        }
+        for row in [
+            json!({"text": "t", "bogus": "pending"}),
+            json!({"text": "t", "status": "done", "bogus": 1}),
+        ] {
+            let err = serde_json::from_value::<Task>(row.clone()).unwrap_err();
+            assert!(err.to_string().contains("bogus"), "{row}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_row_that_is_not_an_object_is_refused_as_a_struct_task() {
+        for value in [json!("done"), json!([])] {
+            let err = serde_json::from_value::<Task>(value.clone()).unwrap_err();
+            assert!(err.to_string().contains("struct Task"), "{value}: {err}");
+        }
     }
 
     #[test]
