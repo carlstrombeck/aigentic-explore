@@ -7,17 +7,23 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use aigentic_core::{
-    AgentId, Capabilities, CompletionRequest, Message, Provider, ProviderEvent, RiskClass, ToolCall,
+    AgentId, Author, Capabilities, CompletionRequest, ContentBlock, EventKind, Message, Provider,
+    ProviderEvent, RiskClass, ToolCall, UserId,
 };
-use aigentic_log::ThreadLog;
-use aigentic_policy::{MEMORY_HOME_RULE, Outcome, Policy};
+use aigentic_log::{ThreadLog, ToolResultPayload};
+use aigentic_policy::{MEMORY_HOME_RULE, MEMORY_REASON, Outcome, Policy};
 use aigentic_runtime::project::{MEMORY_DIR, person_memory_dir};
-use aigentic_runtime::{GlobalLayer, Layers, Runtime, WorkspaceLayer};
-use aigentic_tools::ToolRegistry;
+use aigentic_runtime::{GlobalLayer, Layers, Mode, Runtime, WorkspaceLayer};
+use aigentic_tools::{DEFAULT_TIMEOUT, ToolRegistry, Workdir};
 use futures_core::Stream;
 use serde_json::json;
 
-/// Enough of a provider to construct a runtime; no turn is ever run.
+mod common;
+
+use common::{done, scripted};
+
+/// Enough of a provider to construct a runtime; tests that run a turn
+/// script their own.
 struct Quiet;
 
 impl Provider for Quiet {
@@ -181,4 +187,99 @@ fn a_thread_without_a_home_gets_an_empty_list() {
             "{tool} outside the root asks about the boundary, got {here:?}"
         );
     }
+}
+
+/// Runs one `bash` call, then a stop, in `mode`, over the fixture's thread
+/// layers (both homes) and its project as root, and answers with the text
+/// the call's result carries. The built-in tools are registered, so the
+/// command really changes directory and writes.
+async fn run_bash(f: &Fixture, command: &str, mode: Mode) -> String {
+    let (provider, _seen) = scripted(vec![
+        vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                args: json!({ "command": command }),
+            }),
+            done("tool_use"),
+        ],
+        vec![done("stop")],
+    ]);
+    let log = ThreadLog::open(&f.project, ulid::Ulid::generate()).unwrap();
+    let mut runtime = Runtime::new(
+        provider,
+        ToolRegistry::builtin(Workdir::new(&f.project), DEFAULT_TIMEOUT),
+        log,
+        AgentId("worker".into()),
+    )
+    .with_layers(f.layers(Some("steve"), Some(&f.shared)))
+    .with_policy(Policy::defaults().with_root(&f.project, &f.project));
+    runtime.set_mode(mode);
+    runtime
+        .run_turn(
+            Author::User(UserId("steve".into())),
+            vec![ContentBlock::Text("go".into())],
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    for e in runtime.log().read_all().unwrap() {
+        if e.kind != EventKind::ToolResult {
+            continue;
+        }
+        let p: ToolResultPayload = serde_json::from_value(e.payload.clone()).unwrap();
+        if p.result.id == "c1" {
+            return p.result.content;
+        }
+    }
+    panic!("no tool result for c1");
+}
+
+/// A command that changes directory into a home and writes there, in the
+/// same call, is refused: the check reads where the words after the `cd`
+/// write, and `Mode::Auto`, which answers every ask, would otherwise let
+/// the write land.
+#[tokio::test]
+async fn a_cd_into_a_home_and_a_write_in_one_call_is_refused() {
+    let f = Fixture::new();
+    let home = f.person();
+    let text = run_bash(
+        &f,
+        &format!("cd {} && printf x > note.md", home.display()),
+        Mode::Auto,
+    )
+    .await;
+    assert!(
+        text.contains(MEMORY_HOME_RULE) && text.contains(MEMORY_REASON),
+        "the refusal names the homes' rule and reason, got {text:?}"
+    );
+    assert!(
+        !home.join("note.md").exists(),
+        "nothing was written under {}",
+        home.display()
+    );
+}
+
+/// The same shape outside every home runs under the mode that answers an
+/// ask, so the refusal above is the home the words name and not the `cd`.
+#[tokio::test]
+async fn a_cd_and_a_write_outside_every_home_still_runs() {
+    let f = Fixture::new();
+    let here = f.project.join("sub");
+    fs::create_dir_all(&here).unwrap();
+    let text = run_bash(
+        &f,
+        &format!("cd {} && printf x > facts.md", here.display()),
+        Mode::Auto,
+    )
+    .await;
+    assert!(
+        !text.contains(MEMORY_HOME_RULE),
+        "no home is named, got {text:?}"
+    );
+    assert!(
+        here.join("facts.md").exists(),
+        "the write landed in {}",
+        here.display()
+    );
 }

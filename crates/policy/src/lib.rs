@@ -20,7 +20,9 @@ pub use rules::{
     Decision, MEMORY_HOME_RULE, MEMORY_PREFIX, MEMORY_REASON, Riskiest, Rule, default_bash_allow,
     default_rules, prefix_of, riskiest_segment,
 };
-pub use shell::{Kind, ScanSegment, main_segment, scan, write_targets};
+pub use shell::{
+    Kind, ScanSegment, WriteTarget, main_segment, scan, write_targets, write_targets_from,
+};
 pub use step::{DenyParseError, StepOverlay};
 
 /// What policy says about one call.
@@ -235,14 +237,14 @@ impl Policy {
 
     /// The home a `bash` command line writes under, or `None` when it
     /// writes under none of them. Every write target
-    /// [`shell::write_targets`] finds is resolved the way the command
-    /// line itself would — a leading `~` is `$HOME`, a relative word is
-    /// the working directory's — and the first home held by a target in
-    /// that order answers.
+    /// [`shell::write_targets_from`] finds is resolved the way the command
+    /// line itself would — a leading `~` is `$HOME`, a relative word is the
+    /// directory in effect where it appears, `cd` words included — and the
+    /// first home held by a target in that order answers.
     fn bash_home_target(&self, call: &ToolCall, cwd: Option<&Path>) -> Option<PathBuf> {
         let command = call.args.get("command")?.as_str()?;
-        for target in shell::write_targets(command) {
-            for resolved in self.readings(&target, cwd) {
+        for target in shell::write_targets_from(command, cwd.or(self.cwd.as_deref())) {
+            for resolved in self.readings(&target) {
                 if let Some(home) = self.home_holding(&resolved) {
                     return Some(home);
                 }
@@ -256,21 +258,24 @@ impl Policy {
     /// lexer has already dropped a variable's own text, so `$VAR/…` is
     /// never expanded to a value — a target the shell would resolve at
     /// run time stays a word no home can be proven to hold. A relative
-    /// word with no working directory to resolve it against answers with
+    /// word resolves against the directory in effect where it appears,
+    /// and one with no directory to resolve it against answers with
     /// nothing, since there is nothing to prove.
-    fn readings(&self, target: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
-        let mut words = vec![PathBuf::from(target)];
-        if let Some(expanded) = expand_home(target) {
+    fn readings(&self, target: &WriteTarget) -> Vec<PathBuf> {
+        let mut words = vec![PathBuf::from(&target.word)];
+        if let Some(expanded) = expand_home(&target.word) {
             words.push(expanded);
         }
-        let cwd = cwd.or(self.cwd.as_deref());
         words
             .iter()
             .filter_map(|word| {
                 if word.is_absolute() {
                     Some(canonicalise(word))
                 } else {
-                    cwd.map(|cwd| canonicalise(&cwd.join(word)))
+                    target
+                        .cwd
+                        .as_deref()
+                        .map(|cwd| canonicalise(&cwd.join(word)))
                 }
             })
             .collect()

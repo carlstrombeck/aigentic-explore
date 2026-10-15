@@ -1,6 +1,5 @@
-//! The memory homes (issue #138): the person's and each workspace's memory
-//! folder are written by extraction, never by the model, and no rule may
-//! allow one.
+//! The memory homes: the person's and each workspace's memory folder are
+//! written by extraction, never by the model, and no rule may allow one.
 //!
 //! Every row is checked against a policy with the homes and against the
 //! same policy without them, so the homes account for exactly the
@@ -257,6 +256,11 @@ fn a_bash_write_target_under_a_home_is_denied() {
             format!("cp a {facts}", facts = facts.display()),
             format!("mv a {facts}", facts = facts.display()),
             format!("echo x >> {facts}", facts = facts.display()),
+            // The directory a `cd` word names is where the words after it
+            // write, so a relative target there is refused; the reader
+            // moves the directory across `&&` and `&` alike.
+            format!("cd {home} && echo x >> facts.md", home = home.display()),
+            format!("cd {home} & printf x > facts.md", home = home.display()),
         ];
         for command in rows {
             assert_eq!(
@@ -354,6 +358,45 @@ fn a_tilde_write_target_is_expanded_against_home() {
         decisions[2], decisions[3],
         "without the homes, `~` and the path it names decide alike"
     );
+}
+
+/// A home is a folder, not a prefix of a name: a sibling whose name starts
+/// the same is a different path and no write under it is refused as a home
+/// write.
+#[test]
+fn a_sibling_whose_name_starts_like_a_home_is_not_inside_it() {
+    let f = Fixture::new();
+    let home = f.base.join("memory");
+    fs::create_dir_all(&home).unwrap();
+    let p = Policy::defaults()
+        .with_root(&f.project, &f.project)
+        .with_memory_homes([home.clone()]);
+    let without = Policy::defaults().with_root(&f.project, &f.project);
+    assert_eq!(
+        p.decide(
+            &call("write_file", &home.join("facts.md")),
+            RiskClass::Write,
+            None
+        ),
+        denied_in(&home),
+        "a file in the folder the home names is under it"
+    );
+    for path in [f.base.join("memoryX/f"), f.base.join("memory-notes.md")] {
+        let call = call("write_file", &path);
+        let here = p.decide(&call, RiskClass::Write, None);
+        assert!(
+            !is_memory_deny(&here),
+            "{} is beside {}, not under it, got {here:?}",
+            path.display(),
+            home.display()
+        );
+        assert_eq!(
+            here,
+            without.decide(&call, RiskClass::Write, None),
+            "the home changes nothing for {}",
+            path.display()
+        );
+    }
 }
 
 #[test]

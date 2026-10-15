@@ -15,6 +15,7 @@
 //! commit && git push` asks as `git push`.
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 
 /// What one segment of a command line is, least to worst. The order is
 /// the risk order too: the riskiest segment a line has is the worst
@@ -1506,6 +1507,19 @@ fn writer_of(word: &Word) -> Option<Writer> {
     }
 }
 
+/// One word a command line writes through, with the directory a relative
+/// one names a path in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteTarget {
+    /// The word as written: `~` and `$var` unexpanded, nothing
+    /// canonicalised.
+    pub word: String,
+    /// The directory `word` resolves against when it is relative: the
+    /// caller's, with every `cd <dir>` word before it on the same command
+    /// line applied. `None` when the caller named none.
+    pub cwd: Option<PathBuf>,
+}
+
 /// The words a command line writes through, in the order read, duplicates
 /// kept: a redirection that writes, the file arguments of the commands
 /// [`Writer`] names, and the same reading of every `$(…)` they hide.
@@ -1517,22 +1531,77 @@ fn writer_of(word: &Word) -> Option<Writer> {
 /// process substitution, a heredoc body, a forwarder whose table ran out,
 /// and a command no entry names.
 pub fn write_targets(command: &str) -> Vec<String> {
+    write_targets_from(command, None)
+        .into_iter()
+        .map(|target| target.word)
+        .collect()
+}
+
+/// [`write_targets`], each word with the directory a relative one resolves
+/// against: a `cd <dir>` word sets the directory for the words after it, so
+/// `cd /elsewhere && echo x > f` writes `/elsewhere/f`. A relative `dir` is
+/// measured from `cwd`, and its own leading `~` is `$HOME`. A `cd` word
+/// moves the directory for every later segment whatever separates them, so
+/// a backgrounded or piped `cd` — which moves no shell — is read as if it
+/// did. A `cd` word the reader cannot read — one holding a `$var` or a
+/// substitution, or none at all — leaves the directory as it last knew it;
+/// another directory-changing word (`pushd`, a `chdir` inside a program) is
+/// not read at all. As with [`write_targets`], a form the reader cannot see
+/// leaves the caller's own reading in place.
+pub fn write_targets_from(command: &str, cwd: Option<&Path>) -> Vec<WriteTarget> {
     let mut out = Vec::new();
-    targets_within(command, &mut out, 0);
+    targets_within(command, cwd, &mut out, 0);
     out
 }
 
-fn targets_within(src: &str, out: &mut Vec<String>, depth: usize) {
+fn targets_within(src: &str, cwd: Option<&Path>, out: &mut Vec<WriteTarget>, depth: usize) {
     if depth > MAX_DEPTH {
         return;
     }
-    let mut nested: Vec<String> = Vec::new();
+    let mut here = cwd.map(Path::to_path_buf);
     for seg in segments(Scanner::scan(src)) {
-        targets_of_segment(&seg, out, &mut nested);
+        let mut words: Vec<String> = Vec::new();
+        let mut nested: Vec<String> = Vec::new();
+        targets_of_segment(&seg, &mut words, &mut nested);
+        out.extend(words.into_iter().map(|word| WriteTarget {
+            word,
+            cwd: here.clone(),
+        }));
+        for sub in nested {
+            targets_within(&sub, here.as_deref(), out, depth + 1);
+        }
+        if let Some(dir) = changed_dir(&seg, here.as_deref()) {
+            here = Some(dir);
+        }
     }
-    for sub in nested {
-        targets_within(&sub, out, depth + 1);
+}
+
+/// The directory a `cd <dir>` segment changes to: `dir` measured from
+/// `cwd` when it is relative, a leading `~` as `$HOME`, and left
+/// uncanonicalised for the caller to resolve, so a symlink or a `..`
+/// settles where the words are read. `None` when the segment's command is
+/// not `cd`, or its word names no directory the reader can see — a `$var`,
+/// a substitution, an option word, or no word at all.
+fn changed_dir(seg: &Segment, cwd: Option<&Path>) -> Option<PathBuf> {
+    let words: Vec<&Word> = seg.words.iter().collect();
+    let rest = command_words(&words)?;
+    if rest[0].text != "cd" {
+        return None;
     }
+    let dir = rest[1..].iter().find(|word| file_word(word, false))?;
+    // A quoted word is read: its text is what runs. Only a word holding a
+    // `$var`, a substitution or an unclosed construct hides its directory.
+    if dir.broken || dir.var || !dir.subs.is_empty() {
+        return None;
+    }
+    let path = match crate::expand_home(&dir.text) {
+        Some(expanded) => expanded,
+        None => PathBuf::from(&dir.text),
+    };
+    if path.is_absolute() {
+        return Some(path);
+    }
+    cwd.map(|cwd| cwd.join(path))
 }
 
 /// One segment's write targets: its redirecting redirections first, then
