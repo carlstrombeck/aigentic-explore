@@ -286,8 +286,13 @@ fn a_bash_write_target_under_a_home_is_denied() {
         "the `bash` allow rule still allows a read of a home"
     );
     let outside = bash("echo x > /tmp/out");
+    let asked = p.decide(&outside, RiskClass::Write, None);
+    assert!(
+        matches!(asked, Outcome::Ask { .. }),
+        "a write outside every home still asks, got {asked:?}"
+    );
     assert_eq!(
-        p.decide(&outside, RiskClass::Write, None),
+        asked,
         without.decide(&outside, RiskClass::Write, None),
         "a write outside every home is unchanged"
     );
@@ -308,8 +313,16 @@ fn a_tilde_write_target_is_expanded_against_home() {
     let decisions = {
         unsafe { std::env::set_var("HOME", &f.base) };
         let rows = [
-            p.decide(&bash(&format!("cat {tilde}")), RiskClass::Write, None),
-            p.decide(&bash(&format!("tee {tilde}")), RiskClass::Write, None),
+            p.decide(
+                &bash(&format!("cat {facts} {tilde}", facts = f.person.display())),
+                RiskClass::Write,
+                None,
+            ),
+            p.decide(
+                &bash(&format!("tee {facts} {tilde}", facts = f.person.display())),
+                RiskClass::Write,
+                None,
+            ),
             without.decide(&bash(&format!("tee {tilde}")), RiskClass::Write, None),
             without.decide(
                 &bash(&format!("tee {}", f.person.join("facts.md").display())),

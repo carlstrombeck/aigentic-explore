@@ -13,7 +13,7 @@ use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
 use aigentic_runtime::project::person_memory_dir;
 use aigentic_runtime::{
     DEFAULT_COMPACTION, GlobalLayer, Layers, Project, ProjectContext, ProjectFile, ProjectRow,
-    Runtime, WorkspaceLayer,
+    Runtime, WorkspaceLayer, memory_homes_of,
 };
 use ulid::Ulid;
 
@@ -170,7 +170,8 @@ pub async fn project_context(
         .policy()
         .with_root(&root.root, &root.root)
         .with_boundary_roots(boundary_roots(&file, &root.root, &skills))
-        .with_rules_file(&rules_file);
+        .with_rules_file(&rules_file)
+        .with_memory_homes(memory_homes_of(&layers));
     Ok(Context {
         ctx: ProjectContext {
             name: opened.as_ref().map(|p| p.name.clone()),
@@ -654,5 +655,130 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(plain.runtime.utility_label(), None);
+    }
+
+    /// A daemon thread's policy carries the memory homes its layers name,
+    /// and only the ones it has: the person's folder with an owner, the
+    /// workspace's with a shared dir. A write under either is refused, so
+    /// the model cannot edit the memory it will be handed next turn.
+    #[tokio::test]
+    async fn a_built_thread_denies_writes_under_its_memory_homes() {
+        use aigentic_runtime::aigentic_policy::{MEMORY_HOME_RULE, MEMORY_REASON, Outcome};
+        use aigentic_runtime::project::{MEMORY_DIR, person_memory_dir};
+        use aigentic_runtime::{WorkspaceLayer, aigentic_core::RiskClass, aigentic_core::ToolCall};
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let config_dir = base.join("config");
+        let shared = base.join("shared");
+        let project = base.join("project");
+        for d in [&config_dir, &shared, &project] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::create_dir_all(person_memory_dir(&config_dir)).unwrap();
+        let config = Config::parse(
+            "default_profile = \"plain\"\n[profiles.plain]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
+        )
+        .unwrap();
+        let root = |root: &Path| Root {
+            name: "project".into(),
+            root: root.to_path_buf(),
+            threads_dir: base.join("threads"),
+        };
+        let workspaces = [Workspace {
+            name: "ws".into(),
+            shared: Some(shared.clone()),
+            projects: vec![project.clone()],
+        }];
+        /// One thread, built the way the daemon builds one.
+        async fn thread(
+            config: &Config,
+            config_dir: &Path,
+            owner: Option<&str>,
+            root: &Root,
+            workspaces: &[Workspace],
+        ) -> Built {
+            build_thread(
+                config,
+                config_dir,
+                owner,
+                &Stub,
+                root,
+                workspaces,
+                Ulid::from_datetime(std::time::SystemTime::now()),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+        }
+
+        let built = thread(
+            &config,
+            &config_dir,
+            Some("steve"),
+            &root(&project),
+            &workspaces,
+        )
+        .await;
+        let expected = vec![
+            person_memory_dir(&config_dir),
+            WorkspaceLayer::dir(&shared).join(MEMORY_DIR),
+        ];
+        assert_eq!(built.runtime.policy().memory_homes(), expected);
+        for home in &expected {
+            for tool in ["write_file", "edit_file"] {
+                let call = ToolCall {
+                    id: "c1".into(),
+                    name: tool.into(),
+                    args: serde_json::json!({ "path": home.join("facts.md").to_str().unwrap() }),
+                };
+                let outcome = built.runtime.policy().decide(&call, RiskClass::Write, None);
+                assert_eq!(
+                    outcome,
+                    Outcome::Deny {
+                        rule: MEMORY_HOME_RULE.to_owned(),
+                        reason: format!("{MEMORY_REASON}: {}", home.display()),
+                    },
+                    "{tool} under {} is a write under a home",
+                    home.display()
+                );
+            }
+        }
+
+        // No owner, and a workspace with no shared dir: no home, so the
+        // policy is the one a thread without memory gets.
+        let bare_workspaces = [Workspace {
+            name: "ws".into(),
+            shared: None,
+            projects: vec![project.clone()],
+        }];
+        let bare = thread(
+            &config,
+            &config_dir,
+            None,
+            &root(&project),
+            &bare_workspaces,
+        )
+        .await;
+        assert!(bare.runtime.policy().memory_homes().is_empty());
+        for home in &expected {
+            for tool in ["write_file", "edit_file"] {
+                let call = ToolCall {
+                    id: "c1".into(),
+                    name: tool.into(),
+                    args: serde_json::json!({ "path": home.join("facts.md").to_str().unwrap() }),
+                };
+                let outcome = bare.runtime.policy().decide(&call, RiskClass::Write, None);
+                assert!(
+                    !matches!(&outcome, Outcome::Deny { rule, .. } if rule == MEMORY_HOME_RULE),
+                    "{tool} with no home is not the memory deny, got {outcome:?}"
+                );
+                assert!(
+                    matches!(&outcome, Outcome::Ask { .. } | Outcome::AskBoundary { .. }),
+                    "{tool} outside the project still asks, got {outcome:?}"
+                );
+            }
+        }
     }
 }

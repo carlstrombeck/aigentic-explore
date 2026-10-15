@@ -69,6 +69,6 @@ pub use run_status::{Phase, RunStatus, run_status};
 pub use runtime::{
     ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, INTERRUPTED, LENGTH_STOP,
     MAX_TOKENS_STOP, Prices, ProjectContext, ProjectRow, Runtime, STEP_REPORTED, SUMMARY_LIMIT,
-    Signal, TurnOutcome, WindowUsage,
+    Signal, TurnOutcome, WindowUsage, memory_homes_of,
 };
 pub use seams::{SessionGrant, Verdict};

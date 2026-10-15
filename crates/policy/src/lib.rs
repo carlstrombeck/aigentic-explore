@@ -251,10 +251,11 @@ impl Policy {
         None
     }
 
-    /// What one write target can name, each canonical: the word as it was
-    /// written, and, past its leading `~`, the path that expands to. A
-    /// word holding a `$var` is only ever tried as written, so a looser
-    /// reading of it can never refuse a file it does not name; a relative
+    /// What one write target can name, each canonical: the word the lexer
+    /// read, and, past its leading `~`, the path that expands to. The
+    /// lexer has already dropped a variable's own text, so `$VAR/…` is
+    /// never expanded to a value — a target the shell would resolve at
+    /// run time stays a word no home can be proven to hold. A relative
     /// word with no working directory to resolve it against answers with
     /// nothing, since there is nothing to prove.
     fn readings(&self, target: &str, cwd: Option<&Path>) -> Vec<PathBuf> {

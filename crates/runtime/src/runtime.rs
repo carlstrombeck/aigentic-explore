@@ -1200,11 +1200,13 @@ impl Runtime {
     }
 }
 
-/// The memory homes the layers name, in the order the extraction request
-/// names them (`Layers::extra_memory_homes`): the person's folder, then
-/// the workspace's. Empty for a thread with neither, which is a thread
-/// whose policy is untouched.
-fn memory_homes_of(layers: &Layers) -> Vec<std::path::PathBuf> {
+/// The memory homes a thread's layers name, in the order the extraction
+/// request names them (`Layers::extra_memory_homes`): the person's folder,
+/// then the workspace's. Empty for a thread with neither — no owner, no
+/// shared dir — which is a thread whose policy is untouched. The daemon
+/// builds its policy with these, and the runtime applies them to whatever
+/// policy it is handed.
+pub fn memory_homes_of(layers: &Layers) -> Vec<std::path::PathBuf> {
     layers
         .extra_memory_homes()
         .into_iter()
