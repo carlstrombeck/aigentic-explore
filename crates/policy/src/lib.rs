@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 pub use roles::{Participants, Role, needs};
 pub use rules::{
-    Decision, MEMORY_PREFIX, MEMORY_REASON, Riskiest, Rule, default_bash_allow, default_rules,
-    prefix_of, riskiest_segment,
+    Decision, MEMORY_HOME_RULE, MEMORY_PREFIX, MEMORY_REASON, Riskiest, Rule, default_bash_allow,
+    default_rules, prefix_of, riskiest_segment,
 };
 pub use shell::{Kind, ScanSegment, main_segment, scan};
 pub use step::{DenyParseError, StepOverlay};
@@ -60,8 +60,14 @@ impl Boundary {
     /// Whether canonical `path` is a root or below one. Compared by
     /// component, so `/tmp/x` is not inside `/tmp/xyz`.
     pub fn is_inside(&self, path: &Path) -> bool {
-        self.roots.iter().any(|r| path == r || path.starts_with(r))
+        self.roots.iter().any(|r| is_root_or_below(path, r))
     }
+}
+
+/// Whether canonical `path` is `root` or below it. Compared by component,
+/// so `/tmp/x` is not inside `/tmp/xyz`.
+fn is_root_or_below(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
 }
 
 /// The file tools the boundary checks. `bash` and the MCP tools that take
@@ -99,6 +105,11 @@ pub struct Policy {
     /// checked call asks.
     #[serde(skip)]
     pub boundary: Boundary,
+    /// The person's and each workspace's memory folder, canonical: the
+    /// model may not write under one, whatever the rules say. Empty, no
+    /// home refuses anything.
+    #[serde(skip)]
+    pub memory_homes: Vec<PathBuf>,
 }
 
 impl Default for Policy {
@@ -118,6 +129,7 @@ impl Policy {
             allowed_prefixes: Vec::new(),
             rules_file: None,
             boundary: Boundary::default(),
+            memory_homes: Vec::new(),
         }
     }
 
@@ -176,6 +188,48 @@ impl Policy {
     /// The boundary's roots, canonical, in the order they were set.
     pub fn boundary_roots(&self) -> &[PathBuf] {
         &self.boundary.roots
+    }
+
+    /// The memory folders the model may not write under: the person's and
+    /// each workspace's. Every home is canonicalised here, and appends,
+    /// like [`with_boundary_roots`](Self::with_boundary_roots), so a
+    /// later call can only refuse more.
+    pub fn with_memory_homes(mut self, homes: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.memory_homes
+            .extend(homes.into_iter().map(|h| canonicalise(&h)));
+        self
+    }
+
+    /// The memory homes, canonical, in the order they were set.
+    pub fn memory_homes(&self) -> &[PathBuf] {
+        &self.memory_homes
+    }
+
+    /// The memory home a call would write under, canonical, or `None`
+    /// when it writes under none of them. A read is never a hit: only
+    /// `write_file` and `edit_file` are read.
+    fn memory_home_target(&self, call: &ToolCall, cwd: Option<&Path>) -> Option<PathBuf> {
+        if self.memory_homes.is_empty() {
+            return None;
+        }
+        let path = match call.name.as_str() {
+            "write_file" | "edit_file" => match self.boundary_target(call, cwd) {
+                Some(Ok(path)) => path,
+                // An unchecked or unresolvable call reaches no home.
+                _ => return None,
+            },
+            _ => return None,
+        };
+        self.home_holding(&path)
+    }
+
+    /// The first configured home holding `path`, compared by component
+    /// as [`Boundary::is_inside`], so `…/memory-notes.md` is not one.
+    fn home_holding(&self, path: &Path) -> Option<PathBuf> {
+        self.memory_homes
+            .iter()
+            .find(|home| is_root_or_below(path, home.as_path()))
+            .cloned()
     }
 
     /// The path a checked call will reach, canonical, or `None` when the
@@ -253,12 +307,22 @@ impl Policy {
     /// First matching rule wins. No rule matching is `Ask`, so a class
     /// added later can never run silently.
     ///
+    /// A write under a memory home is `Deny` before anything else: the
+    /// person's and each workspace's folder are the harness's own, and no
+    /// rule, mode or grant may allow one.
+    ///
     /// A file tool reaching outside the boundary is `AskBoundary` before
     /// any rule is read (issue #124): no rule, no mode and no session
     /// grant may allow an outside path without a person, and the runtime
     /// refuses one in a step. `cwd` is the runtime's live working
     /// directory.
     pub fn decide(&self, call: &ToolCall, class: RiskClass, cwd: Option<&Path>) -> Outcome {
+        if let Some(path) = self.memory_home_target(call, cwd) {
+            return Outcome::Deny {
+                rule: MEMORY_HOME_RULE.to_owned(),
+                reason: format!("{MEMORY_REASON}: {}", path.display()),
+            };
+        }
         if let Some(target) = self.boundary_target(call, cwd) {
             let outside = match target {
                 Ok(path) if self.boundary.is_inside(&path) => None,
@@ -704,6 +768,7 @@ mod tests {
             root: None,
             cwd: None,
             boundary: crate::Boundary::default(),
+            memory_homes: vec![],
         };
         assert!(matches!(
             p.decide(&call("x", json!({})), RiskClass::Safe, None),
