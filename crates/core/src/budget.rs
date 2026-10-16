@@ -9,6 +9,11 @@ pub struct Budget {
     pub max_iterations: u32,
     pub max_tokens: u64,
     pub max_wall_time: Duration,
+    /// What one turn may spend, in USD. `None` means no dollar cap, the
+    /// default: `.usd` is only known once a price table is configured, so
+    /// a turn without one cannot be held to a figure.
+    #[serde(default)]
+    pub max_cost_usd: Option<f64>,
     /// What a cache read counts against `max_tokens`, as a fraction of
     /// an uncached input token: providers price a re-read prefix far
     /// below fresh input, so counting both the same spends a build
@@ -55,6 +60,7 @@ mod tests {
             max_iterations: 1,
             max_tokens: 1,
             max_wall_time: Duration::from_secs(1),
+            max_cost_usd: None,
             cache_read_price_ratio: ratio,
         };
         assert_eq!(budget(0.25).spent_of(&usage), 200 + 300 + 500 + 35_000);

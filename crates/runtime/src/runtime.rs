@@ -26,6 +26,7 @@ pub const DEFAULT_BUDGET: Budget = Budget {
     max_iterations: 50,
     max_tokens: 2_000_000,
     max_wall_time: Duration::from_secs(1800),
+    max_cost_usd: None,
     cache_read_price_ratio: 0.25,
 };
 

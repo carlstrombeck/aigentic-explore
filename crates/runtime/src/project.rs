@@ -346,6 +346,7 @@ impl BudgetConfig {
             max_wall_time: self
                 .max_wall_time_secs
                 .map_or(base.max_wall_time, std::time::Duration::from_secs),
+            max_cost_usd: base.max_cost_usd,
             cache_read_price_ratio: self
                 .cache_read_price_ratio
                 .unwrap_or(base.cache_read_price_ratio),

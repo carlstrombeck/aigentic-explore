@@ -516,6 +516,7 @@ fn budget(max_iterations: u32) -> Budget {
         max_iterations,
         max_tokens: u64::MAX,
         max_wall_time: Duration::from_secs(60),
+        max_cost_usd: None,
         cache_read_price_ratio: 0.25,
     }
 }

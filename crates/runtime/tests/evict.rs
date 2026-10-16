@@ -249,6 +249,7 @@ async fn run_turn_with(
             max_iterations: calls + 20,
             max_tokens: u64::MAX,
             max_wall_time: std::time::Duration::from_secs(300),
+            max_cost_usd: None,
             cache_read_price_ratio: 0.25,
         })
         .with_model_label("scripted");
@@ -321,6 +322,7 @@ async fn run_scripted(script: Vec<Vec<ProviderEvent>>, k: f64, ceiling: u64) -> 
             max_iterations: iterations + 20,
             max_tokens: u64::MAX,
             max_wall_time: std::time::Duration::from_secs(300),
+            max_cost_usd: None,
             cache_read_price_ratio: 0.25,
         })
         .with_model_label("scripted");
@@ -1538,6 +1540,7 @@ async fn run_turns(
             max_iterations: 100,
             max_tokens: u64::MAX,
             max_wall_time: std::time::Duration::from_secs(300),
+            max_cost_usd: None,
             cache_read_price_ratio: 0.25,
         })
         .with_model_label("scripted");

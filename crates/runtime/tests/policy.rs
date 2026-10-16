@@ -765,6 +765,7 @@ async fn time_waiting_on_a_prompt_does_not_count_against_the_wall_time_budget() 
             max_iterations: 10,
             max_tokens: u64::MAX,
             max_wall_time: std::time::Duration::from_millis(1_000),
+            max_cost_usd: None,
             cache_read_price_ratio: 0.25,
         });
     let outcome = runtime

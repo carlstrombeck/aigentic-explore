@@ -168,6 +168,7 @@ async fn an_answered_question_ends_the_turn_and_the_continuation_has_its_own_bud
             max_iterations: 2,
             max_tokens: 1_000_000,
             max_wall_time: Duration::from_secs(60),
+            max_cost_usd: None,
             cache_read_price_ratio: 0.25,
         });
     let first = rt
