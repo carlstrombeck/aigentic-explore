@@ -20,7 +20,7 @@ use aigentic_runtime::runner::{
     RunnerHost, WriteGuard,
 };
 use aigentic_runtime::workflow::{LoadedWorkflow, SlotKind, WorkflowFile, WorkflowOrigin};
-use aigentic_runtime::{Answer, Approver, LENGTH_STOP, Prices, Runtime};
+use aigentic_runtime::{Answer, Approver, LENGTH_STOP, MAX_USD, Prices, Runtime};
 use aigentic_runtime::{
     RuntimeError, STEP_REPORTED,
     harness_tools::FINISH_STEP,
@@ -6228,5 +6228,496 @@ async fn a_rebuild_mid_step_over_the_line_parks_before_resuming_the_child() {
         fx.child_events_of(budget.write).len(),
         children,
         "and the child is not resumed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A step's turn is capped at its own figure, or at the run's room
+// ---------------------------------------------------------------------------
+
+/// `budget_workflow` with both step figures dropped: the shape
+/// `.aigentic/workflows/loop/workflow.toml` has, where a step's cap can
+/// only come from the run's room.
+fn budget_workflow_unfigured() -> String {
+    budget_workflow().replace(&format!("budget = {BUDGET_TRIVIAL:.1}\n"), "")
+}
+
+/// One scripted reply that calls the harmless tool and costs `usd` under
+/// the fixture's price table: a turn that neither reports nor stops, at a
+/// price the test derives. The tokens come from the figure the test wants
+/// spent, as `priced_reply`'s do.
+fn priced_works(id: &str, usd: f64) -> Vec<ProviderEvent> {
+    let mut reply = works(id);
+    reply[1] = usage(
+        (usd * 1_000_000.0 / budget_prices().input).round() as u64,
+        0,
+    );
+    reply
+}
+
+/// The smallest price at or above `usd` that the fixture's table can
+/// charge: a reply is priced from whole input tokens, so a figure between
+/// two tokens' worth is charged as the one above it.
+fn price_at_least(usd: f64) -> f64 {
+    (usd * 1_000_000.0 / budget_prices().input).ceil() * budget_prices().input / 1_000_000.0
+}
+
+/// A brief priced at the figure, proposing a raise that clears the run's
+/// ask line, and a writing child whose first call costs `spend` and whose
+/// next reply is its report. `workflow` decides where the writing step's
+/// cap comes from: the step's own figure, or the run's room.
+fn capped_fixture(spend: f64, workflow: String) -> BudgetFixture {
+    let brief = Ulid::generate();
+    let write = Ulid::generate();
+    let fx = Fixture::with_workflow(
+        vec![
+            (
+                brief,
+                vec![priced_reply(
+                    brief_report_proposing(clearing_raise()),
+                    budget_figure(),
+                )],
+            ),
+            (
+                write,
+                vec![
+                    priced_works("w1", spend),
+                    priced_reply(implementer_report(), budget_figure()),
+                ],
+            ),
+        ],
+        &[
+            ("workflow.toml", workflow.as_str()),
+            ("templates/step.md", "do the step\n"),
+        ],
+    )
+    .priced(budget_prices());
+    BudgetFixture { fx, write }
+}
+
+/// Drive a fixture to its end, keeping the world after every move: a step
+/// whose turn ended at its cap asks at a later move, and only the moves
+/// up to the cap run the child.
+async fn capped_run(fx: &Fixture) -> Trace {
+    let mut runner = fx.runner();
+    let mut snapshots = vec![snapshot(fx)];
+    let terminal = loop {
+        match runner.advance().await.expect("the run advances") {
+            Advanced::Moved => snapshots.push(snapshot(fx)),
+            other => break other,
+        }
+    };
+    snapshots.push(snapshot(fx));
+    Trace {
+        snapshots,
+        terminal,
+    }
+}
+
+/// A child's `turn_ended` reasons, oldest first.
+fn turn_reasons(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| event.kind == EventKind::TurnEnded)
+        .map(|event| {
+            let payload: aigentic_log::TurnEndedPayload =
+                serde_json::from_value(event.payload.clone()).unwrap();
+            payload.reason
+        })
+        .collect()
+}
+
+/// A child's assistant messages: the calls it made, in order.
+fn calls_of(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|event| event.kind == EventKind::AssistantMessage)
+        .count()
+}
+
+/// A capped child's turn is `Partial` at the step, at the figure it spent:
+/// the call that reached the cap ran, and the turn stopped before the
+/// next one.
+#[tokio::test]
+async fn t4_a_child_that_spends_its_step_budget_ends_its_turn() {
+    let capped = capped_fixture(budget_figure(), budget_workflow());
+    let run = capped_run(&capped.fx).await;
+    let child = capped.fx.child_events_of(capped.write);
+
+    assert_eq!(
+        calls_of(&child),
+        1,
+        "the reply that reached the cap is the child's only call"
+    );
+    assert_eq!(turn_reasons(&child), vec![MAX_USD.to_owned()]);
+
+    let finished = step_finished(run.lead());
+    assert_eq!(finished.len(), 2, "the brief's end and the writing step's");
+    assert_eq!(finished[1].status, StepStatus::Partial);
+    assert_eq!(finished[1].end_reason, MAX_USD);
+    assert_eq!(finished[1].cost_usd, budget_figure());
+}
+
+/// Under the cap there is no stop: the child's call, then its report, and
+/// the run reaches its end with no gate asked.
+#[tokio::test]
+async fn t5_a_child_under_its_step_budget_writes_no_budget_stop() {
+    let capped = capped_fixture(budget_figure() / 2.0, budget_workflow());
+    let run = capped_run(&capped.fx).await;
+
+    assert_eq!(
+        checkpoints(run.lead()).len(),
+        0,
+        "no gate is asked of a step that stays under its figure"
+    );
+    assert!(
+        gate(run.lead()).is_none(),
+        "and none is left open when the run ends"
+    );
+    let child = capped.fx.child_events_of(capped.write);
+    assert_eq!(
+        turn_reasons(&child),
+        vec![STEP_REPORTED.to_owned()],
+        "the child's turn ends at its report, not at a cap"
+    );
+    assert!(matches!(run.terminal, Advanced::Finished { .. }));
+}
+
+/// A capped step parks where it cannot be retried: `step_stop`, once, with
+/// the step, its attempt and its figure named, and nothing started behind
+/// it.
+#[tokio::test]
+async fn t6_a_capped_step_parks_at_step_stop() {
+    let capped = capped_fixture(budget_figure(), budget_workflow());
+    let run = capped_run(&capped.fx).await;
+
+    assert_eq!(
+        run.terminal,
+        Advanced::WaitingHuman {
+            gate: "step_stop".to_owned()
+        }
+    );
+    let starts = step_started(run.lead());
+    assert_eq!(starts.len(), 2, "the capped attempt is not retried");
+    assert_eq!(starts[1].attempt, 1);
+
+    let asks = checkpoints(run.lead());
+    assert_eq!(asks.len(), 1, "the ask is written once");
+    assert_eq!(asks[0].gate, "step_stop");
+    let shown = asks[0].shown.join("\n");
+    assert_eq!(asks[0].shown[0], "implement-alone", "the step: {shown}");
+    assert_eq!(
+        asks[0].shown[1],
+        (starts[1].attempt + 1).to_string(),
+        "the attempt the park blocks: {shown}"
+    );
+    assert!(
+        shown.contains(&format!("{BUDGET_TRIVIAL:.2}")),
+        "the figure: {shown}"
+    );
+
+    let child = capped.fx.child_events_of(capped.write);
+    let capped_at = run.after_where(EventKind::StepFinished, 2);
+    assert_eq!(
+        Some(&child),
+        capped_at.children.get(&capped.write),
+        "the park adds nothing to the child's log"
+    );
+}
+
+/// The park is derived from the log, not remembered: a new runner over the
+/// same log moves the same way and writes nothing.
+#[tokio::test]
+async fn t7_a_rebuild_of_a_capped_step_parks_without_resuming_the_child() {
+    let capped = capped_fixture(budget_figure(), budget_workflow());
+    let run = capped_run(&capped.fx).await;
+    assert_eq!(
+        run.terminal,
+        Advanced::WaitingHuman {
+            gate: "step_stop".to_owned()
+        }
+    );
+
+    let asked = checkpoints(&capped.fx.lead_events()).len();
+    let child = capped.fx.child_events_of(capped.write);
+    let mut fresh = capped.fx.runner();
+    let moved = fresh.advance().await.expect("the run advances");
+
+    assert_eq!(
+        moved,
+        Advanced::WaitingHuman {
+            gate: "step_stop".to_owned()
+        }
+    );
+    assert_eq!(step_started(&capped.fx.lead_events()).len(), 2);
+    assert_eq!(checkpoints(&capped.fx.lead_events()).len(), asked);
+    assert_eq!(capped.fx.child_events_of(capped.write), child);
+}
+
+/// A step with no figure of its own is capped by the run's room to its ask
+/// line: the call that reaches the room ends the child's turn, and the
+/// run's own guard asks right after.
+#[tokio::test]
+async fn t8_a_step_with_no_figure_is_capped_by_the_runs_room() {
+    let room = BUDGET_ASK_AT * clearing_raise() - budget_figure();
+    let price = price_at_least(room);
+    assert!(
+        price >= room,
+        "the price reaches the room: a reply is priced from whole tokens"
+    );
+    let capped = capped_fixture(price, budget_workflow_unfigured());
+    let run = capped_run(&capped.fx).await;
+
+    let starts = step_started(run.lead());
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[1].budget_usd, 0.0, "the step carries no figure");
+
+    let child = capped.fx.child_events_of(capped.write);
+    assert_eq!(
+        calls_of(&child),
+        1,
+        "the cap stops the turn on its first call"
+    );
+    assert_eq!(turn_reasons(&child), vec![MAX_USD.to_owned()]);
+
+    assert_eq!(
+        run.terminal,
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        }
+    );
+    assert_eq!(checkpoints(run.lead()).len(), 1);
+}
+
+/// The room's park is the run's own gate, so a raise frees the step: the
+/// retry runs, reports, and the run ends.
+#[tokio::test]
+async fn t9_a_raise_frees_a_step_capped_by_the_runs_room() {
+    let room = BUDGET_ASK_AT * clearing_raise() - budget_figure();
+    let capped = capped_fixture(price_at_least(room), budget_workflow_unfigured());
+    let run = capped_run(&capped.fx).await;
+    assert_eq!(
+        run.terminal,
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        }
+    );
+
+    let mut runner = capped.fx.runner();
+    runner
+        .answer(
+            BUDGET_GATE,
+            CheckpointAnswer::Raise,
+            Some(format!("{:.2}", budget_ceiling())),
+            steve(),
+        )
+        .expect("the raise clears the gate");
+    let terminal = loop {
+        match runner.advance().await.expect("the run advances") {
+            Advanced::Moved => {}
+            other => break other,
+        }
+    };
+
+    let starts = step_started(&capped.fx.lead_events());
+    assert_eq!(starts.len(), 3, "the freed attempt starts");
+    assert_eq!(starts[2].attempt, 2);
+    let finished = step_finished(&capped.fx.lead_events());
+    assert_eq!(finished.len(), 3, "and finishes");
+    assert_ne!(
+        finished[2].status,
+        StepStatus::Partial,
+        "the report it made is the step's end"
+    );
+    assert!(matches!(terminal, Advanced::Finished { .. }));
+}
+
+/// A step's spend does not reset between attempts: asked again, the parked
+/// step parks where it stands, with no attempt and no call behind it.
+#[tokio::test]
+async fn t10_a_step_stops_where_its_last_attempt_spent_its_figure() {
+    let capped = capped_fixture(budget_figure(), budget_workflow());
+    let run = capped_run(&capped.fx).await;
+    assert_eq!(
+        run.terminal,
+        Advanced::WaitingHuman {
+            gate: "step_stop".to_owned()
+        }
+    );
+
+    let turns = turn_ends(&capped.fx.child_events_of(capped.write));
+    let mut runner = capped.fx.runner();
+    let first = runner.advance().await.expect("the run advances");
+    let again = runner.advance().await.expect("the run advances");
+
+    assert_eq!(first, again);
+    assert_eq!(
+        again,
+        Advanced::WaitingHuman {
+            gate: "step_stop".to_owned()
+        }
+    );
+    assert_eq!(step_started(&capped.fx.lead_events()).len(), 2);
+    assert_eq!(checkpoints(&capped.fx.lead_events()).len(), 1);
+    assert_eq!(
+        turn_ends(&capped.fx.child_events_of(capped.write)),
+        turns,
+        "no child turn is started or resumed"
+    );
+}
+
+/// What an attempt has already spent counts, not only what the step's
+/// closed attempts spent: a crash after a call that reached the figure
+/// parks instead of resuming the torn turn, and the report is never taken.
+#[tokio::test]
+async fn t11_a_rebuild_of_an_attempt_whose_crashed_call_spent_the_room_parks() {
+    let capped = capped_fixture(budget_figure(), budget_workflow());
+    let run = capped_run(&capped.fx).await;
+    assert_eq!(
+        run.terminal,
+        Advanced::WaitingHuman {
+            gate: "step_stop".to_owned()
+        }
+    );
+
+    // The lead at the writing step's `step_started`, and the child cut
+    // where the crash would have landed: the prompt and the call that
+    // spent the figure, no result line yet.
+    let lead = run.after_where(EventKind::StepStarted, 2);
+    let source = run.after(run.lead().len());
+    let before = source
+        .children
+        .get(&capped.write)
+        .expect("the child's log by the cap")
+        .len();
+    assert!(
+        source.children[&capped.write]
+            .iter()
+            .any(|event| event.kind == EventKind::ToolResult),
+        "the traced child went past the call, so the cut really cuts"
+    );
+    capped
+        .fx
+        .restore_child_prefix_from(lead, source, capped.write, |events| {
+            !events
+                .iter()
+                .any(|event| event.kind == EventKind::ToolResult)
+        });
+    let mut runner = capped.fx.runner();
+    let moved = runner.advance().await.expect("the run advances");
+
+    assert_eq!(
+        moved,
+        Advanced::WaitingHuman {
+            gate: "step_stop".to_owned()
+        },
+        "the torn call spent the figure, so the attempt's room is spent"
+    );
+    let child = capped.fx.child_events_of(capped.write);
+    assert!(
+        child.len() < before,
+        "the child's log is the cut the crash left, not a resumed turn"
+    );
+    assert_eq!(
+        calls_of(&child),
+        1,
+        "its one call is not followed by another"
+    );
+    assert!(
+        !child
+            .iter()
+            .any(|event| event.kind == EventKind::StepReported),
+        "the report it would have written was never taken"
+    );
+}
+
+/// The world of a crashed attempt whose call spent half its figure: the
+/// traced run's first call, then the priced call the attempt's second turn
+/// makes, then the report it would otherwise reach.
+fn continuation_fixture() -> BudgetFixture {
+    let brief = Ulid::generate();
+    let write = Ulid::generate();
+    let half = budget_figure() / 2.0;
+    let fx = Fixture::with_workflow(
+        vec![
+            (
+                brief,
+                vec![priced_reply(
+                    brief_report_proposing(clearing_raise()),
+                    budget_figure(),
+                )],
+            ),
+            (
+                write,
+                vec![
+                    priced_works("w1", half),
+                    priced_works("w2", half),
+                    priced_reply(implementer_report(), budget_figure()),
+                ],
+            ),
+        ],
+        &[
+            ("workflow.toml", budget_workflow().as_str()),
+            ("templates/step.md", "do the step\n"),
+        ],
+    )
+    .priced(budget_prices());
+    BudgetFixture { fx, write }
+}
+
+/// The attempt's second turn runs under what the attempt has left, not
+/// under its whole figure: its one call lands on the remainder, and the
+/// retry that follows has nothing left to spend.
+#[tokio::test]
+async fn t12_a_resumed_attempts_continuation_runs_under_what_the_attempt_has_left() {
+    let capped = continuation_fixture();
+    let run = capped_run(&capped.fx).await;
+    assert_eq!(
+        run.terminal,
+        Advanced::WaitingHuman {
+            gate: "step_stop".to_owned()
+        }
+    );
+
+    let lead = run.after_where(EventKind::StepStarted, 2);
+    let source = run.after(run.lead().len());
+    capped
+        .fx
+        .restore_child_prefix_from(lead, source, capped.write, |events| {
+            !events
+                .iter()
+                .any(|event| event.kind == EventKind::ToolResult)
+        });
+    let mut runner = capped.fx.runner();
+    let terminal = loop {
+        match runner.advance().await.expect("the run advances") {
+            Advanced::Moved => {}
+            other => break other,
+        }
+    };
+
+    let child = capped.fx.child_events_of(capped.write);
+    assert_eq!(
+        calls_of(&child),
+        2,
+        "the cut call and the continuation's own: {child:#?}"
+    );
+    assert_eq!(
+        turn_reasons(&child).last(),
+        Some(&MAX_USD.to_owned()),
+        "the continuation's call lands on the remainder, not on the figure"
+    );
+    assert!(
+        !child
+            .iter()
+            .any(|event| event.kind == EventKind::StepReported),
+        "the report is never reached"
+    );
+    assert_eq!(
+        terminal,
+        Advanced::WaitingHuman {
+            gate: "step_stop".to_owned()
+        },
+        "the attempt's total is now the step's closed spend"
     );
 }

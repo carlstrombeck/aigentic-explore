@@ -520,6 +520,15 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         if let Some(park) = self.budget_guard()? {
             return self.park_at_budget(park);
         }
+        // A step that has already spent its own figure starts nothing: the
+        // retry of a capped attempt lands here, and its spend has not moved
+        // since the cap. A cap that came from the run's room is left to the
+        // run's own guard above, and applied to the child when it exists.
+        if let StepRoom::Cap { left, own: true } = self.step_room(&step, attempt, child)?
+            && left <= 0.0
+        {
+            return self.park_at_step_stop(&step, attempt, left);
+        }
         if step.checkpoint {
             return self.open_checkpoint(&step);
         }
@@ -627,6 +636,13 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         if let Some(park) = self.budget_guard()? {
             return self.park_at_budget(park);
         }
+        // The room is read again here, before the write lock and before
+        // either child is built, so the cap the child's turn runs under is
+        // derived from the log as it stands at this move.
+        let room = self.step_room(&step, attempt, Some(child))?;
+        if let Some(park) = self.park_if_spent(&step, attempt, &room)? {
+            return Ok(park);
+        }
         if step.writes
             && self.lock.is_none()
             && let Some(waiting) = self.take_write_lock()?
@@ -651,6 +667,12 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 .build_child(child, &step.profile, &step.id, &step.deny)
                 .await?
                 .with_restack(base.clone());
+            if let Some(park) = self
+                .hold_to_room(&step, attempt, &mut runtime, &room)
+                .await?
+            {
+                return Ok(park);
+            }
             self.run_turn(&mut runtime, &message).await?;
             if prompt_count(self.host.child_log(child)?.events()) != posted + 1 {
                 return Err(RunnerError::MessageNotPosted);
@@ -663,6 +685,17 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 .with_restack(base);
             let mut observe = |_: Signal<'_>| {};
             if let crate::Resumed::Interrupted { .. } = runtime.resume(None, &mut observe)? {
+                // The continuation is this attempt's second turn, and the
+                // repairs the resume wrote are not calls: the room is read
+                // again so the turn cannot run on spend the attempt has
+                // already made.
+                let room = self.step_room(&step, attempt, Some(child))?;
+                if let Some(park) = self
+                    .hold_to_room(&step, attempt, &mut runtime, &room)
+                    .await?
+                {
+                    return Ok(park);
+                }
                 runtime.continue_turn(&mut observe).await?;
             }
         }
@@ -1665,19 +1698,8 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         let from = prompt_at(events, attempt).unwrap_or(0);
         let tail = &events[from..];
         // The price the child's runtime stamped on each call, inside its
-        // `usage`: `payload["cost_usd"]` at the top level is always absent,
-        // which is why this used to sum to an empty `-0.0`. A `fold` from a
-        // positive zero keeps a run with no prices from writing `-0.0`.
-        let cost_usd: f64 = tail
-            .iter()
-            .filter(|e| e.kind == EventKind::AssistantMessage)
-            .filter_map(|e| {
-                e.payload
-                    .get("usage")
-                    .and_then(|usage| usage.get("cost_usd"))
-                    .and_then(Value::as_f64)
-            })
-            .fold(0.0_f64, |total, cost| total + cost);
+        // `usage`: `payload["cost_usd"]` at the top level is always absent.
+        let cost_usd: f64 = call_spend(tail);
         let reported = tail
             .iter()
             .rev()
@@ -1867,6 +1889,151 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
     }
 }
 
+/// How much a step's turn may still spend.
+enum StepRoom {
+    /// Neither the step nor the run declares a figure.
+    NoCap,
+    /// What is left of the cap, and whether the cap is the step's own
+    /// figure. The two differ in where a spent cap parks: a step over its
+    /// own figure asks at `step_stop`, one over the run's room at the
+    /// run's own `budget` gate.
+    Cap { left: f64, own: bool },
+}
+
+impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
+    /// What a step's turn is held to: its own figure when it declares a
+    /// usable one, else the run's room to its ask line, else nothing.
+    ///
+    /// `left` is what remains, so a figure already spent is `0.0` or less
+    /// and starts no turn. The in-flight attempt's own spend is subtracted
+    /// when it is known: its calls are in neither the run's fold (nothing
+    /// closes an open attempt) nor, for the step's figure, its closed
+    /// attempts — so without that term a resumed attempt would be granted
+    /// its whole remainder again. A price table is what makes a cap
+    /// reachable at all: an unpriced call adds nothing to either spend, so
+    /// `left` never falls.
+    fn step_room(
+        &self,
+        step: &Step,
+        attempt: u32,
+        child: Option<Ulid>,
+    ) -> Result<StepRoom, RunnerError> {
+        let state = self.state()?;
+        let own = step
+            .budget
+            .filter(|figure| figure.is_finite() && *figure > 0.0);
+        // An unposted prompt spends nothing, so a missing child, a child
+        // with no prompt for this attempt and an unstarted attempt all
+        // agree on zero.
+        let in_flight = match child {
+            Some(child) => self.attempt_spend(child, attempt)?,
+            None => 0.0,
+        };
+        match own {
+            Some(figure) => Ok(StepRoom::Cap {
+                left: figure - state.step_spend(&step.id) - in_flight,
+                own: true,
+            }),
+            None if state.budget_usd > 0.0 => Ok(StepRoom::Cap {
+                // The room is the run's own remainder: the step's closed
+                // attempts are already part of `state.cost_usd`, so only
+                // the open attempt's spend is new.
+                left: BUDGET_ASK_AT * state.budget_usd - state.cost_usd - in_flight,
+                own: false,
+            }),
+            None => Ok(StepRoom::NoCap),
+        }
+    }
+
+    /// What an attempt has spent so far: the same sum `apply_end` writes
+    /// into `step_finished.cost_usd`, read from the child's log between
+    /// this attempt's prompt and the log's end. An attempt whose prompt is
+    /// not posted has spent nothing.
+    fn attempt_spend(&self, child: Ulid, attempt: u32) -> Result<f64, RunnerError> {
+        let events = self.host.child_log(child)?;
+        let events = events.events();
+        Ok(match prompt_at(events, attempt) {
+            Some(from) => call_spend(&events[from..]),
+            None => 0.0,
+        })
+    }
+
+    /// Hold a child's turn to `room`: the cap rides on the child's
+    /// `Budget`, and the step's own figure is what `step_started` recorded
+    /// for it. Returns the park when the cap is spent, `None` when the
+    /// turn may run.
+    async fn hold_to_room(
+        &mut self,
+        step: &Step,
+        attempt: u32,
+        runtime: &mut Runtime,
+        room: &StepRoom,
+    ) -> Result<Option<Advanced>, RunnerError> {
+        let left = match room {
+            StepRoom::NoCap => {
+                // Nothing declares a cap, so clear whatever the child
+                // carries: a figure a test or an earlier attempt set must
+                // not linger in a rebuilt child.
+                let mut budget = *runtime.budget();
+                budget.max_cost_usd = None;
+                runtime.set_budget(budget);
+                return Ok(None);
+            }
+            StepRoom::Cap { left, .. } => *left,
+        };
+        let mut budget = *runtime.budget();
+        budget.max_cost_usd = (left > 0.0).then_some(left);
+        runtime.set_budget(budget);
+        if left > 0.0 {
+            return Ok(None);
+        }
+        self.park_if_spent(step, attempt, room)
+    }
+
+    /// Park a spent cap, at the gate its source asks for: the step's own
+    /// figure at `step_stop`, the run's room at the run's own gate, where
+    /// a raise can free it.
+    fn park_if_spent(
+        &mut self,
+        step: &Step,
+        attempt: u32,
+        room: &StepRoom,
+    ) -> Result<Option<Advanced>, RunnerError> {
+        match room {
+            StepRoom::Cap { left, own } if *left <= 0.0 => {
+                if *own {
+                    self.park_at_step_stop(step, attempt, *left).map(Some)
+                } else {
+                    let park = match self.state()?.pending_checkpoint.as_deref() {
+                        Some(BUDGET_GATE) => Park::AlreadyAsked,
+                        _ => Park::Ask(spent_shown(&self.state()?, None)),
+                    };
+                    self.park_at_budget(park).map(Some)
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Park a step that has spent its own figure. `stop` is the only
+    /// answer: a raise records the run's figure, which cannot free a step
+    /// held to a figure of its own.
+    fn park_at_step_stop(
+        &mut self,
+        step: &Step,
+        attempt: u32,
+        left: f64,
+    ) -> Result<Advanced, RunnerError> {
+        let figure = step.budget.unwrap_or(0.0);
+        let shown = vec![
+            step.id.clone(),
+            attempt.to_string(),
+            format!("spent {:.2} of its {:.2} figure", figure - left, figure),
+        ];
+        self.escalate("step_stop", shown)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The prompt log lines
 // ---------------------------------------------------------------------------
@@ -1889,6 +2056,22 @@ fn prompt_at(events: &[Event], attempt: u32) -> Option<usize> {
         .filter(|(_, event)| is_prompt(event))
         .nth(attempt.saturating_sub(1) as usize)
         .map(|(index, _)| index)
+}
+
+/// What the calls in `events` cost: the price the child's runtime stamped
+/// on each `assistant_message`'s `usage`. The fold starts from a positive
+/// zero so a run with no prices reads `0.0`, not `-0.0`.
+fn call_spend(events: &[Event]) -> f64 {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::AssistantMessage)
+        .filter_map(|e| {
+            e.payload
+                .get("usage")
+                .and_then(|usage| usage.get("cost_usd"))
+                .and_then(Value::as_f64)
+        })
+        .fold(0.0_f64, |total, cost| total + cost)
 }
 
 /// A release impact as its serde name (`none`, `patch`, `minor`,

@@ -171,6 +171,17 @@ pub struct RunState {
 }
 
 impl RunState {
+    /// What this step has spent: the `cost_usd` of its closed attempts.
+    /// An attempt in flight has closed nothing, so its spend is not here;
+    /// whoever weighs such an attempt reads that from the child's log.
+    pub fn step_spend(&self, step: &str) -> f64 {
+        self.steps
+            .iter()
+            .filter(|record| record.step == step && record.status.is_some())
+            .map(|record| record.cost_usd)
+            .sum()
+    }
+
     /// Where the run is, from the last decisive event of the log. The
     /// arms reach into state the same event wrote, so each is total.
     pub fn next_move(&self) -> NextMove {
