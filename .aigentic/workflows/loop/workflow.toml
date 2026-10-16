@@ -7,8 +7,11 @@ version = 1
 # thread; each report is posted on the issue under the step's marker, and
 # the next step reads the issue.
 
-# Recorded with each run; the loop's steps are capped by their profile's
-# budget, not by these figures.
+# What a run of this loop may spend: the figure the runner holds for the
+# run it drives, not a step's. The runner parks at the `budget` gate at 80%
+# of the figure in force before it starts a step or an attempt; a step's
+# turn is capped by its profile's `max_iterations`, `max_tokens` and
+# `max_wall_time` instead.
 [budget]
 trivial = 10.0
 full = 10.0

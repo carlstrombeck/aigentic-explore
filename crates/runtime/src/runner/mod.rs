@@ -24,11 +24,12 @@ use std::sync::Mutex;
 
 use aigentic_core::{AgentId, Author, ContentBlock, Event, EventKind};
 use aigentic_log::{
-    CheckOutcome, CheckResult, CheckpointAnswer, CheckpointAnsweredPayload, CheckpointAskedPayload,
-    ChecksOutcome, ChecksRunPayload, CommitRef, LogError, NewEvent, NextMove, PushedPayload,
-    ReleaseImpact, ReportStatus, RouteTakenPayload, RunErroredPayload, RunFinishedPayload,
-    RunOutcome, RunStartedPayload, RunState, StepFinishedPayload, StepReport, StepStartedPayload,
-    StepStatus, ThreadLog, TurnEndedPayload, Verdict, run_state,
+    BUDGET_GATE, BudgetRaisedPayload, CheckOutcome, CheckResult, CheckpointAnswer,
+    CheckpointAnsweredPayload, CheckpointAskedPayload, ChecksOutcome, ChecksRunPayload, CommitRef,
+    LogError, NewEvent, NextMove, PushedPayload, ReleaseImpact, ReportStatus, RouteTakenPayload,
+    RunErroredPayload, RunFinishedPayload, RunOutcome, RunStartedPayload, RunState,
+    StepFinishedPayload, StepReport, StepStartedPayload, StepStatus, ThreadLog, TurnEndedPayload,
+    Verdict, run_state,
 };
 use serde_json::Value;
 use ulid::Ulid;
@@ -57,6 +58,19 @@ pub const REPORT_WITHOUT_BODY: &str = "report_without_body";
 
 /// What a step's next attempt is told when its last report had no body.
 pub const REPORT_AGAIN_PROMPT: &str = "Your finish_step call had no `body`. Call finish_step again with the same fields and your whole report in `body`, not inside `slots`.";
+
+/// The share of the run's budget at which the runner asks before it starts
+/// anything else. The step in flight is never interrupted, so this covers a
+/// run at 100% of its budget too; the gate's `shown` lines quote it.
+pub const BUDGET_ASK_AT: f64 = 0.8;
+
+/// What the budget guard found.
+enum Park {
+    /// The run must ask; these are the `shown` lines the ask carries.
+    Ask(Vec<String>),
+    /// The log's open checkpoint is already this gate: nothing is written.
+    AlreadyAsked,
+}
 
 /// Every way the runner can fail.
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +106,23 @@ pub enum RunnerError {
         log: Ulid,
         /// The id the caller passed.
         lead: Ulid,
+    },
+    /// A `raise` whose figure would not clear the guard's line. Nothing is
+    /// written: the run stays parked at the gate and the person may answer
+    /// again.
+    #[error(
+        "a raise of `{offered}` does not clear the budget gate: {spent:.2} spent against \
+         {budget:.2} in force, and a figure above {least:.2} would"
+    )]
+    RaiseRefused {
+        /// The figure the answer offered, as it was written.
+        offered: String,
+        /// The figure in force when the answer came.
+        budget: f64,
+        /// What the run had spent then.
+        spent: f64,
+        /// The smallest figure that would clear the line.
+        least: f64,
     },
     /// Installing the binary failed, or the installed binary could not be
     /// asked its version.
@@ -367,7 +398,11 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 outcome,
             } => self.checks_done(&step, attempt, outcome).await,
             NextMove::Pushed { step, .. } => self.after_pushed(&step).await,
-            NextMove::Answered { gate, answer, .. } => self.answered(&gate, answer).await,
+            NextMove::Answered {
+                gate,
+                answer,
+                amendment,
+            } => self.answered(&gate, answer, amendment).await,
         }
     }
 
@@ -400,12 +435,42 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 });
             }
         }
+        if gate == BUDGET_GATE && answer == CheckpointAnswer::Raise {
+            self.checked_raise(amendment.as_deref())?;
+        }
         let payload = CheckpointAnsweredPayload {
             answer,
             amendment,
             marks: Vec::new(),
         };
         self.append_as(by, EventKind::CheckpointAnswered, &payload)
+    }
+
+    /// The figure a `raise` offers, as the budget gate accepts it.
+    ///
+    /// `Err` when the amendment carries no number, when the number is not
+    /// above the figure in force, or when it would leave the run at or over
+    /// the guard's line and park again at once. All three are the same
+    /// refusal, naming the offer, the figure in force and the smallest
+    /// figure that would clear the line; nothing is written, so the run
+    /// stays parked and the person may answer again.
+    fn checked_raise(&self, amendment: Option<&str>) -> Result<f64, RunnerError> {
+        let state = self.state()?;
+        let offered = amendment.unwrap_or_default();
+        let refused = || RunnerError::RaiseRefused {
+            offered: offered.to_owned(),
+            budget: state.budget_usd,
+            spent: state.cost_usd,
+            // A figure that clears the line is the smallest the guard
+            // would take, so a person reading the error knows where to
+            // aim rather than guessing.
+            least: f64::next_up(state.cost_usd / BUDGET_ASK_AT),
+        };
+        let usd = budget_usd(&Value::String(offered.to_owned())).ok_or_else(refused)?;
+        if usd > state.budget_usd && state.cost_usd < BUDGET_ASK_AT * usd {
+            return Ok(usd);
+        }
+        Err(refused())
     }
 
     /// The gate the run waits at, or `None` when it is not waiting.
@@ -452,6 +517,9 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         child: Option<Ulid>,
     ) -> Result<Advanced, RunnerError> {
         let step = self.step(step_id)?.clone();
+        if let Some(park) = self.budget_guard()? {
+            return self.park_at_budget(park);
+        }
         if step.checkpoint {
             return self.open_checkpoint(&step);
         }
@@ -506,6 +574,47 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         Ok(Advanced::Moved)
     }
 
+    /// Whether the run must ask before it starts anything else, and what
+    /// the ask says if so. Read only: the log's budget, its spend and its
+    /// open gate.
+    ///
+    /// A figure of `0.0` (nothing declared one, or a workflow with no
+    /// figures) parks nothing, so such a run behaves as it did before the
+    /// gate existed.
+    fn budget_guard(&self) -> Result<Option<Park>, RunnerError> {
+        let state = self.state()?;
+        if state.budget_usd <= 0.0 || state.cost_usd < BUDGET_ASK_AT * state.budget_usd {
+            return Ok(None);
+        }
+        if state.pending_checkpoint.as_deref() == Some(BUDGET_GATE) {
+            return Ok(Some(Park::AlreadyAsked));
+        }
+        Ok(Some(Park::Ask(spent_shown(&state, None))))
+    }
+
+    /// Act on what the guard found: write the ask, or report the one the
+    /// log already holds. A raise is not a route to `go`: the run's only
+    /// answers here are a larger figure and a stop.
+    fn park_at_budget(&mut self, park: Park) -> Result<Advanced, RunnerError> {
+        match park {
+            Park::Ask(shown) => {
+                self.escalate_with(BUDGET_GATE, shown, vec!["raise".into(), "stop".into()])
+            }
+            Park::AlreadyAsked => Ok(Advanced::WaitingHuman {
+                gate: BUDGET_GATE.into(),
+            }),
+        }
+    }
+
+    /// The figure above which a brief's own proposal needs a person:
+    /// `full × max_raise`. `max_raise = 0.0` declares no ceiling, and a
+    /// `full` of `0.0` parks nothing, so both are `None` and a run with
+    /// either takes its brief's figure as written.
+    fn ceiling(&self) -> Option<f64> {
+        let budget = &self.workflow.workflow.budget;
+        (budget.full > 0.0 && budget.max_raise > 0.0).then_some(budget.full * budget.max_raise)
+    }
+
     /// A `step_started` with no `step_finished`: the prompt is posted once
     /// if the child's log lacks it, otherwise the child is resumed.
     async fn re_await(
@@ -515,6 +624,9 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         child: Ulid,
     ) -> Result<Advanced, RunnerError> {
         let step = self.step(step_id)?.clone();
+        if let Some(park) = self.budget_guard()? {
+            return self.park_at_budget(park);
+        }
         if step.writes
             && self.lock.is_none()
             && let Some(waiting) = self.take_write_lock()?
@@ -716,8 +828,17 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             );
         };
         // A route carries the budget the routing step reported, when it
-        // reported one; a step that sizes nothing has none to carry.
-        let budget = slot("budget").as_ref().and_then(budget_usd);
+        // reported one; a step that sizes nothing has none to carry. A
+        // proposal above the ceiling is not taken as the run's figure: the
+        // route is still recorded, so a replay follows it rather than
+        // re-taking it, but the figure in force stands and the same move
+        // parks at the budget gate.
+        let proposed = slot("budget").as_ref().and_then(budget_usd);
+        let over = match (proposed, self.ceiling()) {
+            (Some(usd), Some(ceiling)) if usd > ceiling => Some((usd, ceiling)),
+            _ => None,
+        };
+        let in_force = self.state()?.budget_usd;
         self.append(
             EventKind::RouteTaken,
             &RouteTakenPayload {
@@ -726,10 +847,20 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 taken,
                 preconditions: Vec::new(),
                 fallback_reason: None,
-                budget_usd: budget,
+                budget_usd: match over {
+                    Some(_) => Some(in_force),
+                    None => proposed,
+                },
             },
         )?;
-        Ok(Advanced::Moved)
+        match over {
+            Some((usd, ceiling)) => self.escalate_with(
+                BUDGET_GATE,
+                spent_shown(&self.state()?, Some((usd, ceiling))),
+                vec!["raise".into(), "stop".into()],
+            ),
+            None => Ok(Advanced::Moved),
+        }
     }
 
     /// A step with no route continues to its `next`: `done` ends the run,
@@ -1317,14 +1448,26 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
     /// `go` and `amend` continue to its `next` (the amendment is already in
     /// the answer, where the `amendment` slot reads it). At any other gate
     /// the runner raised itself, only `stop` is an answer, except `retry`
-    /// at `checks_failed`, which grants the step one more attempt.
+    /// at `checks_failed`, which grants the step one more attempt; at the
+    /// budget gate a `raise` writes the larger figure and continues.
     async fn answered(
         &mut self,
         gate: &str,
         answer: CheckpointAnswer,
+        amendment: Option<String>,
     ) -> Result<Advanced, RunnerError> {
         if answer == CheckpointAnswer::Stop {
             return self.finish(RunOutcome::Stopped);
+        }
+        if gate == BUDGET_GATE && answer == CheckpointAnswer::Raise {
+            // A replay reaches this arm when an earlier runner wrote the
+            // answer, so the figure is checked here too: a refusal writes
+            // nothing and leaves the run parked.
+            let usd = self.checked_raise(amendment.as_deref())?;
+            self.append(EventKind::BudgetRaised, &BudgetRaisedPayload { usd })?;
+            // The move this raise unblocked is the one the fold derives
+            // from here: the next `advance` runs it.
+            return Ok(Advanced::Moved);
         }
         let checkpoint = self
             .workflow
@@ -1772,6 +1915,24 @@ fn budget_usd(value: &serde_json::Value) -> Option<f64> {
         .find(|c: char| !(c.is_ascii_digit() || c == '.'))
         .unwrap_or(text.len());
     text[..end].parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
+/// What the budget ask tells the person: what the run has spent, the
+/// figure in force, and — when a brief's proposal opened the gate — that
+/// proposal and the ceiling it crossed. The figures are formatted rather
+/// than ranged so one line states them all.
+fn spent_shown(state: &RunState, proposal: Option<(f64, f64)>) -> Vec<String> {
+    let mut shown = vec![format!(
+        "spent {:.2} of the run's {:.2} budget",
+        state.cost_usd, state.budget_usd
+    )];
+    if let Some((offered, ceiling)) = proposal {
+        shown.push(format!(
+            "the brief proposed {:.2}, above the ceiling of {:.2}",
+            offered, ceiling
+        ));
+    }
+    shown
 }
 
 /// The value a `verdict` branch routes on when the report has no `verdict`

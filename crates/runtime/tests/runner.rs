@@ -11,8 +11,8 @@ use aigentic_core::{
     AgentId, Author, ContentBlock, Event, EventKind, ProviderError, ProviderEvent, UserId,
 };
 use aigentic_log::{
-    NextMove, PermissionRequestedPayload, RunStartedPayload, StepReport, StepStatus, ThreadLog,
-    ThreadStartedPayload, run_state,
+    BUDGET_GATE, BudgetRaisedPayload, CheckpointAnswer, NextMove, PermissionRequestedPayload,
+    RunStartedPayload, StepReport, StepStatus, ThreadLog, ThreadStartedPayload, run_state,
 };
 use aigentic_policy::Policy;
 use aigentic_runtime::runner::{
@@ -24,7 +24,9 @@ use aigentic_runtime::{Answer, Approver, LENGTH_STOP, Prices, Runtime};
 use aigentic_runtime::{
     RuntimeError, STEP_REPORTED,
     harness_tools::FINISH_STEP,
-    runner::{CALL_FINISH_STEP, CONTINUE_PROMPT, REPORT_AGAIN_PROMPT, REPORT_WITHOUT_BODY},
+    runner::{
+        BUDGET_ASK_AT, CALL_FINISH_STEP, CONTINUE_PROMPT, REPORT_AGAIN_PROMPT, REPORT_WITHOUT_BODY,
+    },
 };
 use aigentic_tools::ToolRegistry;
 use common::{done, scripted, usage};
@@ -5485,5 +5487,698 @@ async fn a_retried_attempt_that_passes_pushes_and_closes() {
     assert_eq!(
         run_finished(events).outcome,
         aigentic_log::RunOutcome::Closed
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The budget gate: a run stops at its budget and asks before spending more.
+// ---------------------------------------------------------------------------
+
+/// The figure the fixture's brief proposes and its route records: the
+/// workflow's trivial figure.
+const BUDGET_TRIVIAL: f64 = 3.0;
+
+/// The outer figure the fixture's workflow allows.
+const BUDGET_FULL: f64 = 10.0;
+
+/// How far above `full` a brief may propose.
+const BUDGET_MAX_RAISE: f64 = 2.0;
+
+/// The workflow the budget tests run: a brief that routes a trivial issue
+/// straight to a writing step, with the shipped `[budget]` shape. Its
+/// figures are the constants above, so a test cannot drift from it.
+fn budget_workflow() -> String {
+    format!(
+        r####"
+name = "budget"
+version = 1
+
+[budget]
+trivial = {BUDGET_TRIVIAL:.1}
+full = {BUDGET_FULL:.1}
+max_raise = {BUDGET_MAX_RAISE:.1}
+
+[[steps]]
+id = "brief"
+role = "brief"
+profile = "flash"
+template = "templates/step.md"
+marker = "## Brief"
+route_by = "size"
+routes = {{ trivial = "implement-alone" }}
+budget = {BUDGET_TRIVIAL:.1}
+wall_secs = 900
+
+[[steps]]
+id = "implement-alone"
+role = "implementer"
+profile = "flash"
+template = "templates/step.md"
+marker = "## Implementation"
+next = "done"
+budget = {BUDGET_TRIVIAL:.1}
+wall_secs = 3600
+writes = true
+push = false
+"####
+    )
+}
+
+/// The figure in force after the brief's route: what the run_started
+/// carries and what the route records.
+fn budget_figure() -> f64 {
+    BUDGET_TRIVIAL
+}
+
+/// The most a brief may propose without an ask: `full × max_raise`.
+fn budget_ceiling() -> f64 {
+    BUDGET_FULL * BUDGET_MAX_RAISE
+}
+
+/// The figure the tests answer the gate with: clear of the line for a run
+/// that has spent `budget_figure()`, so the run continues rather than
+/// parking again.
+fn clearing_raise() -> f64 {
+    budget_figure() * 4.0
+}
+
+/// The price table the fixture's replies are priced by.
+fn budget_prices() -> Prices {
+    Prices {
+        input: 10.0,
+        cache_read: 1.0,
+        cache_write: 12.5,
+        output: 30.0,
+    }
+}
+
+/// One scripted reply that reports `args` and costs `usd` to make. The
+/// fixture rates a reply on its tokens, so the tokens come from the figure
+/// the test wants spent.
+fn priced_reply(args: Value, usd: f64) -> Vec<ProviderEvent> {
+    let input_tokens = (usd * 1_000_000.0 / budget_prices().input).round() as u64;
+    vec![
+        finish("done", args),
+        usage(input_tokens, 0),
+        done("tool_use"),
+    ]
+}
+
+/// The brief's report with the figure it proposes for the run.
+fn brief_report_proposing(usd: f64) -> Value {
+    let mut report = brief_report();
+    report["slots"]["budget"] = json!(usd);
+    report
+}
+
+/// The fixture the budget tests run, with the writing child's id: the
+/// test that watches a mid-step rebuild needs it.
+struct BudgetFixture {
+    fx: Fixture,
+    write: Ulid,
+}
+
+/// A brief whose reply costs `budget_figure()` and proposes `proposal`,
+/// and a writing step whose reply costs the same: the run crosses the ask
+/// line at the brief's end, and not again.
+fn budget_fixture(proposal: f64) -> BudgetFixture {
+    let brief = Ulid::generate();
+    let write = Ulid::generate();
+    let workflow = budget_workflow();
+    let fx = Fixture::with_workflow(
+        vec![
+            (
+                brief,
+                vec![priced_reply(
+                    brief_report_proposing(proposal),
+                    budget_figure(),
+                )],
+            ),
+            (
+                write,
+                vec![priced_reply(implementer_report(), budget_figure())],
+            ),
+        ],
+        &[
+            ("workflow.toml", workflow.as_str()),
+            ("templates/step.md", "do the step\n"),
+        ],
+    )
+    .priced(budget_prices());
+    BudgetFixture { fx, write }
+}
+
+/// The world after every lead event of a run that met the budget gate.
+struct Raised {
+    run: Trace,
+    /// The 1-based place of the answer, and of the raise it took.
+    answered_at: usize,
+    raised_at: usize,
+}
+
+/// Snapshot the world once per lead event a move has written. A move that
+/// parks writes the route and the ask, and a rebuild from between the two
+/// is what the replay tests ask for; nothing else a park does moves the
+/// repository, a child or the forge.
+fn push_snapshots(fx: &Fixture, snapshots: &mut Vec<Snapshot>) {
+    let written = fx.lead_events().len();
+    while snapshots.len() < written {
+        let mut one = snapshot(fx);
+        one.lead.truncate(snapshots.len() + 1);
+        snapshots.push(one);
+    }
+}
+
+/// Drive the fixture to its end, answering the budget gate with `raise`
+/// and `figure` when it comes, and snapshotting the world after every
+/// event. Answering the gate is what a person does in a live run.
+async fn drive_and_raise(fx: &Fixture, figure: f64) -> Raised {
+    let mut runner = fx.runner();
+    let mut snapshots = vec![snapshot(fx)];
+    let mut answered_at = 0;
+    let mut raised_at = 0;
+    let terminal = loop {
+        let advanced = runner.advance().await.expect("the run advances");
+        push_snapshots(fx, &mut snapshots);
+        match advanced {
+            Advanced::Moved => {
+                let events = fx.lead_events();
+                if answered_at == 0
+                    && let Some(at) = events_at(&events, EventKind::CheckpointAnswered).first()
+                {
+                    answered_at = *at;
+                }
+                if let Some(at) = events_at(&events, EventKind::BudgetRaised).first() {
+                    raised_at = *at;
+                }
+            }
+            Advanced::WaitingHuman { gate } if gate == BUDGET_GATE => {
+                assert_eq!(answered_at, 0, "the run parks at the budget gate once");
+                runner
+                    .answer(
+                        BUDGET_GATE,
+                        CheckpointAnswer::Raise,
+                        Some(format!("{figure:.2}")),
+                        steve(),
+                    )
+                    .expect("the raise clears the guard");
+                push_snapshots(fx, &mut snapshots);
+                answered_at = fx.lead_events().len();
+            }
+            other => break other,
+        }
+    };
+    push_snapshots(fx, &mut snapshots);
+    Raised {
+        run: Trace {
+            snapshots,
+            terminal,
+        },
+        answered_at,
+        raised_at,
+    }
+}
+
+/// The 1-based places of every lead event of `kind`.
+fn events_at(events: &[Event], kind: EventKind) -> Vec<usize> {
+    events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.kind == kind)
+        .map(|(i, _)| i + 1)
+        .collect()
+}
+
+/// Rebuild from `snapshot` with its lead events edited, then do one move:
+/// a log an older runner could have written, seen by the guard of this one.
+/// An edit that drops events renumbers what is left: the log's sequence is
+/// contiguous, and a gap is refused on open.
+async fn replay_edited(
+    fx: &Fixture,
+    snapshot: &Snapshot,
+    edit: impl FnOnce(&mut Vec<Event>),
+) -> (Advanced, TestRunner) {
+    fx.restore(snapshot);
+    let mut events = snapshot.lead.clone();
+    edit(&mut events);
+    for (i, event) in events.iter_mut().enumerate() {
+        event.seq = i as u64;
+    }
+    write_events(&fx.dir.path().join(format!("{}.jsonl", fx.lead)), &events);
+    let mut runner = fx.runner();
+    let advanced = runner.advance().await.expect("the rebuilt runner advances");
+    (advanced, runner)
+}
+
+/// T1: a run that has spent the ask line of its figure parks before the
+/// next step, and the ask names the spend and the figure.
+#[tokio::test]
+async fn a_run_at_eighty_percent_of_its_budget_parks_before_the_next_step() {
+    let fx = budget_fixture(budget_figure()).fx;
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        },
+        "the run stops instead of starting the next step"
+    );
+    let events = fx.lead_events();
+    let state = run_state(&events).expect("the log derives a run");
+    assert_eq!(
+        state.cost_usd,
+        budget_figure(),
+        "the priced reply is the spend the guard weighs"
+    );
+    assert_eq!(
+        gate(&events).as_deref(),
+        Some(BUDGET_GATE),
+        "the ask is the budget gate"
+    );
+    assert_eq!(
+        step_started(&events).len(),
+        1,
+        "and the next step never started"
+    );
+    let asks = checkpoints(&events);
+    assert_eq!(asks.len(), 1, "one ask");
+    assert_eq!(
+        asks[0].options,
+        vec!["raise".to_owned(), "stop".to_owned()],
+        "the ask offers a raise and a stop"
+    );
+    let spent = format!("{:.2}", state.cost_usd);
+    let figure = format!("{:.2}", state.budget_usd);
+    let shown = &asks[0].shown;
+    assert!(
+        shown.iter().any(|line| line.contains(&spent)),
+        "the ask says what the run spent: {shown:?}"
+    );
+    assert!(
+        shown.iter().any(|line| line.contains(&figure)),
+        "and the figure in force: {shown:?}"
+    );
+}
+
+/// T2: a second `advance()` while parked starts nothing and stacks no ask.
+#[tokio::test]
+async fn a_parked_budget_gate_starts_nothing_and_does_not_stack_asks() {
+    let fx = budget_fixture(budget_figure()).fx;
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        },
+        "the run parks"
+    );
+    let parked = fx.lead_events();
+    assert_eq!(
+        runner
+            .advance()
+            .await
+            .expect("a parked run advances nothing"),
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        },
+        "the run is still waiting"
+    );
+    assert_eq!(fx.lead_events().len(), parked.len(), "and writes nothing");
+    assert_eq!(checkpoints(&fx.lead_events()).len(), 1, "one ask, not two");
+    assert_eq!(
+        step_started(&fx.lead_events()).len(),
+        1,
+        "and no child starts behind the ask"
+    );
+}
+
+/// T3: an answered `raise` sends the run on under the new figure.
+#[tokio::test]
+async fn an_answered_raise_continues_the_run_under_the_new_figure() {
+    let fx = budget_fixture(budget_figure()).fx;
+    let figure = clearing_raise();
+    let raised = drive_and_raise(&fx, figure).await;
+    assert_eq!(
+        raised.run.terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the run goes on to its end"
+    );
+    let events = raised.run.lead();
+    assert!(
+        raised.answered_at < raised.raised_at,
+        "the answer comes before the raise"
+    );
+    let answer: aigentic_log::CheckpointAnsweredPayload =
+        serde_json::from_value(events[raised.answered_at - 1].payload.clone())
+            .expect("the answer carries its word");
+    assert_eq!(answer.answer, CheckpointAnswer::Raise);
+    let raise = &events[raised.raised_at - 1];
+    assert_eq!(
+        raise.kind,
+        EventKind::BudgetRaised,
+        "the raise is its own event"
+    );
+    let payload: BudgetRaisedPayload =
+        serde_json::from_value(raise.payload.clone()).expect("the raise carries its figure");
+    assert_eq!(payload.usd, figure, "the figure the answer offered");
+    assert_eq!(
+        run_state(events).expect("the log derives a run").budget_usd,
+        payload.usd,
+        "and the fold takes it"
+    );
+    let starts = events_at(events, EventKind::StepStarted);
+    assert_eq!(starts.len(), 2, "the brief and the writing step");
+    assert!(
+        raised.raised_at < starts[1],
+        "the writing step starts after the raise"
+    );
+}
+
+/// T4: a rebuild over the same log neither parks again nor repeats a move.
+#[tokio::test]
+async fn a_raised_budget_survives_a_rebuild() {
+    let fx = budget_fixture(budget_figure()).fx;
+    let raised = drive_and_raise(&fx, clearing_raise()).await;
+    let figure = &raised.run.lead()[raised.raised_at - 1].payload["usd"];
+    let snapshot = raised.run.after(raised.raised_at);
+    let before = snapshot.lead.len();
+    let (advanced, _runner) = replay(&fx, snapshot).await;
+    assert_eq!(
+        advanced,
+        Advanced::Moved,
+        "the rebuild continues instead of parking again"
+    );
+    let after = fx.lead_events();
+    assert_eq!(after.len(), before + 1, "the rebuild does one move");
+    assert_eq!(checkpoints(&after).len(), 1, "and asks no second time");
+    assert_eq!(
+        run_state(&after).expect("the log derives a run").budget_usd,
+        figure.as_f64().expect("the raise's figure"),
+        "the figure the raise wrote is still in force"
+    );
+}
+
+/// T5: `stop` at the budget gate ends the run as stopped.
+#[tokio::test]
+async fn a_stop_at_the_budget_gate_ends_the_run_as_stopped() {
+    let fx = budget_fixture(budget_figure()).fx;
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        },
+        "the run parks"
+    );
+    runner
+        .answer(BUDGET_GATE, CheckpointAnswer::Stop, None, steve())
+        .expect("stop is always offered");
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Stopped
+        },
+        "the answer ends the run"
+    );
+    let events = fx.lead_events();
+    assert_eq!(step_started(&events).len(), 1, "and starts no further step");
+    assert_eq!(checkpoints(&events).len(), 1, "and asks no second time");
+}
+
+/// T6: a run whose figure is zero is not asked, and starts its next step
+/// whatever it has spent.
+#[tokio::test]
+async fn a_run_with_no_budget_still_starts_its_next_step() {
+    let fx = budget_fixture(budget_figure()).fx;
+    let run = trace(&fx).await;
+    let ask = events_at(run.lead(), EventKind::CheckpointAsked)[0];
+    // A log an older runner could have written: the workflow's zero figure,
+    // no proposal taken, and no ask at all.
+    let snapshot = run.after(ask - 1);
+    let (advanced, _runner) = replay_edited(&fx, snapshot, |events| {
+        let started = events
+            .iter_mut()
+            .find(|event| event.kind == EventKind::RunStarted)
+            .expect("the run's first event");
+        started.payload["budget_usd"] = json!(0.0);
+        let route = events
+            .iter_mut()
+            .find(|event| event.kind == EventKind::RouteTaken)
+            .expect("the brief's route");
+        route.payload["budget_usd"] = Value::Null;
+    })
+    .await;
+    assert_eq!(
+        advanced,
+        Advanced::Moved,
+        "a zero figure parks nothing, so the writing step starts"
+    );
+    let after = fx.lead_events();
+    assert_eq!(step_started(&after).len(), 2, "the writing step started");
+    assert_eq!(checkpoints(&after).len(), 0, "and no gate was asked");
+    assert_eq!(
+        run_state(&after).expect("the log derives a run").budget_usd,
+        0.0,
+        "the figure in force is the zero the log records"
+    );
+}
+
+/// T7: a brief that proposes above the ceiling parks at the route, with the
+/// figure in force left alone.
+#[tokio::test]
+async fn a_brief_that_proposes_above_the_ceiling_parks_at_the_route() {
+    let proposal = budget_ceiling() + 1.0;
+    let fx = budget_fixture(proposal).fx;
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        },
+        "the run parks rather than taking the proposal"
+    );
+    let events = fx.lead_events();
+    let route = routes(&events).pop().expect("the route is recorded");
+    assert_eq!(
+        route.budget_usd,
+        Some(budget_figure()),
+        "the route leaves the figure in force"
+    );
+    assert_eq!(
+        run_state(&events)
+            .expect("the log derives a run")
+            .budget_usd,
+        budget_figure(),
+        "which is what the run is spending against"
+    );
+    assert_eq!(step_started(&events).len(), 1, "and no step starts on it");
+    let asks = checkpoints(&events);
+    assert_eq!(asks.len(), 1, "one ask");
+    let shown = &asks[0].shown;
+    assert!(
+        shown
+            .iter()
+            .any(|line| line.contains(&format!("{proposal:.2}"))),
+        "the ask names the proposal: {shown:?}"
+    );
+    assert!(
+        shown
+            .iter()
+            .any(|line| line.contains(&format!("{:.2}", budget_ceiling()))),
+        "and the ceiling it went over: {shown:?}"
+    );
+}
+
+/// T8: a proposal at the ceiling exactly is the run's figure, with no ask.
+#[tokio::test]
+async fn a_brief_that_proposes_at_the_ceiling_is_taken_without_asking() {
+    let proposal = budget_ceiling();
+    let fx = budget_fixture(proposal).fx;
+    let run = trace(&fx).await;
+    let events = run.lead();
+    assert_eq!(
+        run.terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the run goes on to its end"
+    );
+    assert_eq!(
+        checkpoints(events).len(),
+        0,
+        "the boundary is not over the line"
+    );
+    assert_eq!(
+        routes(events).pop().expect("the route").budget_usd,
+        Some(proposal),
+        "the proposal at the ceiling is the run's figure"
+    );
+    assert_eq!(
+        run_state(events).expect("the log derives a run").budget_usd,
+        proposal
+    );
+}
+
+/// T9: a raise that does not clear the gate is refused and writes nothing,
+/// and the run stays parked.
+#[tokio::test]
+async fn a_raise_that_does_not_clear_the_gate_is_refused_without_writing() {
+    let fx = budget_fixture(budget_figure()).fx;
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        },
+        "the run parks"
+    );
+    let parked = fx.lead_events();
+    let state = run_state(&parked).expect("the log derives a run");
+    let quotient = state.cost_usd / BUDGET_ASK_AT;
+    let least = format!("{}", quotient);
+    let current = format!("{:.2}", state.budget_usd);
+    let offers = vec![
+        ("an unparseable figure", "a lot".to_owned()),
+        ("a figure not above the one in force", current),
+        ("exactly the ask point", least),
+    ];
+    for (why, offer) in offers {
+        let refused = runner
+            .answer(
+                BUDGET_GATE,
+                CheckpointAnswer::Raise,
+                Some(offer.clone()),
+                steve(),
+            )
+            .expect_err("the answer is refused");
+        match refused {
+            RunnerError::RaiseRefused {
+                offered,
+                budget,
+                spent,
+                least: told,
+            } => {
+                assert_eq!(offered, offer, "{why}: the refusal names the offer");
+                assert_eq!(budget, state.budget_usd, "{why}: and the figure in force");
+                assert_eq!(spent, state.cost_usd, "{why}: and what was spent");
+                assert_eq!(
+                    told,
+                    f64::next_up(quotient),
+                    "{why}: and the smallest figure above the ask point"
+                );
+            }
+            other => panic!("{why}: the refusal is the raise's, not {other:?}"),
+        }
+        assert_eq!(
+            fx.lead_events().len(),
+            parked.len(),
+            "{why}: the refusal writes nothing"
+        );
+        assert_eq!(
+            runner.advance().await.expect("the run is still parked"),
+            Advanced::WaitingHuman {
+                gate: BUDGET_GATE.to_owned()
+            },
+            "{why}: so the run stays parked and may be answered again"
+        );
+    }
+    // The figure the refusal points at is the one that clears: the guard's
+    // test is strict, so the smallest figure past the quotient is taken.
+    runner
+        .answer(
+            BUDGET_GATE,
+            CheckpointAnswer::Raise,
+            Some(format!("{}", f64::next_up(quotient))),
+            steve(),
+        )
+        .expect("the smallest figure past the ask point clears the line");
+}
+
+/// T10: a rebuild from every prefix of a raised run does each move once and
+/// leaves the same log.
+#[tokio::test]
+async fn a_rebuild_after_every_lead_event_does_each_move_once_at_the_budget_gate() {
+    let fx = budget_fixture(budget_figure()).fx;
+    let raised = drive_and_raise(&fx, clearing_raise()).await;
+    let full = raised.run.lead().to_vec();
+    assert!(full.len() >= 5, "the run is several moves long");
+    for k in 1..=full.len() {
+        fx.restore(raised.run.after(k));
+        let rebuilt = drive_and_raise(&fx, clearing_raise()).await;
+        assert_eq!(
+            rebuilt.run.terminal, raised.run.terminal,
+            "prefix {k}: the run ends the same way"
+        );
+        let after = fx.lead_events();
+        assert_eq!(
+            after.len(),
+            full.len(),
+            "prefix {k}: the same number of events"
+        );
+        for (i, (one, other)) in after.iter().zip(&full).enumerate() {
+            assert_eq!(one.kind, other.kind, "prefix {k}: event {i}'s kind");
+            assert_eq!(
+                same_move(one),
+                same_move(other),
+                "prefix {k}: event {i}'s payload"
+            );
+        }
+    }
+}
+
+/// T15: a rebuild mid-step with the run over the line parks before it
+/// resumes the child.
+#[tokio::test]
+async fn a_rebuild_mid_step_over_the_line_parks_before_resuming_the_child() {
+    let budget = budget_fixture(budget_figure());
+    let fx = &budget.fx;
+    let raised = drive_and_raise(fx, clearing_raise()).await;
+    let started = events_at(raised.run.lead(), EventKind::StepStarted);
+    let mid_step = *started.last().expect("the writing step started");
+    // The log an older runner could have left: no gate at all, and a step
+    // that crossed the line this runner's guard weighs.
+    let snapshot = raised.run.after(mid_step);
+    let children = {
+        fx.restore(snapshot);
+        let events = fx.child_events_of(budget.write);
+        assert!(!events.is_empty(), "the child had begun its turn");
+        events.len()
+    };
+    let (advanced, _runner) = replay_edited(fx, snapshot, |events| {
+        events.retain(|event| {
+            !matches!(
+                event.kind,
+                EventKind::CheckpointAsked
+                    | EventKind::CheckpointAnswered
+                    | EventKind::BudgetRaised
+            )
+        });
+        let finished = events
+            .iter_mut()
+            .find(|event| event.kind == EventKind::StepFinished)
+            .expect("the brief's step finished");
+        finished.payload["cost_usd"] = json!(budget_figure() * 4.0);
+    })
+    .await;
+    assert_eq!(
+        advanced,
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        },
+        "the rebuild asks before resuming the child"
+    );
+    let after = fx.lead_events();
+    assert_eq!(checkpoints(&after).len(), 1, "once");
+    assert_eq!(
+        step_started(&after).len(),
+        2,
+        "the step it was mid-way through"
+    );
+    assert_eq!(
+        fx.child_events_of(budget.write).len(),
+        children,
+        "and the child is not resumed"
     );
 }
