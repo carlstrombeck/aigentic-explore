@@ -12,12 +12,18 @@ use serde::de::DeserializeOwned;
 use ulid::Ulid;
 
 use crate::payload::{
-    BudgetScope, BudgetWarnedPayload, CheckOutcome, CheckResult, CheckpointAnswer,
-    CheckpointAnsweredPayload, CheckpointAskedPayload, ChecksRunPayload, CommitRef, PushedPayload,
-    ReleaseImpact, RouteTakenPayload, RunErroredPayload, RunFinishedPayload, RunOutcome,
-    RunStartedPayload, StepFinishedPayload, StepStartedPayload, StepStatus,
+    BudgetRaisedPayload, BudgetScope, BudgetWarnedPayload, CheckOutcome, CheckResult,
+    CheckpointAnswer, CheckpointAnsweredPayload, CheckpointAskedPayload, ChecksRunPayload,
+    CommitRef, PushedPayload, ReleaseImpact, RouteTakenPayload, RunErroredPayload,
+    RunFinishedPayload, RunOutcome, RunStartedPayload, StepFinishedPayload, StepStartedPayload,
+    StepStatus,
 };
 use crate::store::LogError;
+
+/// The gate a run parks at when what it has spent has reached its budget.
+/// The runner writes the ask and the fold reads it, so the word has one
+/// home.
+pub const BUDGET_GATE: &str = "budget";
 
 /// How a step's checks did as a whole: what `NextMove::ChecksDone`
 /// reports. The runner decides a send-back and its limit from this; the
@@ -157,6 +163,11 @@ pub struct RunState {
     /// The last answered checkpoint: the gate that was open when the
     /// answer came, and the answer itself.
     answered: Option<(String, CheckpointAnsweredPayload)>,
+    /// The decisive kind a `budget` ask interrupted. A raise is a budget
+    /// figure rather than a move, so folding `budget_raised` puts this
+    /// kind back as `last`: a replay then derives the move the park
+    /// blocked instead of parking again.
+    parked_at_budget: Option<EventKind>,
 }
 
 impl RunState {
@@ -281,10 +292,10 @@ fn runner_kind(kind: EventKind) -> Option<RunnerKind> {
         EventKind::CheckpointAsked => Some(RunnerKind::CheckpointAsked),
         EventKind::CheckpointAnswered => Some(RunnerKind::CheckpointAnswered),
         EventKind::BudgetWarned => Some(RunnerKind::BudgetWarned),
+        EventKind::BudgetRaised => Some(RunnerKind::BudgetRaised),
         EventKind::Pushed => Some(RunnerKind::Pushed),
         EventKind::RunFinished => Some(RunnerKind::RunFinished),
         EventKind::RunErrored => Some(RunnerKind::RunErrored),
-        EventKind::BudgetRaised => None,
         EventKind::UserMessage
         | EventKind::AssistantMessage
         | EventKind::ToolResult
@@ -327,6 +338,8 @@ enum RunnerKind {
     CheckpointAsked,
     CheckpointAnswered,
     BudgetWarned,
+    /// A raise: a budget figure, not a move of its own.
+    BudgetRaised,
     Pushed,
     RunFinished,
     RunErrored,
@@ -352,6 +365,7 @@ pub fn run_state(events: &[Event]) -> Result<RunState, LogError> {
         errored: None,
         last: None,
         answered: None,
+        parked_at_budget: None,
     };
     let mut opened: Option<usize> = None;
     for event in events {
@@ -424,6 +438,11 @@ pub fn run_state(events: &[Event]) -> Result<RunState, LogError> {
             }
             RunnerKind::CheckpointAsked => {
                 let p: CheckpointAskedPayload = payload(event)?;
+                if p.gate == BUDGET_GATE {
+                    // The park stands between a move and itself: what the
+                    // raise must give back is the move it interrupted.
+                    st.parked_at_budget = st.last;
+                }
                 st.pending_checkpoint = Some(p.gate);
             }
             RunnerKind::CheckpointAnswered => {
@@ -432,6 +451,15 @@ pub fn run_state(events: &[Event]) -> Result<RunState, LogError> {
                     return Err(ordering(event, "no checkpoint is open"));
                 };
                 st.answered = Some((gate, p));
+            }
+            RunnerKind::BudgetRaised => {
+                let p: BudgetRaisedPayload = payload(event)?;
+                st.budget_usd = p.usd;
+                let Some(parked) = st.parked_at_budget.take() else {
+                    return Err(ordering(event, "no budget gate to raise at"));
+                };
+                st.last = Some(parked);
+                continue;
             }
             RunnerKind::BudgetWarned => {
                 let p: BudgetWarnedPayload = payload(event)?;
@@ -708,6 +736,18 @@ mod tests {
                 limit_usd,
             },
         )
+    }
+
+    fn budget_raised(usd: f64) -> Event {
+        at(EventKind::BudgetRaised, BudgetRaisedPayload { usd })
+    }
+
+    /// The `run_started()` fixture's provisional budget, read from its
+    /// payload so a log that changes the fixture moves these tests with
+    /// it.
+    fn run_budget() -> f64 {
+        let p: RunStartedPayload = serde_json::from_value(run_started().payload).unwrap();
+        p.budget_usd
     }
 
     fn run_errored(reason: &str, cost_usd: f64) -> Event {
@@ -1368,5 +1408,69 @@ mod tests {
         route.payload["budget_usd"] = serde_json::json!(7.5);
         let st = run_state(&numbered(vec![run_started(), route])).unwrap();
         assert_eq!(st.budget_usd, 7.5);
+    }
+
+    /// A raise is a budget figure, not a move. Folding it puts the
+    /// figure in force and gives back the move the park interrupted, so a
+    /// replay continues past the park instead of asking again — and a
+    /// note logged between the ask and the raise changes none of it.
+    #[test]
+    fn a_raise_sets_the_budget_and_leaves_the_blocked_move_next() {
+        let interrupted = run_state(&numbered(vec![
+            run_started(),
+            step_started(1, child()),
+            step_finished(StepStatus::Done, 0.4),
+        ]))
+        .unwrap();
+        let raise = |note: Option<Event>| {
+            let mut log = vec![
+                run_started(),
+                step_started(1, child()),
+                step_finished(StepStatus::Done, 0.4),
+                checkpoint_asked(BUDGET_GATE),
+            ];
+            log.extend(note);
+            log.push(checkpoint_answered(
+                CheckpointAnswer::Raise,
+                Some(&format!("{:.2}", run_budget() * 2.0)),
+            ));
+            log.push(budget_raised(run_budget() * 2.0));
+            run_state(&numbered(log)).unwrap()
+        };
+
+        let plain = raise(None);
+        let noted = raise(Some(run_errored("the turn ended", 0.4)));
+        for st in [&plain, &noted] {
+            assert_eq!(st.budget_usd, run_budget() * 2.0);
+            assert_eq!(
+                st.next_move(),
+                interrupted.next_move(),
+                "the move after a raise is the one the park interrupted"
+            );
+        }
+        assert_eq!(plain.errored, None);
+        assert_eq!(
+            noted.errored.as_ref().map(|e| e.reason.as_str()),
+            Some("the turn ended")
+        );
+    }
+
+    /// The ask alone is not the raise — with no answer folded the
+    /// run still waits at the budget gate.
+    #[test]
+    fn an_unanswered_budget_ask_is_still_the_next_move() {
+        let st = run_state(&numbered(vec![
+            run_started(),
+            step_started(1, child()),
+            step_finished(StepStatus::Done, 0.4),
+            checkpoint_asked(BUDGET_GATE),
+        ]))
+        .unwrap();
+        assert_eq!(
+            st.next_move(),
+            NextMove::AwaitingCheckpoint {
+                gate: BUDGET_GATE.into()
+            }
+        );
     }
 }

@@ -256,6 +256,8 @@ pub enum CheckpointAnswer {
     Amend,
     Retry,
     Stop,
+    /// Raised a run's budget; the amendment carries the new figure.
+    Raise,
 }
 
 /// The text reports the REPL prints, rendered by the daemon so every

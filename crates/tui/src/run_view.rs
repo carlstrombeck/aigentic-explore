@@ -209,6 +209,7 @@ pub(crate) fn answer_word(answer: &aigentic_runtime::aigentic_log::CheckpointAns
         LogAnswer::Amend => "amend".into(),
         LogAnswer::Retry => "retry".into(),
         LogAnswer::Stop => "stop".into(),
+        LogAnswer::Raise => "raise".into(),
     }
 }
 

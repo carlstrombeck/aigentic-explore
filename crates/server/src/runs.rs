@@ -1200,6 +1200,7 @@ fn log_answer(answer: CheckpointAnswer) -> LogAnswer {
         CheckpointAnswer::Amend => LogAnswer::Amend,
         CheckpointAnswer::Retry => LogAnswer::Retry,
         CheckpointAnswer::Stop => LogAnswer::Stop,
+        CheckpointAnswer::Raise => LogAnswer::Raise,
     }
 }
 

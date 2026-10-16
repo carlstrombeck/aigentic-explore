@@ -1678,6 +1678,7 @@ impl ThreadTable {
             CheckpointAnswer::Amend => "amend",
             CheckpointAnswer::Retry => "retry",
             CheckpointAnswer::Stop => "stop",
+            CheckpointAnswer::Raise => "raise",
         };
         let offered: Vec<String> = log
             .events()

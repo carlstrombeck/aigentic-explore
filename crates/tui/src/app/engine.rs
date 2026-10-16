@@ -1687,6 +1687,7 @@ impl ClientRepl {
             aigentic_api::CheckpointAnswer::Amend => "amend",
             aigentic_api::CheckpointAnswer::Retry => "retry",
             aigentic_api::CheckpointAnswer::Stop => "stop",
+            aigentic_api::CheckpointAnswer::Raise => "raise",
         };
         let r = self
             .request(Request::AnswerCheckpoint {
