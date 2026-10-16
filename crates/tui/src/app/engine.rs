@@ -1641,9 +1641,10 @@ impl ClientRepl {
             .and_then(|watch| watch.child_ref().checkpoint())
     }
 
-    /// `/answer go`, `/answer amend <text>` or `/answer stop`: answer the
-    /// followed run's open checkpoint by name. The daemon refuses an
-    /// answer the gate didn't offer, and the prompt stays up then.
+    /// `/answer go`, `/answer amend <text>`, `/answer raise <usd>` or
+    /// `/answer stop`: answer the followed run's open checkpoint by name.
+    /// The daemon refuses an answer the gate didn't offer, and the prompt
+    /// stays up then.
     async fn answer_checkpoint(&mut self, arg: &str, out: &mut dyn Printer) {
         if self.checkpoint.is_none() {
             out.line("[no checkpoint is waiting in this REPL: /build <n> follows a run]");
@@ -1657,9 +1658,14 @@ impl ClientRepl {
             ("amend", text) if !text.is_empty() => {
                 (aigentic_api::CheckpointAnswer::Amend, Some(text.to_owned()))
             }
+            // The figure travels as the amendment, as a raise's does in the
+            // log: the daemon reads the number from the answer's text.
+            ("raise", text) if !text.is_empty() => {
+                (aigentic_api::CheckpointAnswer::Raise, Some(text.to_owned()))
+            }
             _ => {
                 out.line(
-                    "[usage: /answer go | /answer retry | /answer amend <text> | /answer stop]",
+                    "[usage: /answer go | /answer retry | /answer amend <text> | /answer raise <usd> | /answer stop]",
                 );
                 return;
             }
@@ -8793,6 +8799,21 @@ mod tests {
         );
     }
 
+    /// The wire mirrors the log's enum by hand, and only the tui names both.
+    /// If the two words drift, a client sends a word the daemon's log cannot
+    /// read, and every frame still looks well-formed.
+    #[test]
+    fn the_raise_word_is_the_same_in_the_log_and_the_wire() {
+        assert_eq!(
+            serde_json::to_value(aigentic_api::CheckpointAnswer::Raise).unwrap(),
+            serde_json::json!("raise")
+        );
+        assert_eq!(
+            serde_json::to_value(aigentic_runtime::aigentic_log::CheckpointAnswer::Raise).unwrap(),
+            serde_json::json!("raise")
+        );
+    }
+
     /// A workflow's own checkpoint offers what it takes: `Continue`,
     /// `Continue with changes`, `Leave it waiting` and `Stop the run`. The
     /// selection starts on the row that sends nothing, so Enter alone
@@ -8914,6 +8935,59 @@ mod tests {
             ] => assert_eq!(text, "split item 7"),
             other => panic!("the typed amendment is sent: {other:?}"),
         }
+        daemon.stop();
+    }
+
+    /// The budget gate takes a figure as its answer. The command carries the
+    /// word the daemon's log reads and the number as the answer's text: what
+    /// the run's figure becomes is the runner's decision, not the client's.
+    #[tokio::test]
+    async fn the_answer_command_sends_a_raise_with_its_figure() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            serde_json::json!({
+                "gate": "budget",
+                "shown": ["spent 2.40 of the run's 3.00 budget"],
+                "options": ["raise", "stop"],
+            }),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let before = daemon.requests().len();
+        repl.handle_line("/answer raise 7.50", &mut out).await;
+        match &daemon.requests()[before..] {
+            [
+                Request::AnswerCheckpoint {
+                    answer: aigentic_api::CheckpointAnswer::Raise,
+                    amendment: Some(figure),
+                    ..
+                },
+            ] => assert_eq!(figure, "7.50"),
+            other => panic!("the figure is the answer's text: {other:?}"),
+        }
+        daemon.stop();
+
+        // A raise with no figure is not an answer.
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            serde_json::json!({
+                "gate": "budget",
+                "shown": ["spent 2.40 of the run's 3.00 budget"],
+                "options": ["raise", "stop"],
+            }),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let before = daemon.requests().len();
+        repl.handle_line("/answer raise", &mut out).await;
+        assert_eq!(daemon.requests().len(), before, "nothing was sent");
+        assert!(repl.menu().is_some(), "and the gate is still waiting");
         daemon.stop();
     }
 

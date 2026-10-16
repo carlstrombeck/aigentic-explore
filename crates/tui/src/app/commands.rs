@@ -212,7 +212,7 @@ pub const HELP: &str = "\
 /new             start a new front thread; the old one stays listed; asks first if a turn is running
 /build <n> [w]   follow a build of issue n here (workflow w, else build), and answer its checkpoints
 /watch <n> [s]   watch a running issue's step s (default: the step it is on) read-only; /back leaves
-/answer go       continue the run past its checkpoint; /answer retry grants one more attempt where one is offered; /answer amend <text> continues with changes; /answer stop
+/answer go       continue the run past its checkpoint; /answer retry grants one more attempt where one is offered; /answer amend <text> continues with changes; /answer raise <usd> lifts a run's budget; /answer stop
 /back            leave a watched step and return to the front thread
 /jobs [n]        today's builds and what each is doing; with a number from the listing, look at that build read-only
 /<skill> [args]  run a user-invoked skill
