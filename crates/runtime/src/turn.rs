@@ -166,6 +166,7 @@ impl Runtime {
             wall_waited: std::time::Duration::ZERO,
             iterations: 0,
             tokens: 0,
+            usd: 0.0,
         };
         self.refresh_knowledge()?;
         self.refresh_memory()?;
@@ -459,6 +460,7 @@ impl Runtime {
                 usage.ttft_ms = ttft_ms;
                 usage.cost_usd = self.prices.map(|p| p.cost_usd(&usage));
                 spent.tokens += self.budget.spent_of(&usage.to_core());
+                spent.usd += usage.cost_usd.unwrap_or(0.0);
                 // Issue #114: the attempt failed after content, and the
                 // failure is one a fresh call can get past — a stream cut off
                 // with no end marker (`Cut`), or a transient error such as a

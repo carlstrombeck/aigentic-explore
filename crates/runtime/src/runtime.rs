@@ -1353,11 +1353,18 @@ pub const LENGTH_STOP: &str = "length";
 /// The provider's other name for the same stop (issue #96).
 pub const MAX_TOKENS_STOP: &str = "max_tokens";
 
+/// The `turn_ended` reason when the turn's own spend reached
+/// `Budget::max_cost_usd`: the call that crossed the cap ran to its end,
+/// and the check that reads this runs before the next one. The runner
+/// maps it to a `Partial` step, the same recoverable stop the other
+/// budget reasons are.
+pub const MAX_USD: &str = "max_usd";
+
 /// How a turn ended. The same information is in the `turn_ended` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnOutcome {
-    /// `done`, `max_iterations`, `max_tokens`, `max_wall_time` or
-    /// `provider_error`.
+    /// `done`, `max_iterations`, `max_tokens`, `max_wall_time`,
+    /// `max_usd` or `provider_error`.
     pub reason: String,
     pub iterations: u32,
     pub tokens: u64,

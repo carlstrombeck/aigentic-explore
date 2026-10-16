@@ -8,7 +8,7 @@ use aigentic_core::{
     ToolCall,
 };
 use aigentic_log::{AssistantMessagePayload, ThreadLog, ToolResultPayload, TurnEndedPayload};
-use aigentic_runtime::{Prices, Runtime, RuntimeError, Signal};
+use aigentic_runtime::{DEFAULT_BUDGET, MAX_USD, Prices, Runtime, RuntimeError, Signal};
 use aigentic_tools::ToolRegistry;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
@@ -270,6 +270,259 @@ async fn wall_time_budget_is_named_in_the_turn_ended_event() {
     let end: TurnEndedPayload =
         serde_json::from_value(events.last().unwrap().payload.clone()).unwrap();
     assert_eq!(end.reason, "max_wall_time");
+}
+
+/// What the runtime's own arithmetic charges for a call whose reply
+/// reports `usage(i, o)`: a test's cap comes from here, so the cap and
+/// the stamped cost are one computation and no dollar figure is typed.
+fn cost_of(prices: &Prices, i: u64, o: u64) -> f64 {
+    prices.cost_usd(&aigentic_log::Usage::reported(aigentic_core::Usage {
+        input_tokens: i,
+        output_tokens: o,
+        ..Default::default()
+    }))
+}
+
+/// A reply that calls the `echo` tool and reports `usage(i, o)`. A tool
+/// call rather than a plain stop, because a reply that stops ends the
+/// turn before the budget is consulted: only a reply that keeps the loop
+/// going lets a test reach the dollar check at the next iteration.
+fn priced_tool_call(id: &str, i: u64, o: u64) -> Vec<ProviderEvent> {
+    vec![
+        ProviderEvent::ToolCall(call(id, "x")),
+        usage(i, o),
+        done("tool_calls"),
+    ]
+}
+
+/// The new cap ends a turn with a reason of its own, and the call that
+/// reached the cap runs to its end: the check runs before the next call,
+/// not inside one.
+#[tokio::test]
+async fn a_turn_ends_at_its_dollar_cap() {
+    let prices = Prices {
+        input: 3.0,
+        cache_read: 0.5,
+        cache_write: 4.0,
+        output: 15.0,
+    };
+    let cap = cost_of(&prices, 1_000, 500);
+    assert!(cap > 0.0, "the price table charges for this call");
+
+    let mut h = harness(
+        vec![
+            priced_tool_call("c", 1_000, 500),
+            // Never called: the first one has spent the cap.
+            vec![ProviderEvent::TextDelta("after".into()), done("stop")],
+        ],
+        None,
+    );
+    h.runtime.set_pricing("tensorx", Some(prices));
+    h.runtime.set_budget(Budget {
+        max_cost_usd: Some(cap),
+        ..DEFAULT_BUDGET
+    });
+
+    let outcome = h
+        .runtime
+        .run_turn(steve(), vec![], &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason, MAX_USD);
+    assert_eq!(
+        h.seen.lock().unwrap().len(),
+        1,
+        "the call that spent the cap ran; the next was never made"
+    );
+
+    let events = h.runtime.log().read_all().unwrap();
+    let ends: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::TurnEnded)
+        .collect();
+    assert_eq!(ends.len(), 1, "one turn, one end");
+    let end: TurnEndedPayload = serde_json::from_value(ends[0].payload.clone()).unwrap();
+    assert_eq!(
+        end.reason, MAX_USD,
+        "the same reason string the runner's step record carries"
+    );
+
+    let u = costs(&events);
+    assert_eq!(u[0], cap, "the turn's spend is what its one call cost");
+    assert_eq!(
+        u[0],
+        prices.cost_usd(&aigentic_log::Usage::reported(aigentic_core::Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            ..Default::default()
+        })),
+        "the logged cost is the formula over the numbers the reply reported"
+    );
+}
+
+/// The cost each logged call carries, in the log's order: the spend the
+/// cap is compared against, read back from the log rather than counted.
+fn costs(events: &[aigentic_core::Event]) -> Vec<f64> {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::AssistantMessage)
+        .map(|e| {
+            serde_json::from_value::<AssistantMessagePayload>(e.payload.clone())
+                .unwrap()
+                .usage
+                .expect("a stamped usage line")
+                .cost_usd
+                .expect("a priced call")
+        })
+        .collect()
+}
+
+/// The cap is the turn's own spend, whatever the script holds next: a
+/// turn whose first call reached it stops there, and one whose cap is two
+/// calls' price stops after the second.
+#[tokio::test]
+async fn a_turn_stops_when_it_spends_its_cap() {
+    let prices = Prices {
+        input: 3.0,
+        cache_read: 0.5,
+        cache_write: 4.0,
+        output: 15.0,
+    };
+    let first = cost_of(&prices, 1_000, 500);
+    let second = cost_of(&prices, 2_000, 100);
+
+    // One call's price as the cap: the turn ends after it.
+    let mut h = harness(
+        vec![
+            priced_tool_call("c1", 1_000, 500),
+            vec![ProviderEvent::TextDelta("after".into()), done("stop")],
+        ],
+        None,
+    );
+    h.runtime.set_pricing("tensorx", Some(prices));
+    h.runtime.set_budget(Budget {
+        max_cost_usd: Some(first),
+        ..DEFAULT_BUDGET
+    });
+    let outcome = h
+        .runtime
+        .run_turn(steve(), vec![], &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason, MAX_USD);
+    assert_eq!(h.seen.lock().unwrap().len(), 1);
+
+    // Both prices as the cap: two calls run, and the third is never made.
+    let mut h = harness(
+        vec![
+            priced_tool_call("c1", 1_000, 500),
+            priced_tool_call("c2", 2_000, 100),
+            vec![ProviderEvent::TextDelta("after".into()), done("stop")],
+        ],
+        None,
+    );
+    h.runtime.set_pricing("tensorx", Some(prices));
+    h.runtime.set_budget(Budget {
+        max_cost_usd: Some(first + second),
+        ..DEFAULT_BUDGET
+    });
+    let outcome = h
+        .runtime
+        .run_turn(steve(), vec![], &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason, MAX_USD);
+    assert_eq!(
+        h.seen.lock().unwrap().len(),
+        2,
+        "the second call is the one that reached the cap"
+    );
+    let events = h.runtime.log().read_all().unwrap();
+    assert_eq!(
+        costs(&events),
+        vec![first, second],
+        "the spend that met the cap is the two calls' prices"
+    );
+}
+
+/// The dollar arm sits behind the three older ones: the same script and
+/// the same cap are named by the iteration limit when that limit is met
+/// on the same check, and by the cap when there is iteration room.
+#[tokio::test]
+async fn a_dollar_cap_does_not_displace_the_older_reasons() {
+    let prices = Prices {
+        input: 3.0,
+        cache_read: 0.5,
+        cache_write: 4.0,
+        output: 15.0,
+    };
+    let per = cost_of(&prices, 1_000, 500);
+    let capped = || Budget {
+        max_cost_usd: Some(per * 2.0),
+        ..DEFAULT_BUDGET
+    };
+    let script = || {
+        vec![
+            priced_tool_call("c1", 1_000, 500),
+            priced_tool_call("c2", 1_000, 500),
+            priced_tool_call("c3", 1_000, 500),
+        ]
+    };
+    let spend = |h: &Harness| {
+        costs(&h.runtime.log().read_all().unwrap())
+            .iter()
+            .sum::<f64>()
+    };
+
+    // No figure at all: the iteration limit names the stop.
+    let forever = || vec![ProviderEvent::ToolCall(call("c", "x")), done("tool_calls")];
+    let mut h = harness(vec![forever(), forever(), forever()], None);
+    h.runtime.set_budget(Budget {
+        max_iterations: 2,
+        max_cost_usd: None,
+        ..DEFAULT_BUDGET
+    });
+    let outcome = h
+        .runtime
+        .run_turn(steve(), vec![], &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason, "max_iterations");
+    assert_ne!(outcome.reason, MAX_USD);
+
+    // The same cap with iteration room: the dollar reason, after the two
+    // calls whose prices it names.
+    let mut h = harness(script(), None);
+    h.runtime.set_pricing("tensorx", Some(prices));
+    h.runtime.set_budget(capped());
+    let outcome = h
+        .runtime
+        .run_turn(steve(), vec![], &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason, MAX_USD);
+    assert_eq!(spend(&h), per * 2.0, "two calls met the cap");
+
+    // The same script and cap with the iteration limit met on the same
+    // check: the limit is named, and the cap was met as well.
+    let mut h = harness(script(), None);
+    h.runtime.set_pricing("tensorx", Some(prices));
+    h.runtime.set_budget(Budget {
+        max_iterations: 2,
+        ..capped()
+    });
+    let outcome = h
+        .runtime
+        .run_turn(steve(), vec![], &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason, "max_iterations");
+    assert_ne!(outcome.reason, MAX_USD);
+    assert_eq!(
+        spend(&h),
+        per * 2.0,
+        "the cap was spent and the count still named the stop"
+    );
 }
 
 #[tokio::test]

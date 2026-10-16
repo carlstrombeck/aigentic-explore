@@ -37,7 +37,7 @@ use ulid::Ulid;
 use crate::checks::git::{read_commits_between, read_uncommitted};
 use crate::checks::{CheckInput, run_checks};
 use crate::workflow::{LoadedWorkflow, Step, WorkflowError};
-use crate::{LENGTH_STOP, Runtime, RuntimeError, STEP_REPORTED, Signal};
+use crate::{LENGTH_STOP, MAX_USD, Runtime, RuntimeError, STEP_REPORTED, Signal};
 
 /// The author id of the lead's own events, and of the messages a runner
 /// posts into a child.
@@ -1728,7 +1728,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             // `LENGTH_STOP` is a budget-style stop like `max_tokens`: the
             // step is Partial, not Failed, and nothing escalates (issue
             // #96).
-            "done" | "resumed" | LENGTH_STOP | "max_iterations" | "max_tokens"
+            "done" | "resumed" | LENGTH_STOP | MAX_USD | "max_iterations" | "max_tokens"
             | "max_wall_time" => {
                 let finished = finish(StepStatus::Partial, end.reason, None);
                 self.append(EventKind::StepFinished, &finished)?;

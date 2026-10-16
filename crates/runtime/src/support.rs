@@ -8,7 +8,7 @@ use aigentic_core::{
 use aigentic_log::{NewEvent, TurnEndedPayload, Usage, UserMessagePayload};
 
 use crate::decisions::Queued;
-use crate::{Runtime, RuntimeError, Signal, TurnOutcome};
+use crate::{MAX_USD, Runtime, RuntimeError, Signal, TurnOutcome};
 
 /// A gap between wall time and running time at or above this is reported
 /// as sleep (issue #47): clock jitter and NTP steps stay silent.
@@ -50,6 +50,11 @@ pub(crate) struct Spent {
     pub(crate) wall_waited: Duration,
     pub(crate) iterations: u32,
     pub(crate) tokens: u64,
+    /// What this turn's calls have cost, in dollars. A call the endpoint
+    /// reports no price for adds nothing, and a turn with no price table
+    /// stays at zero, so a dollar cap is only reached where a cost is
+    /// known.
+    pub(crate) usd: f64,
 }
 
 impl Runtime {
@@ -86,6 +91,12 @@ impl Runtime {
             >= self.budget.max_wall_time
         {
             Some("max_wall_time")
+        } else if self.budget.max_cost_usd.is_some_and(|cap| spent.usd >= cap) {
+            // Last of the four, so a turn that crossed both a count and
+            // the dollar cap is named by the count. The call that
+            // crossed the cap has already settled: this check runs
+            // before a call, not inside one.
+            Some(MAX_USD)
         } else {
             None
         }
