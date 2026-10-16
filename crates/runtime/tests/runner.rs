@@ -5504,6 +5504,12 @@ const BUDGET_FULL: f64 = 10.0;
 /// How far above `full` a brief may propose.
 const BUDGET_MAX_RAISE: f64 = 2.0;
 
+/// The figure whose ask line a priced reply lands on exactly: `0.8 ×` this
+/// figure is $1.60, a whole number of the input tokens the fixture's
+/// replies are priced from, so a run's spend can reach the line itself and
+/// not only cross it.
+const AT_LINE_FIGURE: f64 = 2.0;
+
 /// The workflow the budget tests run: a brief that routes a trivial issue
 /// straight to a writing step, with the shipped `[budget]` shape. Its
 /// figures are the constants above, so a test cannot drift from it.
@@ -5602,6 +5608,14 @@ struct BudgetFixture {
 /// and a writing step whose reply costs the same: the run crosses the ask
 /// line at the brief's end, and not again.
 fn budget_fixture(proposal: f64) -> BudgetFixture {
+    budget_fixture_spending(budget_figure(), proposal)
+}
+
+/// A brief whose reply costs `spend` and proposes `proposal`, and a
+/// writing step whose reply costs `budget_figure()`: the test that weighs
+/// the guard at the ask line picks the brief's spend, the one figure a run
+/// reaches the line with exactly.
+fn budget_fixture_spending(spend: f64, proposal: f64) -> BudgetFixture {
     let brief = Ulid::generate();
     let write = Ulid::generate();
     let workflow = budget_workflow();
@@ -5609,10 +5623,7 @@ fn budget_fixture(proposal: f64) -> BudgetFixture {
         vec![
             (
                 brief,
-                vec![priced_reply(
-                    brief_report_proposing(proposal),
-                    budget_figure(),
-                )],
+                vec![priced_reply(brief_report_proposing(proposal), spend)],
             ),
             (
                 write,
@@ -5730,7 +5741,7 @@ async fn replay_edited(
     (advanced, runner)
 }
 
-/// T1: a run that has spent the ask line of its figure parks before the
+/// A run that has spent the ask line of its figure parks before the
 /// next step, and the ask names the spend and the figure.
 #[tokio::test]
 async fn a_run_at_eighty_percent_of_its_budget_parks_before_the_next_step() {
@@ -5780,7 +5791,43 @@ async fn a_run_at_eighty_percent_of_its_budget_parks_before_the_next_step() {
     );
 }
 
-/// T2: a second `advance()` while parked starts nothing and stacks no ask.
+/// A run whose spend has reached the ask line exactly parks before the next
+/// step: the guard asks at the line itself, not only past it.
+#[tokio::test]
+async fn a_run_exactly_at_the_ask_line_parks_before_the_next_step() {
+    let fx = budget_fixture_spending(BUDGET_ASK_AT * AT_LINE_FIGURE, AT_LINE_FIGURE).fx;
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: BUDGET_GATE.to_owned()
+        },
+        "the run stops instead of starting the next step"
+    );
+    let events = fx.lead_events();
+    let state = run_state(&events).expect("the log derives a run");
+    assert_eq!(
+        state.budget_usd, AT_LINE_FIGURE,
+        "the brief's proposal is the figure in force"
+    );
+    assert_eq!(
+        state.cost_usd,
+        BUDGET_ASK_AT * state.budget_usd,
+        "the spend the guard weighs sits on the ask line, not past it"
+    );
+    assert_eq!(
+        step_started(&events).len(),
+        1,
+        "and no step starts behind the ask"
+    );
+    assert_eq!(
+        gate(&events).as_deref(),
+        Some(BUDGET_GATE),
+        "the ask is the budget gate"
+    );
+}
+
+/// A second `advance()` while parked starts nothing and stacks no ask.
 #[tokio::test]
 async fn a_parked_budget_gate_starts_nothing_and_does_not_stack_asks() {
     let fx = budget_fixture(budget_figure()).fx;
@@ -5812,7 +5859,7 @@ async fn a_parked_budget_gate_starts_nothing_and_does_not_stack_asks() {
     );
 }
 
-/// T3: an answered `raise` sends the run on under the new figure.
+/// An answered `raise` sends the run on under the new figure.
 #[tokio::test]
 async fn an_answered_raise_continues_the_run_under_the_new_figure() {
     let fx = budget_fixture(budget_figure()).fx;
@@ -5856,7 +5903,7 @@ async fn an_answered_raise_continues_the_run_under_the_new_figure() {
     );
 }
 
-/// T4: a rebuild over the same log neither parks again nor repeats a move.
+/// A rebuild over the same log neither parks again nor repeats a move.
 #[tokio::test]
 async fn a_raised_budget_survives_a_rebuild() {
     let fx = budget_fixture(budget_figure()).fx;
@@ -5880,7 +5927,7 @@ async fn a_raised_budget_survives_a_rebuild() {
     );
 }
 
-/// T5: `stop` at the budget gate ends the run as stopped.
+/// `stop` at the budget gate ends the run as stopped.
 #[tokio::test]
 async fn a_stop_at_the_budget_gate_ends_the_run_as_stopped() {
     let fx = budget_fixture(budget_figure()).fx;
@@ -5907,7 +5954,7 @@ async fn a_stop_at_the_budget_gate_ends_the_run_as_stopped() {
     assert_eq!(checkpoints(&events).len(), 1, "and asks no second time");
 }
 
-/// T6: a run whose figure is zero is not asked, and starts its next step
+/// A run whose figure is zero is not asked, and starts its next step
 /// whatever it has spent.
 #[tokio::test]
 async fn a_run_with_no_budget_still_starts_its_next_step() {
@@ -5945,7 +5992,7 @@ async fn a_run_with_no_budget_still_starts_its_next_step() {
     );
 }
 
-/// T7: a brief that proposes above the ceiling parks at the route, with the
+/// A brief that proposes above the ceiling parks at the route, with the
 /// figure in force left alone.
 #[tokio::test]
 async fn a_brief_that_proposes_above_the_ceiling_parks_at_the_route() {
@@ -5991,7 +6038,7 @@ async fn a_brief_that_proposes_above_the_ceiling_parks_at_the_route() {
     );
 }
 
-/// T8: a proposal at the ceiling exactly is the run's figure, with no ask.
+/// A proposal at the ceiling exactly is the run's figure, with no ask.
 #[tokio::test]
 async fn a_brief_that_proposes_at_the_ceiling_is_taken_without_asking() {
     let proposal = budget_ceiling();
@@ -6021,7 +6068,7 @@ async fn a_brief_that_proposes_at_the_ceiling_is_taken_without_asking() {
     );
 }
 
-/// T9: a raise that does not clear the gate is refused and writes nothing,
+/// A raise that does not clear the gate is refused and writes nothing,
 /// and the run stays parked.
 #[tokio::test]
 async fn a_raise_that_does_not_clear_the_gate_is_refused_without_writing() {
@@ -6096,7 +6143,7 @@ async fn a_raise_that_does_not_clear_the_gate_is_refused_without_writing() {
         .expect("the smallest figure past the ask point clears the line");
 }
 
-/// T10: a rebuild from every prefix of a raised run does each move once and
+/// A rebuild from every prefix of a raised run does each move once and
 /// leaves the same log.
 #[tokio::test]
 async fn a_rebuild_after_every_lead_event_does_each_move_once_at_the_budget_gate() {
@@ -6128,7 +6175,7 @@ async fn a_rebuild_after_every_lead_event_does_each_move_once_at_the_budget_gate
     }
 }
 
-/// T15: a rebuild mid-step with the run over the line parks before it
+/// A rebuild mid-step with the run over the line parks before it
 /// resumes the child.
 #[tokio::test]
 async fn a_rebuild_mid_step_over_the_line_parks_before_resuming_the_child() {
