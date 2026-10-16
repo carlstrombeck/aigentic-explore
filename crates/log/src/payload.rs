@@ -864,6 +864,13 @@ pub struct BudgetWarnedPayload {
     pub limit_usd: f64,
 }
 
+/// Payload of a `budget_raised` event: the figure in USD the run compares
+/// its cost against from here on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BudgetRaisedPayload {
+    pub usd: f64,
+}
+
 /// Payload of a `pushed` event: the commits, the remote ref before and
 /// after, and the installed binary's commit. Appended after the push and
 /// install, which are idempotent.

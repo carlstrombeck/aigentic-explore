@@ -472,6 +472,7 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             | EventKind::CheckpointAsked
             | EventKind::CheckpointAnswered
             | EventKind::BudgetWarned
+            | EventKind::BudgetRaised
             | EventKind::Pushed
             | EventKind::RunFinished
             | EventKind::RunErrored

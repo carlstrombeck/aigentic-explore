@@ -3087,6 +3087,7 @@ impl ClientRepl {
             | EventKind::CheckpointAsked
             | EventKind::CheckpointAnswered
             | EventKind::BudgetWarned
+            | EventKind::BudgetRaised
             | EventKind::Pushed
             | EventKind::RunFinished
             | EventKind::RunErrored

@@ -117,6 +117,12 @@ pub enum EventKind {
     /// the limit, so a restart re-warns only at levels not yet reached.
     /// Not a decision: replay sees the move of the event before it.
     BudgetWarned,
+    /// The run's budget was raised at the budget gate (layer 2). Author
+    /// `agent:runner`; the payload carries the new figure in USD, which
+    /// is the one the run compares its cost against from here on. Written
+    /// when a person answers the gate with a raise, so a replay continues
+    /// past the park instead of asking again.
+    BudgetRaised,
     /// The runner pushed the run's commits and installed the binary
     /// (layer 2, issue #53). Author `agent:runner`; the payload carries
     /// the commits, the remote ref before and after and the installed

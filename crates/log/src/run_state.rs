@@ -284,6 +284,7 @@ fn runner_kind(kind: EventKind) -> Option<RunnerKind> {
         EventKind::Pushed => Some(RunnerKind::Pushed),
         EventKind::RunFinished => Some(RunnerKind::RunFinished),
         EventKind::RunErrored => Some(RunnerKind::RunErrored),
+        EventKind::BudgetRaised => None,
         EventKind::UserMessage
         | EventKind::AssistantMessage
         | EventKind::ToolResult

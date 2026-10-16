@@ -19,9 +19,9 @@ pub use decision_log::{
     DecisionFold, DecisionRecord, RecordedAnswer, decision_records, declined_at_startup,
 };
 pub use payload::{
-    AssistantMessagePayload, BudgetScope, BudgetWarnedPayload, CheckOutcome, CheckResult,
-    CheckpointAnswer, CheckpointAnsweredPayload, CheckpointAskedPayload, ChecksRunPayload,
-    CommitRef, CompactedPayload, CompactionStrategy, ContextEvictedPayload,
+    AssistantMessagePayload, BudgetRaisedPayload, BudgetScope, BudgetWarnedPayload, CheckOutcome,
+    CheckResult, CheckpointAnswer, CheckpointAnsweredPayload, CheckpointAskedPayload,
+    ChecksRunPayload, CommitRef, CompactedPayload, CompactionStrategy, ContextEvictedPayload,
     ContextSaturatedPayload, DecisionAnswer, DecisionAnsweredPayload, DecisionKind,
     DecisionProposedPayload, DecisionScope, DecisionStage, Finding, FindingMark, FixSize, Handoff,
     InterruptedPayload, Invoker, LedgerEntry, LedgerStatus, MemoryExtractedPayload, MemoryHome,
