@@ -23,7 +23,7 @@ use crate::harness_tools::{
 };
 use crate::runtime::{ASKED_HUMAN, INTERRUPTED, LENGTH_STOP, MAX_TOKENS_STOP, STEP_REPORTED};
 use crate::seams::{Verdict, author_name, denial_text};
-use crate::support::{Spent, append_queued, block_start, flush_text};
+use crate::support::{Spent, append_queued, block_start, flush_text, recoverable_fault};
 use crate::{Runtime, RuntimeError, Signal, TurnOutcome, build_context};
 
 impl Runtime {
@@ -465,15 +465,13 @@ impl Runtime {
                 // failure is one a fresh call can get past — a stream cut off
                 // with no end marker (`Cut`), or a transient error such as a
                 // dropped mid-stream connection. `Protocol`, `Unsupported` and
-                // a refusal are not transient (`ProviderError::is_transient`),
-                // so a malformed stream still ends the turn as before; the
+                // a refusal are not (`ProviderError::is_transient`), so a
+                // malformed stream still ends the turn as before; the
                 // boundary is deliberately narrower than "any error after
                 // content". #90's adapter retries are untouched: this is the
                 // one retry the runtime itself makes, and the new call gets
                 // its own adapter window.
-                let retryable = error
-                    .as_ref()
-                    .is_some_and(|e| matches!(e, ProviderError::Cut) || e.is_transient());
+                let retryable = error.as_ref().is_some_and(recoverable_fault);
                 if content && retryable && !retried_once {
                     // Not if the person has asked to stop (issue #114): a
                     // retry nobody is listening for is a call not wanted.

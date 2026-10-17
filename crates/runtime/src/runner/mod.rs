@@ -36,6 +36,7 @@ use ulid::Ulid;
 
 use crate::checks::git::{read_commits_between, read_uncommitted};
 use crate::checks::{CheckInput, run_checks};
+use crate::support::recoverable_fault;
 use crate::workflow::{LoadedWorkflow, Step, WorkflowError};
 use crate::{LENGTH_STOP, MAX_USD, Runtime, RuntimeError, STEP_REPORTED, Signal};
 
@@ -1759,10 +1760,24 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             other => {
                 let finished = finish(StepStatus::Failed, other.to_owned(), None);
                 self.append(EventKind::StepFinished, &finished)?;
-                self.escalate(
-                    "step_stop",
-                    vec![step.id.clone(), attempt.to_string(), other.to_owned()],
-                )?;
+                let shown = vec![step.id.clone(), attempt.to_string(), other.to_owned()];
+                // A fault a fresh call could get past is one a fresh
+                // attempt could too, so the person is offered it. A tail
+                // whose `turn_ended` carries no error (a log written
+                // before that field) keeps `stop` alone: the offer is
+                // never guessed.
+                match end.error.as_ref() {
+                    Some(fault) if recoverable_fault(fault) => {
+                        self.escalate_with(
+                            "step_stop",
+                            shown,
+                            vec!["retry".to_owned(), "stop".to_owned()],
+                        )?;
+                    }
+                    _ => {
+                        self.escalate("step_stop", shown)?;
+                    }
+                }
                 Ok(())
             }
         }

@@ -6721,3 +6721,226 @@ async fn t12_a_resumed_attempts_continuation_runs_under_what_the_attempt_has_lef
         "the attempt's total is now the step's closed spend"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A step whose turn died on a provider fault
+// ---------------------------------------------------------------------------
+
+/// Drive a fixture whose implementer's one reply is `reply` until the live
+/// pass surfaces the provider's error, then hand back the fixture and a
+/// runner rebuilt over the logs that fault left.
+async fn a_dead_turn_restarted(
+    brief_child: Ulid,
+    implementer_child: Ulid,
+    reply: Vec<ProviderEvent>,
+) -> (Fixture, RunnerError, TestRunner) {
+    let fx = Fixture::new(vec![
+        (brief_child, vec![report("r1", brief_report())]),
+        (implementer_child, vec![reply]),
+    ]);
+    let mut live = fx.runner();
+    let error = loop {
+        match live.advance().await {
+            Ok(Advanced::Moved) => {}
+            Ok(other) => panic!("the live pass ended without the provider's error: {other:?}"),
+            Err(error) => break error,
+        }
+    };
+    drop(live);
+    let rebuilt = fx.runner();
+    (fx, error, rebuilt)
+}
+
+/// The child's last `turn_ended`, as the log wrote it: what the parked
+/// step ended on.
+fn child_turn_end(fx: &Fixture, child: Ulid) -> aigentic_log::TurnEndedPayload {
+    let events = fx.child_events_of(child);
+    let ended = events
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::TurnEnded)
+        .expect("the child's turn ended");
+    serde_json::from_value(ended.payload.clone()).unwrap()
+}
+
+/// A 5xx that killed a step's turn is re-applied by a resumed pass as the
+/// step's end, and the park that opens offers the fresh attempt beside the
+/// stop, so a run a transient fault stopped can go on with one answer.
+#[tokio::test]
+async fn a_resumed_run_offers_a_retry_for_a_recoverable_fault() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let (fx, error, mut rebuilt) = a_dead_turn_restarted(
+        brief_child,
+        implementer_child,
+        vec![ProviderEvent::Error(ProviderError::Http {
+            status: 503,
+            body: "unavailable".into(),
+        })],
+    )
+    .await;
+    assert!(
+        matches!(
+            error,
+            RunnerError::Turn(RuntimeError::Provider(ProviderError::Http {
+                status: 503,
+                ..
+            }))
+        ),
+        "the live pass still surfaces the fault: {error:?}"
+    );
+    assert_eq!(
+        drive_with(&fx, &mut rebuilt, || {}).await,
+        Advanced::WaitingHuman {
+            gate: "step_stop".to_owned()
+        },
+        "the resumed pass ends the step on the fault"
+    );
+
+    let events = fx.lead_events();
+    let asked = checkpoints(&events).pop().expect("the park was asked");
+    assert_eq!(asked.gate, "step_stop");
+    assert_eq!(
+        asked.options,
+        vec!["retry", "stop"],
+        "both answers, in order"
+    );
+
+    let ended = child_turn_end(&fx, implementer_child);
+    let starts = step_started(&events);
+    let attempt = starts.last().expect("the attempt started");
+    assert_eq!(asked.shown[0], attempt.step, "the gate names the step");
+    assert_eq!(
+        asked.shown[1],
+        attempt.attempt.to_string(),
+        "and the attempt"
+    );
+    assert_eq!(asked.shown[2], ended.reason, "and what its turn ended on");
+
+    let finishes = step_finished(&events);
+    let last = finishes.last().expect("the step finished");
+    assert_eq!(last.status, StepStatus::Failed);
+    assert_eq!(
+        last.end_reason, ended.reason,
+        "the step's end carries the reason the child's turn ended on"
+    );
+    assert_eq!(
+        last.cost_usd, 0.0,
+        "the fixture prices nothing, so the fault's attempt cost nothing"
+    );
+}
+
+/// A 4xx is not a fault a fresh call gets past, so that step parks as it
+/// did before: `stop` alone. The word is written into the log here because
+/// the daemon refuses an unoffered answer before writing it, which leaves
+/// this the path a client answering the runtime directly takes.
+#[tokio::test]
+async fn a_fault_a_fresh_call_cannot_get_past_parks_with_stop_alone() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let (fx, _, mut rebuilt) = a_dead_turn_restarted(
+        brief_child,
+        implementer_child,
+        vec![ProviderEvent::Error(ProviderError::Http {
+            status: 404,
+            body: "not found".into(),
+        })],
+    )
+    .await;
+    assert_eq!(
+        drive_with(&fx, &mut rebuilt, || {}).await,
+        Advanced::WaitingHuman {
+            gate: "step_stop".to_owned()
+        },
+        "the resumed pass ends the step on the fault"
+    );
+
+    let events = fx.lead_events();
+    let asked = checkpoints(&events).pop().expect("the park was asked");
+    assert_eq!(
+        asked.options,
+        vec!["stop"],
+        "a 4xx is not a fresh call's to fix"
+    );
+    let starts = step_started(&events).len();
+    let finishes = step_finished(&events).len();
+
+    rebuilt
+        .answer("step_stop", CheckpointAnswer::Retry, None, steve())
+        .expect("the runner writes the answer it was not offered");
+    let error = rebuilt
+        .advance()
+        .await
+        .expect_err("the move refuses the word the ask never offered");
+    assert!(
+        matches!(error, RunnerError::SliceTwo { ref gate } if gate == "step_stop"),
+        "the refusal names the gate: {error:?}"
+    );
+
+    let after = fx.lead_events();
+    assert_eq!(
+        step_started(&after).len(),
+        starts,
+        "nothing started, so the refused word moved no attempt"
+    );
+    assert_eq!(step_finished(&after).len(), finishes, "and nothing ended");
+    assert_eq!(
+        after
+            .iter()
+            .filter(|event| event.kind == EventKind::CheckpointAnswered)
+            .count(),
+        1,
+        "the ask counts as answered, so one answer stands"
+    );
+    assert!(
+        matches!(
+            rebuilt.answer("step_stop", CheckpointAnswer::Retry, None, steve()),
+            Err(RunnerError::NotWaiting { .. })
+        ),
+        "and the park takes no second answer"
+    );
+}
+
+/// The new offer stays where the fault is: a step cut off twice still parks
+/// with `stop` alone, and the retry word moves nothing there either.
+#[tokio::test]
+async fn a_cap_park_still_offers_stop_alone() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let fx = Fixture::new(vec![
+        (brief_child, vec![report("r1", brief_report())]),
+        (implementer_child, vec![works("w1"), works("w2")]),
+    ])
+    .capped(implementer_child, 1);
+
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "step_stop".to_owned()
+        },
+        "twice cut off is the human's problem"
+    );
+
+    let events = fx.lead_events();
+    let asked = checkpoints(&events).pop().expect("the park was asked");
+    assert_eq!(asked.options, vec!["stop"], "a cap is not a provider fault");
+    let starts = step_started(&events).len();
+
+    runner
+        .answer("step_stop", CheckpointAnswer::Retry, None, steve())
+        .expect("the runner writes the answer it was not offered");
+    let error = runner
+        .advance()
+        .await
+        .expect_err("the move refuses the word the ask never offered");
+    assert!(
+        matches!(error, RunnerError::SliceTwo { ref gate } if gate == "step_stop"),
+        "the refusal names the gate: {error:?}"
+    );
+    assert_eq!(
+        step_started(&fx.lead_events()).len(),
+        starts,
+        "the refused word moved no attempt"
+    );
+}

@@ -10,6 +10,16 @@ use aigentic_log::{NewEvent, TurnEndedPayload, Usage, UserMessagePayload};
 use crate::decisions::Queued;
 use crate::{MAX_USD, Runtime, RuntimeError, Signal, TurnOutcome};
 
+/// Whether a **fresh call** to the provider could get past `error`: the
+/// classes the adapters retry themselves (a dropped connection, a rate
+/// limit, an overloaded backend) plus `Cut`, whose reply is untrustworthy
+/// but whose cause — a stream closed with no completion marker — need not
+/// happen again. A refusal, a malformed reply or an unsupported call would
+/// fail the same way, so none of them is one.
+pub(crate) fn recoverable_fault(error: &ProviderError) -> bool {
+    matches!(error, ProviderError::Cut) || error.is_transient()
+}
+
 /// A gap between wall time and running time at or above this is reported
 /// as sleep (issue #47): clock jitter and NTP steps stay silent.
 pub(crate) const SLEPT_THRESHOLD_SECS: u64 = 30;
