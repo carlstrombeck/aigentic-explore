@@ -535,7 +535,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         }
         // The prompt is decided before any child exists, so a slot the
         // brief never reported stops the run here, not mid-step.
-        match self.attempt_message(&step, attempt, None) {
+        match self.attempt_message(&step, attempt, None, child.is_none()) {
             Ok(_) => {}
             Err(err @ RunnerError::Workflow(_)) => {
                 return self.escalate(
@@ -662,7 +662,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             if !self.child_started(child)? {
                 self.host.create_child(child, &step.id)?;
             }
-            let message = self.attempt_message(&step, attempt, base.as_deref())?;
+            let message = self.attempt_message(&step, attempt, base.as_deref(), posted == 0)?;
             let mut runtime = self
                 .host
                 .build_child(child, &step.profile, &step.id, &step.deny)
@@ -932,7 +932,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
     /// `go`, `amend` or `stop`. Writing the ask is the whole move, so a
     /// crash before it repeats it and a crash after it waits.
     fn open_checkpoint(&mut self, step: &Step) -> Result<Advanced, RunnerError> {
-        let shown = match self.attempt_message(step, 1, None) {
+        let shown = match self.attempt_message(step, 1, None, true) {
             Ok(text) => text,
             Err(err @ RunnerError::Workflow(_)) => {
                 return self.escalate(
@@ -1516,9 +1516,69 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         if answer == CheckpointAnswer::Retry && gate == "checks_failed" {
             return self.retry_attempt().await;
         }
+        if answer == CheckpointAnswer::Retry
+            && gate == "step_stop"
+            && self.offered("step_stop", "retry")?
+        {
+            return self.retry_failed_step().await;
+        }
         Err(RunnerError::SliceTwo {
             gate: gate.to_owned(),
         })
+    }
+
+    /// Whether the last ask at `gate` offered `option`. Options are what a
+    /// client may answer with, so a word the standing ask never offered is
+    /// not an answer to this park. A gate with no ask on record, or an ask
+    /// whose line cannot be read, offers nothing: the move is refused
+    /// rather than guessed at.
+    fn offered(&self, gate: &str, option: &str) -> Result<bool, RunnerError> {
+        let asked = self
+            .lead
+            .events()
+            .iter()
+            .rev()
+            .filter(|event| event.kind == EventKind::CheckpointAsked)
+            .filter_map(|event| {
+                serde_json::from_value::<CheckpointAskedPayload>(event.payload.clone()).ok()
+            })
+            .find(|payload| payload.gate == gate);
+        Ok(asked.is_some_and(|payload| payload.options.iter().any(|held| held == option)))
+    }
+
+    /// Start one fresh attempt of the step whose last attempt died on a
+    /// recoverable provider fault. The fault said nothing about the step, so
+    /// the new attempt runs in a child the step has never used and is
+    /// prompted with the whole task instead of an instruction. Both the
+    /// step and its attempt come from the log, so a rebuild between the
+    /// answer and this move repeats it exactly.
+    async fn retry_failed_step(&mut self) -> Result<Advanced, RunnerError> {
+        let step = self
+            .lead
+            .events()
+            .iter()
+            .rev()
+            .filter(|event| event.kind == EventKind::StepFinished)
+            .filter_map(|event| {
+                serde_json::from_value::<StepFinishedPayload>(event.payload.clone()).ok()
+            })
+            .next()
+            .filter(|payload| payload.status == StepStatus::Failed)
+            .ok_or_else(|| RunnerError::Host("step_stop with no failed step to retry".into()))?
+            .step;
+        let attempt = self
+            .lead
+            .events()
+            .iter()
+            .rev()
+            .filter(|event| event.kind == EventKind::StepStarted)
+            .filter_map(|event| {
+                serde_json::from_value::<StepStartedPayload>(event.payload.clone()).ok()
+            })
+            .find(|payload| payload.step == step)
+            .ok_or_else(|| RunnerError::Host(format!("step_stop with no step_started for {step}")))?
+            .attempt;
+        self.start_step(&step, attempt + 1, None).await
     }
 
     /// Grant one more attempt to the step whose checks last failed: the
@@ -1655,11 +1715,16 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
     /// `head_at_start` is the base the send-back may fold onto, handed in
     /// by the caller so the prompt and the armed overlay carry one value:
     /// the send-back offers the route only when it is `Some`.
+    ///
+    /// `fresh` says the child this attempt speaks into holds no prompt yet,
+    /// so it has no work to be told to continue. An instruction only fits a
+    /// child that holds the task already.
     fn attempt_message(
         &self,
         step: &Step,
         attempt: u32,
         head_at_start: Option<&str>,
+        fresh: bool,
     ) -> Result<String, RunnerError> {
         // A send-back reads as a first attempt with the failures handed to
         // it: the same template, plus the failing checks, so the step is
@@ -1677,7 +1742,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             }
             return Ok(self.workflow.render(&step.id, &slots)?);
         }
-        if attempt <= 1 {
+        if fresh || attempt <= 1 {
             let slots = self.slot_map(step)?;
             return Ok(self.workflow.render(&step.id, &slots)?);
         }

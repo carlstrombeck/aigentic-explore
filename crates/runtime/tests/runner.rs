@@ -6726,18 +6726,16 @@ async fn t12_a_resumed_attempts_continuation_runs_under_what_the_attempt_has_lef
 // A step whose turn died on a provider fault
 // ---------------------------------------------------------------------------
 
+/// The one scripted reply a child gets when the provider fails it: no
+/// usage line, because the call never finished.
+fn a_fault(error: ProviderError) -> Vec<ProviderEvent> {
+    vec![ProviderEvent::Error(error)]
+}
+
 /// Drive a fixture whose implementer's one reply is `reply` until the live
 /// pass surfaces the provider's error, then hand back the fixture and a
 /// runner rebuilt over the logs that fault left.
-async fn a_dead_turn_restarted(
-    brief_child: Ulid,
-    implementer_child: Ulid,
-    reply: Vec<ProviderEvent>,
-) -> (Fixture, RunnerError, TestRunner) {
-    let fx = Fixture::new(vec![
-        (brief_child, vec![report("r1", brief_report())]),
-        (implementer_child, vec![reply]),
-    ]);
+async fn a_dead_turn_restarted(fx: Fixture) -> (Fixture, RunnerError, TestRunner) {
     let mut live = fx.runner();
     let error = loop {
         match live.advance().await {
@@ -6770,15 +6768,17 @@ fn child_turn_end(fx: &Fixture, child: Ulid) -> aigentic_log::TurnEndedPayload {
 async fn a_resumed_run_offers_a_retry_for_a_recoverable_fault() {
     let brief_child = Ulid::generate();
     let implementer_child = Ulid::generate();
-    let (fx, error, mut rebuilt) = a_dead_turn_restarted(
-        brief_child,
-        implementer_child,
-        vec![ProviderEvent::Error(ProviderError::Http {
-            status: 503,
-            body: "unavailable".into(),
-        })],
-    )
-    .await;
+    let fx = Fixture::new(vec![
+        (brief_child, vec![report("r1", brief_report())]),
+        (
+            implementer_child,
+            vec![a_fault(ProviderError::Http {
+                status: 503,
+                body: "unavailable".into(),
+            })],
+        ),
+    ]);
+    let (fx, error, mut rebuilt) = a_dead_turn_restarted(fx).await;
     assert!(
         matches!(
             error,
@@ -6838,15 +6838,17 @@ async fn a_resumed_run_offers_a_retry_for_a_recoverable_fault() {
 async fn a_fault_a_fresh_call_cannot_get_past_parks_with_stop_alone() {
     let brief_child = Ulid::generate();
     let implementer_child = Ulid::generate();
-    let (fx, _, mut rebuilt) = a_dead_turn_restarted(
-        brief_child,
-        implementer_child,
-        vec![ProviderEvent::Error(ProviderError::Http {
-            status: 404,
-            body: "not found".into(),
-        })],
-    )
-    .await;
+    let fx = Fixture::new(vec![
+        (brief_child, vec![report("r1", brief_report())]),
+        (
+            implementer_child,
+            vec![a_fault(ProviderError::Http {
+                status: 404,
+                body: "not found".into(),
+            })],
+        ),
+    ]);
+    let (fx, _, mut rebuilt) = a_dead_turn_restarted(fx).await;
     assert_eq!(
         drive_with(&fx, &mut rebuilt, || {}).await,
         Advanced::WaitingHuman {
@@ -6942,5 +6944,191 @@ async fn a_cap_park_still_offers_stop_alone() {
         step_started(&fx.lead_events()).len(),
         starts,
         "the refused word moved no attempt"
+    );
+}
+
+/// The park's `retry` starts exactly one new attempt of the step, in a
+/// child the step has never used, and that child is prompted with the whole
+/// task: a fresh attempt has no work to be told to continue. The attempt
+/// then ends on its own report, not on the fault.
+#[tokio::test]
+async fn the_retry_answer_starts_a_fresh_attempt_with_a_first_attempts_prompt() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let retry_child = Ulid::generate();
+    let prices = Prices {
+        input: 3.0,
+        cache_read: 0.5,
+        cache_write: 4.0,
+        output: 15.0,
+    };
+    let fx = Fixture::new(vec![
+        (brief_child, vec![report("r1", brief_report())]),
+        (
+            implementer_child,
+            vec![a_fault(ProviderError::Http {
+                status: 503,
+                body: "unavailable".into(),
+            })],
+        ),
+        (retry_child, vec![report("r2", implementer_report())]),
+    ])
+    .priced(prices);
+    let (fx, _, mut rebuilt) = a_dead_turn_restarted(fx).await;
+    assert_eq!(
+        drive_with(&fx, &mut rebuilt, || {}).await,
+        Advanced::WaitingHuman {
+            gate: "step_stop".to_owned()
+        },
+        "the resumed pass parks at the fault"
+    );
+
+    rebuilt
+        .answer("step_stop", CheckpointAnswer::Retry, None, steve())
+        .expect("the park takes the retry");
+    // The answer's move is `step_started`; the next moves post the fresh
+    // attempt's prompt and run its turn, which ends on its report.
+    let mut moves = 0;
+    while step_finished(&fx.lead_events())
+        .iter()
+        .filter(|finished| finished.step == "implement-alone")
+        .count()
+        < 2
+    {
+        rebuilt.advance().await.expect("the fresh attempt runs");
+        moves += 1;
+        assert!(moves < 8, "the fresh attempt ends instead of looping");
+    }
+
+    let events = fx.lead_events();
+    let attempts: Vec<_> = step_started(&events)
+        .into_iter()
+        .filter(|started| started.step == "implement-alone")
+        .collect();
+    assert_eq!(attempts.len(), 2, "one new attempt, not two");
+    assert_eq!(attempts[0].attempt, 1);
+    assert_eq!(
+        attempts[1].attempt, 2,
+        "the attempt after the one that died"
+    );
+    assert_ne!(
+        attempts[0].child_thread, attempts[1].child_thread,
+        "the fresh attempt runs in a child the step has never used"
+    );
+
+    // The child that reported is the one the new attempt started, derived
+    // from the logs rather than named here: the dead attempt reported
+    // nothing, the brief's child is not this step's.
+    let reporters: Vec<Ulid> = fx
+        .child_events()
+        .into_iter()
+        .filter(|(_, events)| events.iter().any(|e| e.kind == EventKind::StepReported))
+        .map(|(id, _)| id)
+        .filter(|id| *id != brief_child)
+        .collect();
+    assert_eq!(
+        reporters,
+        vec![attempts[1].child_thread],
+        "the report of the new attempt lands in that child"
+    );
+
+    let template = prompts(&fx.child_events_of(attempts[0].child_thread));
+    assert_eq!(template.len(), 1, "the dead attempt was prompted once");
+    assert_eq!(
+        template[0],
+        prompts(&fx.child_events_of(attempts[1].child_thread))[0],
+        "the fresh attempt gets the whole task, not an instruction"
+    );
+    assert_eq!(
+        prompts(&fx.child_events_of(attempts[0].child_thread)).len(),
+        1,
+        "the retry leaves the dead child alone"
+    );
+
+    let finished = step_finished(&events);
+    let last = finished.last().expect("the retry's attempt finished");
+    assert_eq!(last.step, "implement-alone");
+    assert_eq!(last.status, StepStatus::Done, "the report's status decides");
+    assert_eq!(
+        last.end_reason,
+        aigentic_runtime::STEP_REPORTED,
+        "the attempt ends on its report"
+    );
+    assert_ne!(
+        last.end_reason,
+        child_turn_end(&fx, implementer_child).reason,
+        "not on the fault that killed the first attempt"
+    );
+
+    // Both steps' calls are priced by the fixture's table, and the fault's
+    // attempt logged no usage, so the run carries the two reports' calls.
+    let per_call = prices.cost_usd(&aigentic_log::Usage::reported(aigentic_core::Usage {
+        input_tokens: 10,
+        output_tokens: 5,
+        ..Default::default()
+    }));
+    assert!(per_call > 0.0, "the fixture prices a real cost");
+    assert_eq!(
+        rebuilt.state().expect("the run state reads").cost_usd,
+        per_call * 2.0,
+        "the brief's call and the fresh attempt's"
+    );
+    assert_eq!(
+        last.cost_usd, per_call,
+        "the step's cost is the fresh attempt's own call"
+    );
+}
+
+/// A cut stream is the fault a fresh call may get past even though
+/// `is_transient` says no, and it is what actually stopped the run this
+/// ticket came from: its park offers the retry, and one answer starts the
+/// fresh attempt.
+#[tokio::test]
+async fn a_cut_stream_is_offered_a_retry_too() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let retry_child = Ulid::generate();
+    let fx = Fixture::new(vec![
+        (brief_child, vec![report("r1", brief_report())]),
+        (implementer_child, vec![a_fault(ProviderError::Cut)]),
+        (retry_child, vec![report("r2", implementer_report())]),
+    ]);
+    let (fx, error, mut rebuilt) = a_dead_turn_restarted(fx).await;
+    assert!(
+        matches!(
+            error,
+            RunnerError::Turn(RuntimeError::Provider(ProviderError::Cut))
+        ),
+        "a cut stream still surfaces from the live pass: {error:?}"
+    );
+    assert_eq!(
+        drive_with(&fx, &mut rebuilt, || {}).await,
+        Advanced::WaitingHuman {
+            gate: "step_stop".to_owned()
+        },
+        "the resumed pass parks at the fault"
+    );
+
+    let events = fx.lead_events();
+    let asked = checkpoints(&events).pop().expect("the park was asked");
+    assert_eq!(asked.options, vec!["retry", "stop"], "both answers");
+
+    rebuilt
+        .answer("step_stop", CheckpointAnswer::Retry, None, steve())
+        .expect("the park takes the retry");
+    assert_eq!(
+        rebuilt.advance().await.expect("the retry's move runs"),
+        Advanced::Moved,
+        "the move writes the new attempt's start and ends there"
+    );
+    let attempts: Vec<_> = step_started(&fx.lead_events())
+        .into_iter()
+        .filter(|started| started.step == "implement-alone")
+        .collect();
+    assert_eq!(attempts.len(), 2, "one new attempt");
+    assert_eq!(attempts[1].attempt, 2);
+    assert_ne!(
+        attempts[0].child_thread, attempts[1].child_thread,
+        "the fresh attempt runs in a child the step has never used"
     );
 }
