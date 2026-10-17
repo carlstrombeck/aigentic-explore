@@ -654,7 +654,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         // child's sanction must never disagree.
         let base = self.restack_base(&step)?;
         let posted = prompt_count(self.host.child_log(child)?.events());
-        if posted < attempt {
+        if self.prompt_due(&step, attempt, child)? {
             // The prompt is not in the child's log yet, whether the step
             // just started or a crash came first: post it once. A crash
             // before the child was created leaves it to create here, with
@@ -702,6 +702,31 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         }
         self.apply_end(&step, attempt)?;
         Ok(Advanced::Moved)
+    }
+
+    /// Whether the child still owes this attempt a prompt. The prompts
+    /// already in the child are counted against the `step_started` events
+    /// naming that child with an attempt no later than this one: every
+    /// attempt's own start names the child it runs in, so a fresh attempt
+    /// whose child was prompted and whose turn never ended is resumed
+    /// rather than prompted a second time.
+    fn prompt_due(&self, step: &Step, attempt: u32, child: Ulid) -> Result<bool, RunnerError> {
+        let owed = self
+            .lead
+            .events()
+            .iter()
+            .filter(|event| event.kind == EventKind::StepStarted)
+            .filter_map(|event| {
+                serde_json::from_value::<StepStartedPayload>(event.payload.clone()).ok()
+            })
+            .filter(|payload| {
+                payload.step == step.id
+                    && payload.child_thread == child
+                    && payload.attempt <= attempt
+            })
+            .count() as u32;
+        let posted = prompt_count(self.host.child_log(child)?.events());
+        Ok(posted < owed)
     }
 
     /// Whether this attempt's report is already in the child's log: a

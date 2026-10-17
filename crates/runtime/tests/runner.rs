@@ -6726,6 +6726,14 @@ async fn t12_a_resumed_attempts_continuation_runs_under_what_the_attempt_has_lef
 // A step whose turn died on a provider fault
 // ---------------------------------------------------------------------------
 
+/// How many `step_finished` records the lead holds for `step`.
+fn attempts_finished(fx: &Fixture, step: &str) -> usize {
+    step_finished(&fx.lead_events())
+        .iter()
+        .filter(|finished| finished.step == step)
+        .count()
+}
+
 /// The one scripted reply a child gets when the provider fails it: no
 /// usage line, because the call never finished.
 fn a_fault(error: ProviderError) -> Vec<ProviderEvent> {
@@ -7130,5 +7138,100 @@ async fn a_cut_stream_is_offered_a_retry_too() {
     assert_ne!(
         attempts[0].child_thread, attempts[1].child_thread,
         "the fresh attempt runs in a child the step has never used"
+    );
+}
+
+/// The fresh attempt's prompt is what makes a rebuild safe: a crash between
+/// the prompt and the turn's end must resume that attempt, not write the
+/// template into a child that already holds it.
+#[tokio::test]
+async fn a_fresh_attempt_is_prompted_once_across_a_rebuild() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let retry_child = Ulid::generate();
+    let fx = Fixture::new(vec![
+        (brief_child, vec![report("r1", brief_report())]),
+        (
+            implementer_child,
+            vec![a_fault(ProviderError::Http {
+                status: 503,
+                body: "unavailable".into(),
+            })],
+        ),
+        (retry_child, vec![report("r2", implementer_report())]),
+    ]);
+    let (fx, _, mut rebuilt) = a_dead_turn_restarted(fx).await;
+    assert_eq!(
+        drive_with(&fx, &mut rebuilt, || {}).await,
+        Advanced::WaitingHuman {
+            gate: "step_stop".to_owned()
+        },
+        "the resumed pass parks at the fault"
+    );
+    rebuilt
+        .answer("step_stop", CheckpointAnswer::Retry, None, steve())
+        .expect("the park takes the retry");
+    assert_eq!(
+        rebuilt.advance().await.expect("the retry's move runs"),
+        Advanced::Moved,
+        "the new attempt's start is written"
+    );
+    // The crash this test rebuilds from: the lead at the fresh attempt's
+    // `step_started`, its child prompted, its turn never ended.
+    let short = snapshot(&fx);
+
+    let mut moves = 0;
+    while attempts_finished(&fx, "implement-alone") < 2 {
+        rebuilt.advance().await.expect("the fresh attempt runs");
+        moves += 1;
+        assert!(moves < 8, "the fresh attempt ends instead of looping");
+    }
+    let later = snapshot(&fx);
+    let new_child = step_started(&later.lead)
+        .into_iter()
+        .filter(|started| started.step == "implement-alone")
+        .nth(1)
+        .expect("the fresh attempt is started")
+        .child_thread;
+    let before = prompts(&later.children[&new_child]);
+    assert_eq!(before.len(), 1, "the whole run prompted it once");
+
+    fx.restore_child_prefix_from(&short, &later, new_child, |events| {
+        !events
+            .iter()
+            .any(|event| event.kind == EventKind::AssistantMessage)
+    });
+    let crashed = fx.child_events_of(new_child);
+    assert_eq!(
+        prompts(&crashed),
+        before,
+        "the crash left the prompt posted"
+    );
+    assert_eq!(turn_ends(&crashed), 0, "and its turn never ended");
+    assert_eq!(
+        attempts_finished(&fx, "implement-alone"),
+        1,
+        "the lead is back at the attempt's start"
+    );
+
+    let mut runner = fx.runner();
+    let mut moves = 0;
+    while attempts_finished(&fx, "implement-alone") < 2 {
+        runner
+            .advance()
+            .await
+            .expect("the rebuilt runner advances the attempt");
+        moves += 1;
+        assert!(moves < 8, "the rebuilt attempt ends instead of looping");
+    }
+    assert_eq!(
+        prompts(&fx.child_events_of(new_child)),
+        before,
+        "the rebuild resumes the attempt instead of re-prompting it"
+    );
+    assert_eq!(
+        attempts_finished(&fx, "implement-alone"),
+        2,
+        "one step_finished for the fresh attempt, not two"
     );
 }
