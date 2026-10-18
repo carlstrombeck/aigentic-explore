@@ -11,8 +11,8 @@ use aigentic_core::{
     ToolError, ToolOutput, UserId,
 };
 use aigentic_log::{
-    CommitRef, Handoff, PermissionRequestedPayload, PolicyRecord, ReportStatus, StepReport,
-    ThreadLog, ToolResultPayload,
+    CommitRef, DecideItemKind, DecideProposal, Handoff, PermissionRequestedPayload, PolicyRecord,
+    ReportStatus, StepReport, ThreadLog, ToolResultPayload,
 };
 use aigentic_policy::{Decision, Policy, Rule};
 use aigentic_runtime::harness_tools::BODY_REQUIRED;
@@ -430,6 +430,91 @@ async fn a_report_without_a_body_is_refused_while_the_turn_can_fix_it() {
     assert_eq!(count(&r, EventKind::StepReported), 1);
     assert_eq!(report(&r, 0).body.as_deref(), Some("the review"));
     assert_eq!(end_reason(&r), STEP_REPORTED);
+}
+
+/// A decider's proposal and its items survive the round trip into the
+/// report, and a call that omits `decide` still lands.
+#[tokio::test]
+async fn a_deciders_proposal_and_items_round_trip() {
+    let mut r = rig(
+        vec![vec![
+            finish(
+                "c1",
+                json!({
+                    "status": "done",
+                    "body": "read the check",
+                    "decide": {
+                        "proposal": "amend",
+                        "items": [
+                            {"item": 3, "kind": "fact", "text": "the spec is right: 1 file"},
+                            {"kind": "choice", "text": "which gate opens first"},
+                        ],
+                    },
+                }),
+            ),
+            done("tool_use"),
+        ]],
+        Some(&["git push"]),
+    );
+    r.runtime
+        .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(count(&r, EventKind::StepReported), 1);
+    let decided = report(&r, 0)
+        .decide
+        .expect("the proposal reached the report");
+    assert_eq!(decided.proposal, DecideProposal::Amend);
+    assert_eq!(decided.items.len(), 2);
+    assert_eq!(decided.items[0].item, Some(3));
+    assert_eq!(decided.items[0].kind, DecideItemKind::Fact);
+    assert_eq!(decided.items[1].item, None);
+    assert_eq!(decided.items[1].kind, DecideItemKind::Choice);
+    assert_eq!(end_reason(&r), STEP_REPORTED);
+
+    let mut plain = rig(
+        vec![vec![
+            finish("c1", json!({"status": "done", "body": "no proposal"})),
+            done("tool_use"),
+        ]],
+        Some(&["git push"]),
+    );
+    plain
+        .runtime
+        .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(report(&plain, 0).decide, None);
+
+    // A proposal outside the two the loop knows is refused with the
+    // deserialiser's own words, and no report is written.
+    let mut maybe = rig(
+        vec![
+            vec![
+                finish(
+                    "c1",
+                    json!({"status": "done", "body": "maybe", "decide": {"proposal": "maybe"}}),
+                ),
+                done("tool_use"),
+            ],
+            vec![text("ok"), done("stop")],
+        ],
+        Some(&["git push"]),
+    );
+    maybe
+        .runtime
+        .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(count(&maybe, EventKind::StepReported), 0);
+    let too_late = json!({"status": "done", "body": "maybe", "decide": {"proposal": "maybe"}});
+    let expected = format!(
+        "invalid arguments: {}",
+        serde_json::from_value::<aigentic_runtime::harness_tools::FinishStepArgs>(too_late)
+            .expect_err("the proposal is not one the loop knows")
+    );
+    assert!(results(&maybe)[0].result.is_error, "the call was refused");
+    assert_eq!(results(&maybe)[0].result.content, expected);
 }
 
 /// T13: one report per turn — the same batch's second call is refused

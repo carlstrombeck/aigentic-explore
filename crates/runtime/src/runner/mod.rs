@@ -26,10 +26,10 @@ use aigentic_core::{AgentId, Author, ContentBlock, Event, EventKind};
 use aigentic_log::{
     BUDGET_GATE, BudgetRaisedPayload, CheckOutcome, CheckResult, CheckpointAnswer,
     CheckpointAnsweredPayload, CheckpointAskedPayload, ChecksOutcome, ChecksRunPayload, CommitRef,
-    LogError, NewEvent, NextMove, PushedPayload, ReleaseImpact, ReportStatus, RouteTakenPayload,
-    RunErroredPayload, RunFinishedPayload, RunOutcome, RunStartedPayload, RunState,
-    StepFinishedPayload, StepReport, StepStartedPayload, StepStatus, ThreadLog, TurnEndedPayload,
-    Verdict, run_state,
+    DecideItemKind, DecideProposal, LogError, NewEvent, NextMove, PushedPayload, ReleaseImpact,
+    ReportStatus, RouteTakenPayload, RunErroredPayload, RunFinishedPayload, RunOutcome,
+    RunStartedPayload, RunState, StepFinishedPayload, StepReport, StepStartedPayload, StepStatus,
+    ThreadLog, TurnEndedPayload, Verdict, run_state,
 };
 use serde_json::Value;
 use ulid::Ulid;
@@ -42,7 +42,7 @@ use crate::{LENGTH_STOP, MAX_USD, Runtime, RuntimeError, STEP_REPORTED, Signal};
 
 /// The author id of the lead's own events, and of the messages a runner
 /// posts into a child.
-const RUNNER: &str = "runner";
+pub const RUNNER: &str = "runner";
 
 /// What a step's next attempt is told when the last one ended without a
 /// report: the step is unfinished, so it asks for the work that is left
@@ -297,6 +297,7 @@ pub struct Runner<F: Forge, H: RunnerHost, R: Repo> {
     repo: R,
     lock: Option<WriteGuard>,
     ci_wait: CiWait,
+    decide_auto_go: bool,
 }
 
 impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
@@ -326,12 +327,19 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             repo,
             lock: None,
             ci_wait: CiWait::default(),
+            decide_auto_go: true,
         })
     }
 
     /// Replace how long a `ci` step's push waits on CI.
     pub fn with_ci_wait(mut self, wait: CiWait) -> Self {
         self.ci_wait = wait;
+        self
+    }
+
+    /// Turn the runner's own answer at a `decided_by` gate on or off.
+    pub fn with_decide_auto_go(mut self, on: bool) -> Self {
+        self.decide_auto_go = on;
         self
     }
 
@@ -530,7 +538,21 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             return self.park_at_step_stop(&step, attempt, left);
         }
         if step.checkpoint {
-            return self.open_checkpoint(&step);
+            let open = self.open_checkpoint(&step)?;
+            if self.answers_itself(&step)? {
+                // The answer is the log's, so a replay takes the same path;
+                // the fold moves the run on at the next advance.
+                self.append(
+                    EventKind::CheckpointAnswered,
+                    &CheckpointAnsweredPayload {
+                        answer: CheckpointAnswer::Go,
+                        amendment: None,
+                        marks: Vec::new(),
+                    },
+                )?;
+                return Ok(Advanced::Moved);
+            }
+            return Ok(open);
         }
         // The prompt is decided before any child exists, so a slot the
         // brief never reported stops the run here, not mid-step.
@@ -1949,6 +1971,46 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             RunnerError::Host(format!("child {}: unreadable report", record.child_thread))
         })?;
         Ok(Some((report, id)))
+    }
+
+    /// The report a step's latest attempt made, whatever its number: a
+    /// decider that a check sent back and that re-ran is read from what it
+    /// said last, and a last attempt that reported nothing reads as nothing.
+    fn last_report(&self, step_id: &str) -> Result<Option<StepReport>, RunnerError> {
+        let state = self.state()?;
+        let Some(attempt) = state
+            .steps
+            .iter()
+            .rev()
+            .find(|record| record.step == step_id)
+            .map(|record| record.attempt)
+        else {
+            return Ok(None);
+        };
+        Ok(self.report_of(step_id, attempt)?.map(|(report, _)| report))
+    }
+
+    /// Whether the runner answers this gate itself: the project's switch on,
+    /// a decider whose latest report proposed `go`, and no choice among its
+    /// items.
+    fn answers_itself(&self, step: &Step) -> Result<bool, RunnerError> {
+        if !self.decide_auto_go {
+            return Ok(false);
+        }
+        let Some(decider) = step.decided_by.as_deref() else {
+            return Ok(false);
+        };
+        if self.step(decider).is_err() {
+            return Ok(false);
+        }
+        let Some(decide) = self.last_report(decider)?.and_then(|report| report.decide) else {
+            return Ok(false);
+        };
+        Ok(decide.proposal == DecideProposal::Go
+            && decide
+                .items
+                .iter()
+                .all(|item| item.kind == DecideItemKind::Fact))
     }
 
     /// How many earlier attempts of this step already ended `Partial`.

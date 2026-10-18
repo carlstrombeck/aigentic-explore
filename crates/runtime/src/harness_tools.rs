@@ -7,9 +7,10 @@ use aigentic_core::{
     Author, ContentBlock, Event, EventKind, RiskClass, ToolCall, ToolResult, ToolSpec,
 };
 use aigentic_log::{
-    AssistantMessagePayload, CommitRef, DecisionAnswer, DecisionKind, DecisionProposedPayload,
-    DecisionStage, Finding, FixSize, Handoff, Invoker, LedgerEntry, PinnedPayload, PlannedTest,
-    ReleaseImpact, ReportStatus, Route, SkillLoadedPayload, StepReport, ToolResultPayload, Verdict,
+    AssistantMessagePayload, CommitRef, Decide, DecisionAnswer, DecisionKind,
+    DecisionProposedPayload, DecisionStage, Finding, FixSize, Handoff, Invoker, LedgerEntry,
+    PinnedPayload, PlannedTest, ReleaseImpact, ReportStatus, Route, SkillLoadedPayload, StepReport,
+    ToolResultPayload, Verdict,
 };
 use aigentic_skills::Invocation;
 use serde::Deserialize;
@@ -530,6 +531,8 @@ pub struct FinishStepArgs {
     pub route: Option<Route>,
     #[serde(default)]
     pub handoff: Option<Handoff>,
+    #[serde(default)]
+    pub decide: Option<Decide>,
 }
 
 impl From<FinishStepArgs> for StepReport {
@@ -548,6 +551,7 @@ impl From<FinishStepArgs> for StepReport {
             findings: args.findings,
             route: args.route,
             handoff: args.handoff,
+            decide: args.decide,
         }
     }
 }
@@ -745,7 +749,26 @@ pub fn harness_specs_with(
                         "done": {"type": "string"},
                         "next": {"type": "string"},
                         "dirty": {"type": "array", "items": {"type": "string"}}
-                    }, "required": ["done", "next"]}
+                    }, "required": ["done", "next"]},
+                    "decide": {
+                        "type": "object",
+                        "description": "A decider step's reading of the gate it reads for: the answer it proposes, and one line per item.",
+                        "additionalProperties": false,
+                        "properties": {
+                            "proposal": {"type": "string", "enum": ["go", "amend"], "description": "`go` when nothing in the spec needs the person; `amend` otherwise."},
+                            "items": {"type": "array", "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "item": {"type": "integer", "description": "The number of the `## Spec check` item or spec section this is about, when it has one."},
+                                    "kind": {"type": "string", "enum": ["fact", "choice"], "description": "`fact` is a correction of what the spec says about the code; `choice` is a decision the purpose does not settle."},
+                                    "text": {"type": "string"}
+                                },
+                                "required": ["kind", "text"]
+                            }}
+                        },
+                        "required": ["proposal"]
+                    }
                 },
                 "required": ["status", "body"]
             }),

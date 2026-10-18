@@ -32,6 +32,31 @@ fn planned_tests_text(tests: &[PlannedTest]) -> String {
         .join("\n")
 }
 
+/// A decider's reading as the gate shows it: the answer it proposed, then
+/// one line per item with its number and whether it is a correction or a
+/// choice. Every word comes from the report, so a replay shows the same
+/// text, and the two vocabularies are the wire's own names rather than a
+/// second copy of them.
+fn proposal_text(report: &StepReport) -> Option<String> {
+    let decide = report.decide.as_ref()?;
+    let word = wire_name(&decide.proposal)?;
+    let mut lines = vec![format!("The decider proposed `{word}`.")];
+    for (position, item) in decide.items.iter().enumerate() {
+        let number = item.item.unwrap_or(position as u32 + 1);
+        let kind = wire_name(&item.kind)?;
+        lines.push(format!("{number}. {kind}: {}", item.text));
+    }
+    Some(lines.join("\n"))
+}
+
+/// A unit enum's name on the wire.
+fn wire_name<T: serde::Serialize>(value: &T) -> Option<String> {
+    serde_json::to_value(value)
+        .ok()?
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// One commit subject per line, when every item is a string.
 fn commits_text(items: &[Value]) -> Option<String> {
     items
@@ -175,6 +200,19 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         // shows it only inside its own section.
         if let Some(text) = self.latest_amendment() {
             slots.insert("amendment".to_owned(), Value::String(text));
+        }
+        // What the gate's decider proposed, for the gate to show. With no
+        // decider, or a decider that reported none, the slot stays absent
+        // and a template's section for it renders as nothing.
+        if step.checkpoint
+            && let Some(text) = step
+                .decided_by
+                .as_deref()
+                .and_then(|decider| self.last_report(decider).ok().flatten())
+                .as_ref()
+                .and_then(proposal_text)
+        {
+            slots.insert("proposal".to_owned(), Value::String(text));
         }
         slots.extend(BTreeMap::from([
             ("issue".to_owned(), Value::String(run.issue.to_string())),

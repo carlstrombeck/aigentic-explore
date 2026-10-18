@@ -79,6 +79,13 @@ pub enum WorkflowError {
         from: String,
         target: String,
     },
+    /// A `decided_by` names no step of the workflow.
+    #[error("{dir}: step `{step}` names decider `{target}`, which is no step")]
+    UnknownDecider {
+        dir: PathBuf,
+        step: String,
+        target: String,
+    },
     #[error("{dir}: duplicate step id `{id}`")]
     DuplicateStep { dir: PathBuf, id: String },
     #[error("{dir}: duplicate slot name `{name}`")]
@@ -219,6 +226,10 @@ pub struct Step {
     /// `amendment` slot); `stop` ends the run.
     #[serde(default)]
     pub checkpoint: bool,
+    /// The step that reads this gate before it opens and reports the answer
+    /// it would give (`StepReport::decide`) for the gate to show.
+    #[serde(default)]
+    pub decided_by: Option<String>,
     /// After the push, wait for the forge's CI on the pushed commit; red,
     /// missing or too slow is a checkpoint, never a silent pass.
     #[serde(default)]
@@ -424,12 +435,31 @@ impl WorkflowFile {
             if step.ci && !step.push {
                 return Err(bad("`ci` waits on a push, so it needs `push`"));
             }
+            if let Some(decider) = &step.decided_by {
+                if !step.checkpoint {
+                    return Err(bad("`decided_by` on a step that is not a checkpoint"));
+                }
+                if decider == &step.id {
+                    return Err(bad("`decided_by` names the step itself"));
+                }
+            }
             // `route` takes the `route_by` branch before the handover, so
             // a routing step's checks and push would never run.
             if step.route_by.is_some() && (step.push || !step.checks.is_empty()) {
                 return Err(bad(
                     "a step that routes hands nothing over, so it cannot check or push",
                 ));
+            }
+        }
+        for step in &self.steps {
+            if let Some(target) = &step.decided_by
+                && !ids.contains(target.as_str())
+            {
+                return Err(WorkflowError::UnknownDecider {
+                    dir: dir.to_path_buf(),
+                    step: step.id.clone(),
+                    target: target.clone(),
+                });
             }
         }
         for step in &self.steps {
@@ -906,6 +936,77 @@ pub(crate) mod tests {
         assert!(matches!(
             load(root.path(), "test"),
             Err(WorkflowError::UnknownTarget { target, .. }) if target == "nowhere"
+        ));
+    }
+
+    /// A gate whose `decided_by` names no step would wait on a decider that
+    /// never reports, so the load refuses it rather than the run stalling.
+    #[test]
+    fn a_decider_that_names_no_step_is_refused() {
+        let target = "nowhere";
+        let root = temp();
+        write_folder(
+            &root.path().join("test"),
+            &format!(
+                "{HEAD}{}{}",
+                one_slot(),
+                step(
+                    "gate",
+                    "templates/g.md",
+                    &format!("checkpoint = true\ndecided_by = \"{target}\"\nnext = \"done\"\n")
+                )
+            ),
+            &[("templates/g.md", "x\n")],
+        );
+        assert!(matches!(
+            load(root.path(), "test"),
+            Err(WorkflowError::UnknownDecider { target: named, .. }) if named == target
+        ));
+    }
+
+    /// `decided_by` only means something on a gate, and only from another
+    /// step: both loads are refused, each for its own reason.
+    #[test]
+    fn a_decider_outside_a_gate_or_on_itself_is_refused() {
+        let root = temp();
+        write_folder(
+            &root.path().join("plain"),
+            &format!(
+                "{HEAD}{}{}{}",
+                one_slot(),
+                step(
+                    "brief",
+                    "templates/b.md",
+                    "decided_by = \"gate\"\nnext = \"gate\"\n"
+                ),
+                step(
+                    "gate",
+                    "templates/g.md",
+                    "checkpoint = true\nnext = \"done\"\n"
+                )
+            ),
+            &[("templates/b.md", "x\n"), ("templates/g.md", "x\n")],
+        );
+        assert!(matches!(
+            load(root.path(), "plain"),
+            Err(WorkflowError::BadStep { reason, .. }) if reason.contains("decided_by")
+        ));
+        write_folder(
+            &root.path().join("itself"),
+            &format!(
+                "{HEAD}{}{}",
+                one_slot(),
+                step(
+                    "gate",
+                    "templates/g.md",
+                    "checkpoint = true\ndecided_by = \"gate\"\nnext = \"done\"\n"
+                )
+            ),
+            &[("templates/g.md", "x\n")],
+        );
+        assert!(matches!(
+            load(root.path(), "itself"),
+            Err(WorkflowError::BadStep { reason, .. }) if reason.contains("decided_by")
         ));
     }
 

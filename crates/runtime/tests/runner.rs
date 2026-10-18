@@ -4430,6 +4430,90 @@ route_by = "verdict"
 routes = { approve = "done", changes = "ask" }
 "###;
 
+/// The loop's files with the `decide` gate reading `check` as its decider,
+/// and a decide template that shows the proposal it read.
+const DECIDER_TOML: &str = r###"
+name = "decider-test"
+version = 1
+
+[budget]
+trivial = 3.0
+full = 10.0
+max_raise = 2.0
+
+[[slots]]
+name = "issue"
+kind = "string"
+filled_by = "runner"
+
+[[slots]]
+name = "amendment"
+kind = "string"
+required = false
+filled_by = "runner"
+
+[[slots]]
+name = "proposal"
+kind = "string"
+required = false
+filled_by = "runner"
+
+[[steps]]
+id = "check"
+role = "checker"
+profile = "flash"
+template = "templates/check.md"
+marker = "## Check"
+next = "decide"
+
+[[steps]]
+id = "decide"
+role = "person"
+profile = "flash"
+template = "templates/decide.md"
+marker = "## Decide"
+checkpoint = true
+decided_by = "check"
+next = "implement"
+
+[[steps]]
+id = "implement"
+role = "implementer"
+profile = "flash"
+template = "templates/implement.md"
+marker = "## Implementation"
+writes = true
+push = true
+ci = true
+install = false
+next = "judge"
+
+[[steps]]
+id = "judge"
+role = "judge"
+profile = "flash"
+template = "templates/judge.md"
+marker = "## Review"
+route_by = "verdict"
+routes = { approve = "done", changes = "ask" }
+"###;
+
+fn decider_files() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("workflow.toml", DECIDER_TOML),
+        ("templates/check.md", "check issue {{issue}}\n"),
+        (
+            "templates/decide.md",
+            "read the check on #{{issue}}, then decide\n{{#proposal}}proposal: {{proposal}}\n{{/proposal}}",
+        ),
+        (
+            "templates/implement.md",
+            "implement issue {{issue}}\n{{#amendment}}the person amended: {{amendment}}\n{{/amendment}}",
+        ),
+        ("templates/judge.md", "judge issue {{issue}}\n"),
+    ]
+}
+
 fn loop_files() -> Vec<(&'static str, &'static str)> {
     vec![
         ("workflow.toml", LOOP_TOML),
@@ -4867,6 +4951,331 @@ async fn a_step_follows_next_and_a_checkpoint_continues_with_the_amendment() {
         "the judge ran after the push"
     );
     assert!(!fx.forge.is_closed(), "a push before `done` closes nothing");
+}
+
+/// The decider loop: `decide` reads `check`, and `check` reports
+/// `check_args`.
+fn decided(check_args: Value) -> Looped {
+    let check = Ulid::generate();
+    let implement = Ulid::generate();
+    let judge = Ulid::generate();
+    let fx = Fixture::with_workflow(
+        vec![
+            (check, vec![report("c1", check_args)]),
+            (
+                implement,
+                vec![report("i1", reported("## Implementation", json!({})))],
+            ),
+            (
+                judge,
+                vec![report(
+                    "j1",
+                    reported("## Review", json!({"verdict": "approve"})),
+                )],
+            ),
+        ],
+        &decider_files(),
+    );
+    Looped {
+        fx,
+        check,
+        implement,
+        judge,
+    }
+}
+
+/// A `## Check` report whose `decide` carries `proposal` and `items`.
+fn proposing(proposal: &str, items: Value) -> Value {
+    let mut args = reported("## Check", json!({}));
+    args["decide"] = json!({ "proposal": proposal, "items": items });
+    args
+}
+
+/// Every `checkpoint_answered` payload of a lead log, oldest first.
+fn answers(events: &[Event]) -> Vec<aigentic_log::CheckpointAnsweredPayload> {
+    events
+        .iter()
+        .filter(|event| event.kind == EventKind::CheckpointAnswered)
+        .map(|event| serde_json::from_value(event.payload.clone()).unwrap())
+        .collect()
+}
+
+/// The header the runner writes for a proposal, built from the proposal's
+/// own serde name.
+fn proposal_header(proposal: &aigentic_log::DecideProposal) -> String {
+    let word = serde_json::to_value(proposal).expect("a proposal serialises");
+    format!(
+        "The decider proposed `{}`.",
+        word.as_str().expect("a proposal is a string")
+    )
+}
+
+/// The `taken` of the first route written after the lead log's
+/// `checkpoint_answered`.
+fn route_after_the_answer(events: &[Event]) -> Option<String> {
+    let at = events
+        .iter()
+        .position(|event| event.kind == EventKind::CheckpointAnswered)?;
+    events[at..]
+        .iter()
+        .find(|event| event.kind == EventKind::RouteTaken)
+        .and_then(|event| {
+            serde_json::from_value::<aigentic_log::RouteTakenPayload>(event.payload.clone()).ok()
+        })
+        .map(|route| route.taken)
+}
+
+/// A `go` over facts alone is the loop's to answer: the gate is asked, the
+/// loop answers it, and the run goes on to the step the workflow names
+/// after it.
+#[tokio::test]
+async fn a_go_proposal_is_answered_by_the_loop_and_the_run_moves_on() {
+    let l = decided(proposing(
+        "go",
+        json!([{"item": 2, "kind": "fact", "text": "the spec's line is right"}]),
+    ));
+    let fx = &l.fx;
+    let mut runner = fx.runner();
+    let ended = drive(fx, &mut runner).await;
+    assert_eq!(
+        ended,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the loop went on past the gate"
+    );
+    let events = fx.lead_events();
+    assert_eq!(checkpoints(&events).len(), 1, "the gate was still asked");
+    let answered = answers(&events);
+    assert_eq!(answered.len(), 1, "one answer, the loop's");
+    let proposal = child_report(fx, l.check)
+        .decide
+        .expect("the check proposed something")
+        .proposal;
+    assert_eq!(
+        answered[0].answer,
+        aigentic_log::CheckpointAnswer::Go,
+        "the answer is the proposal the decider wrote"
+    );
+    assert_eq!(proposal, aigentic_log::DecideProposal::Go);
+    let answer = events
+        .iter()
+        .find(|event| event.kind == EventKind::CheckpointAnswered)
+        .expect("the answer");
+    assert_eq!(
+        answer.author,
+        Author::Agent(AgentId(aigentic_runtime::runner::RUNNER.into())),
+        "the loop's own name is on the answer"
+    );
+    assert!(
+        events
+            .iter()
+            .position(|event| event.kind == EventKind::CheckpointAsked)
+            .expect("the ask")
+            < events
+                .iter()
+                .position(|event| event.kind == EventKind::CheckpointAnswered)
+                .expect("the answer"),
+        "the log reads ask-then-answer"
+    );
+    let next = fx
+        .workflow
+        .step("decide")
+        .and_then(|step| step.next.clone())
+        .expect("the gate names the step after it");
+    assert_eq!(
+        route_after_the_answer(&events).as_deref(),
+        Some(next.as_str()),
+        "the gate's own route was taken"
+    );
+    assert!(
+        !child_prompts(fx, l.implement).is_empty(),
+        "the step after the gate ran"
+    );
+
+    let mut rebuilt = fx.runner();
+    let again = rebuilt.advance().await.expect("the rebuilt runner runs");
+    assert_eq!(
+        again,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        }
+    );
+    assert_eq!(answers(&fx.lead_events()).len(), 1, "no second answer");
+}
+
+/// A choice among the items, and an `amend`, each leave the gate to the
+/// person — and the gate shows the proposal it was left.
+#[tokio::test]
+async fn a_choice_item_or_an_amend_leaves_the_gate_to_the_person() {
+    for (proposal, items) in [
+        (
+            "go",
+            json!([
+                {"item": 1, "kind": "fact", "text": "the spec is right"},
+                {"item": 2, "kind": "choice", "text": "which gate opens first"},
+            ]),
+        ),
+        (
+            "amend",
+            json!([{"item": 3, "kind": "fact", "text": "the spec cites the wrong line"}]),
+        ),
+    ] {
+        let l = decided(proposing(proposal, items));
+        let fx = &l.fx;
+        let mut runner = fx.runner();
+        let paused = drive(fx, &mut runner).await;
+        assert_eq!(
+            paused,
+            Advanced::WaitingHuman {
+                gate: "decide".into()
+            },
+            "a {proposal} with these items waits"
+        );
+        assert!(answers(&fx.lead_events()).is_empty(), "nothing answered it");
+        let shown = gate_shown(&fx.lead_events()).join("\n");
+        let decide = child_report(fx, l.check)
+            .decide
+            .expect("the check proposed something");
+        assert_eq!(
+            decide.proposal,
+            serde_json::from_str::<aigentic_log::DecideProposal>(&format!("\"{proposal}\""))
+                .unwrap()
+        );
+        assert!(
+            shown.contains(&proposal_header(&decide.proposal)),
+            "the gate names the proposal: {shown:?}"
+        );
+        for item in &decide.items {
+            assert!(
+                shown.contains(&item.text),
+                "every item reaches the gate: {shown:?}"
+            );
+        }
+    }
+}
+
+/// The project's switch off leaves every gate to a person, even a clean
+/// `go` — and the person's own `go` still moves the run on.
+#[tokio::test]
+async fn the_switch_off_keeps_the_persons_gate_on_a_go() {
+    let l = decided(proposing("go", json!([])));
+    let fx = &l.fx;
+    let mut runner = fx.runner().with_decide_auto_go(false);
+    let paused = drive(fx, &mut runner).await;
+    assert_eq!(
+        paused,
+        Advanced::WaitingHuman {
+            gate: "decide".into()
+        }
+    );
+    assert!(answers(&fx.lead_events()).is_empty(), "nothing answered it");
+    runner
+        .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+        .unwrap();
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the person's answer moves it on"
+    );
+}
+
+/// The gate a decider left with no proposal is exactly today's: it waits,
+/// and the template renders with no proposal section.
+fn assert_the_gate_is_todays(fx: &Fixture) {
+    let shown = gate_shown(&fx.lead_events()).join("\n");
+    assert!(answers(&fx.lead_events()).is_empty(), "nothing answered it");
+    assert!(
+        !shown.contains("The decider proposed"),
+        "no header without a proposal: {shown:?}"
+    );
+    assert!(
+        !shown.contains("\n\n\n"),
+        "no section left a hole: {shown:?}"
+    );
+}
+
+/// A decider that reported and said nothing about the spec leaves the gate
+/// to the person.
+#[tokio::test]
+async fn a_decider_that_reported_no_proposal_leaves_the_gate_as_today() {
+    let l = decided(reported("## Check", json!({})));
+    let fx = &l.fx;
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "decide".into()
+        }
+    );
+    assert_the_gate_is_todays(fx);
+}
+
+/// A decider whose turn ended without a report leaves the gate to the
+/// person too: a failed decider answers nothing.
+#[tokio::test]
+async fn a_decider_whose_turn_ended_without_a_report_leaves_the_gate_as_today() {
+    let check = Ulid::generate();
+    let fx = Fixture::with_workflow(
+        vec![(
+            check,
+            vec![
+                vec![done("end_turn")],
+                report("c1", reported("## Check", json!({}))),
+            ],
+        )],
+        &decider_files(),
+    );
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "decide".into()
+        }
+    );
+    assert!(
+        child_report(&fx, check).decide.is_none(),
+        "the retry's report carries no proposal"
+    );
+    assert_the_gate_is_todays(&fx);
+}
+
+/// The auto answer replays as the log it wrote: a fold of the events alone
+/// answers the gate, with no runner to ask.
+#[tokio::test]
+async fn the_auto_answer_replays_as_the_log_it_wrote() {
+    let l = decided(proposing("go", json!([])));
+    let fx = &l.fx;
+    let mut runner = fx.runner();
+    drive(fx, &mut runner).await;
+    let events = fx.lead_events();
+    let folded = run_state(&events).expect("the log folds");
+    assert_eq!(folded.pending_checkpoint, None, "no gate is open");
+    let next = fx
+        .workflow
+        .step("decide")
+        .and_then(|step| step.next.clone())
+        .expect("the gate names the step after it");
+    assert!(
+        folded.routes.iter().any(|route| route.taken == next),
+        "the fold is past the gate"
+    );
+    let at = events
+        .iter()
+        .position(|event| event.kind == EventKind::CheckpointAnswered)
+        .expect("the answer")
+        + 1;
+    assert_eq!(
+        run_state(&events[..at]).expect("the log folds").next_move(),
+        aigentic_log::NextMove::Answered {
+            gate: "decide".into(),
+            answer: aigentic_log::CheckpointAnswer::Go,
+            amendment: None,
+        },
+        "the answer alone carries the gate and no amendment"
+    );
 }
 
 /// `go` continues a checkpoint with no amendment: the later prompt has
