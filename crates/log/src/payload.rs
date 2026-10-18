@@ -984,6 +984,51 @@ pub struct StepReport {
     pub route: Option<Route>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<Handoff>,
+    /// A decider step's reading of the gate it reads for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decide: Option<Decide>,
+}
+
+/// The loop's decider step's reading of a spec gate: the answer it would
+/// give, and one line per item saying whether that item is a correction of
+/// fact or a choice the spec left open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Decide {
+    pub proposal: DecideProposal,
+    #[serde(default)]
+    pub items: Vec<DecideItem>,
+}
+
+/// The answer a decider proposes for its gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecideProposal {
+    /// Answer the gate `go`: nothing in the spec needs the person.
+    Go,
+    /// The spec needs the person's decision before the merger runs.
+    Amend,
+}
+
+/// One item of a decider's reading: what it is about, whether it is a
+/// correction or an open choice, and the line itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecideItem {
+    /// The number of the `## Spec check` item or spec section this is
+    /// about, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<u32>,
+    pub kind: DecideItemKind,
+    pub text: String,
+}
+
+/// Whether a decider's item is a correction of fact or an open choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecideItemKind {
+    /// The spec is wrong about a fact the decider checked.
+    Fact,
+    /// The spec leaves a choice that the purpose does not settle.
+    Choice,
 }
 
 /// What kind of decision a `decision_proposed` event is about (issue
@@ -2338,6 +2383,14 @@ mod tests {
                 done: "kinds and payloads".into(),
                 next: "run_state.rs".into(),
                 dirty: vec!["crates/log/src/payload.rs".into()],
+            }),
+            decide: Some(Decide {
+                proposal: DecideProposal::Go,
+                items: vec![DecideItem {
+                    item: None,
+                    kind: DecideItemKind::Fact,
+                    text: "the check's item 4 holds".into(),
+                }],
             }),
         };
         let value = serde_json::to_value(&p).unwrap();
