@@ -169,8 +169,9 @@ pub(crate) fn render(event: &Event) -> Option<String> {
             let payload: CheckpointAnsweredPayload =
                 serde_json::from_value(event.payload.clone()).ok()?;
             Some(format!(
-                "checkpoint answered {}{}",
+                "checkpoint answered {}{}{}",
                 answer_word(&payload.answer),
+                answered_by(&event.author),
                 match &payload.amendment {
                     Some(a) => format!(": {a}"),
                     None => String::new(),
@@ -196,6 +197,16 @@ pub(crate) fn step_status(status: &aigentic_runtime::aigentic_log::StepStatus) -
         StepStatus::Done => "done".into(),
         StepStatus::Partial => "partial".into(),
         StepStatus::Failed => "failed".into(),
+    }
+}
+
+/// Who answered a gate, as the line says it: the runner answers a
+/// `decided_by` gate itself, and a person's answer needs no words.
+pub(crate) fn answered_by(author: &aigentic_runtime::aigentic_core::Author) -> &'static str {
+    use aigentic_runtime::aigentic_core::{AgentId, Author};
+    match author {
+        Author::Agent(AgentId(id)) if id == aigentic_runtime::runner::RUNNER => " (by the loop)",
+        _ => "",
     }
 }
 
