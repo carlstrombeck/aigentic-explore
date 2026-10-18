@@ -69,6 +69,8 @@ pub const POCOCK_SECTION_KEYS: &[&str] = &[
 ];
 pub const SKILLS_SECTION_KEYS: &[&str] = &["enabled"];
 pub const POLICY_SECTION_KEYS: &[&str] = &["rules", "bash_allow", "allow_paths"];
+/// `[workflow]`, the run's own switches.
+pub const WORKFLOW_SECTION_KEYS: &[&str] = &["decide_auto_go"];
 /// One `[[mcp_servers]]` entry, shared by `aigentic.toml` and
 /// `config.toml`; `crates/tools/src/mcp.rs` parses it in both.
 pub const MCP_SERVER_KEYS: &[&str] = &[
@@ -106,6 +108,7 @@ pub fn project_spec() -> Table {
         ("pocock", Table::new(POCOCK_SECTION_KEYS)),
         ("skills", Table::new(SKILLS_SECTION_KEYS)),
         ("policy", Table::new(POLICY_SECTION_KEYS)),
+        ("workflow", Table::new(WORKFLOW_SECTION_KEYS)),
         ("mcp_servers", MCP_SERVER_SPEC),
         ("participants", PARTICIPANTS_SPEC),
     ];
@@ -121,6 +124,7 @@ pub fn project_spec() -> Table {
             "pocock",
             "skills",
             "policy",
+            "workflow",
             "mcp_servers",
             "participants",
         ],
@@ -177,6 +181,10 @@ pub struct ProjectFile {
     /// keeps every name out of the unknown-key report.
     #[serde(default)]
     pub participants: aigentic_policy::Participants,
+    /// `[workflow]`: the run's own switches. Absent is every switch at
+    /// its default.
+    #[serde(default)]
+    pub workflow: Option<WorkflowSection>,
 }
 
 /// Keys in `PROJECT_SECTION_KEYS`.
@@ -222,6 +230,17 @@ impl ToolsSection {
             std::time::Duration::from_secs,
         )
     }
+}
+
+/// `[workflow]`: the switches the runner reads at run start. Keys in
+/// `WORKFLOW_SECTION_KEYS`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WorkflowSection {
+    /// Whether the runner answers a `decided_by` gate itself when the
+    /// decider proposed `go` with no choice among its items. Absent is
+    /// on.
+    #[serde(default = "default_true")]
+    pub decide_auto_go: bool,
 }
 
 /// Keys in `KNOWLEDGE_SECTION_KEYS`.
@@ -701,6 +720,25 @@ impl Project {
     }
 }
 
+/// Whether a run in `root` answers a `decided_by` gate itself.
+///
+/// No `aigentic.toml`, no `[workflow]` section and no key all mean on. A
+/// file that cannot be read means off: a run that cannot tell asks the
+/// person rather than answering for them.
+pub fn decide_auto_go(root: &Path) -> bool {
+    if !root.join(FILE_NAME).is_file() {
+        return true;
+    }
+    let Ok(project) = Project::open_root(root) else {
+        return false;
+    };
+    project
+        .file
+        .workflow
+        .map(|w| w.decide_auto_go)
+        .unwrap_or(true)
+}
+
 /// Walk up from `cwd` to the nearest directory holding `aigentic.toml`.
 pub fn find_root(cwd: &Path) -> Option<PathBuf> {
     let mut dir = Some(cwd);
@@ -1012,6 +1050,7 @@ enabled = ["implement"]
             "skills.enabled",
             "tools.allow",
             "tools.bash_timeout_secs",
+            "workflow.decide_auto_go",
         ] {
             assert!(paths.contains(&expected.to_owned()), "missing {expected}");
         }
@@ -1066,6 +1105,8 @@ transport = { stdio = { command = \"npx\" } }
 class = \"read\"
 [participants]
 steve = \"admin\"
+[workflow]
+decide_auto_go = false
 ";
 
     #[test]
@@ -1078,6 +1119,58 @@ steve = \"admin\"
         assert!(file.budget.is_some() && file.compaction.is_some());
         assert!(file.pocock.is_some());
         assert!(file.has_phase4_sections());
+    }
+
+    /// The `[workflow]` switch: on when no key says otherwise, off when one
+    /// says so, and a typo in its name reported rather than ignored.
+    #[test]
+    fn the_workflow_section_defaults_on_and_reports_a_typo() {
+        // The section with no key at all is what "absent" means for the
+        // field, so the default is the parser's own answer, not a literal.
+        let bare = ProjectFile::parse("[project]\nname = \"p\"\n[workflow]\n")
+            .unwrap()
+            .workflow
+            .expect("the section is present");
+        let off = ProjectFile::parse(FULL_PROJECT)
+            .unwrap()
+            .workflow
+            .expect("the fixture sets the section");
+        assert!(bare.decide_auto_go);
+        assert!(!off.decide_auto_go);
+        assert!(
+            ProjectFile::parse("[project]\nname = \"p\"\n")
+                .unwrap()
+                .workflow
+                .is_none()
+        );
+
+        let (_, unknown) = ProjectFile::parse_with(
+            "[project]\nname = \"p\"\n[workflow]\ndecide_auto_g0 = false\n",
+        )
+        .unwrap();
+        assert_eq!(unknown, vec!["workflow.decide_auto_g0"]);
+    }
+
+    /// What a run does at a `decided_by` gate, read from the directory: on
+    /// with no file and no section, the section's value with one, and off
+    /// for a file that cannot be read.
+    #[test]
+    fn the_switch_a_run_reads_defaults_on_and_fails_closed() {
+        let empty = tempfile::tempdir().unwrap();
+        assert!(decide_auto_go(empty.path()));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE_NAME), "[project]\nname = \"p\"\n").unwrap();
+        // No `[workflow]` at all: on, as no file is.
+        assert!(decide_auto_go(dir.path()));
+        std::fs::write(dir.path().join(FILE_NAME), FULL_PROJECT).unwrap();
+        let file = ProjectFile::parse(FULL_PROJECT).unwrap();
+        assert_eq!(
+            decide_auto_go(dir.path()),
+            file.workflow.unwrap().decide_auto_go
+        );
+        // A file the project cannot open leaves the answer to a person.
+        std::fs::write(dir.path().join(FILE_NAME), "[project]\nname = 7\n").unwrap();
+        assert!(!decide_auto_go(dir.path()));
     }
 
     #[test]

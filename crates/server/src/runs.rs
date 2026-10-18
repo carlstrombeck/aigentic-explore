@@ -1244,7 +1244,11 @@ fn build_runner(
     let repo = world.deps.repo(&world.root);
     let forge = world.deps.forge();
     let installer = world.deps.installer();
-    let runner = Runner::new(log, lead, forge, host, installer, loaded, repo)?;
+    // The project's `[workflow]` switch, read from the run's root rather
+    // than from the built context, which a restart does not rebuild.
+    let auto_go = aigentic_runtime::project::decide_auto_go(&world.root.root);
+    let runner =
+        Runner::new(log, lead, forge, host, installer, loaded, repo)?.with_decide_auto_go(auto_go);
     Ok((runner, started, content_hash))
 }
 
