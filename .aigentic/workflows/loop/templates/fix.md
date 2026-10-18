@@ -10,6 +10,8 @@ Pin each fix with a test, and show that each new test fails without its fix (in 
 Your earlier report failed these checks. Fix each one, run the gate again, and call `finish_step` again.
 
 {{check_failures}}
+
+Rerun each test the failures name as its own bash call, `cargo test -p <crate> <exact name>`, with the name exactly as written and no pipe, no redirection and no loop, so the checks can read its output.
 {{/check_failures}}
 {{#head_at_start}}
 To fold work into an earlier commit, `git reset --soft {{head_at_start}}` and recommit it with the same subject and trailer; the tree must not change.

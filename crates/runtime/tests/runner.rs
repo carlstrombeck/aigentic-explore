@@ -4233,6 +4233,144 @@ fn the_implementation_prompts_ask_for_one_unpiped_call_per_test() {
     );
 }
 
+/// The rule a send-back must carry: the checks read the child's log, so the
+/// rerun has to be a call of its own.
+const SEND_BACK_RERUN: &str = "Rerun each test the failures name as its own bash call, `cargo test -p <crate> <exact name>`, with the name exactly as written and no pipe, no redirection and no loop, so the checks can read its output.";
+
+/// Every step that can be sent back carries the unpiped rerun rule exactly
+/// once, on a line of its own under the whole failure list: the step reads
+/// the failures, not the gate section it was already given.
+#[test]
+fn the_send_back_prompt_repeats_the_unpiped_rerun_rule() {
+    /// Every declared slot filled by its kind, so optional sections are
+    /// kept and no tag is left empty.
+    fn filled(loaded: &LoadedWorkflow) -> BTreeMap<String, Value> {
+        loaded
+            .workflow
+            .slots
+            .iter()
+            .map(|slot| {
+                let value = match slot.kind {
+                    SlotKind::Bool => Value::Bool(true),
+                    SlotKind::String => Value::String(format!("x {}", slot.name)),
+                };
+                (slot.name.clone(), value)
+            })
+            .collect()
+    }
+
+    /// The offset of a phrase asserted to occur exactly once: a sentence
+    /// copied into a second place fails the position it is read at.
+    fn only(prompt: &str, needle: &str) -> usize {
+        let mut found = prompt.match_indices(needle).map(|(at, _)| at);
+        let at = found
+            .next()
+            .unwrap_or_else(|| panic!("{needle:?} is missing"));
+        assert!(found.next().is_none(), "{needle:?} occurs more than once");
+        at
+    }
+
+    let failures = ["- E7: a piped rerun", "- E4: an edit after the gate"].join("\n");
+    let under_the_failures = format!("{failures}\n\n{SEND_BACK_RERUN}\n");
+
+    fn checked(prompt: &str, step: &str, under_the_failures: &str) {
+        let at = only(prompt, SEND_BACK_RERUN);
+        assert!(
+            prompt.contains(under_the_failures),
+            "{step}: the rule does not sit on its own line under the failures"
+        );
+        assert!(
+            only(prompt, "## Sent back by the runner") < at,
+            "{step}: the rule sits above the section that reads it"
+        );
+        assert!(
+            at < only(prompt, "## Report"),
+            "{step}: the rule sits below the report section"
+        );
+    }
+
+    let loop_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.aigentic/workflows/loop");
+    let loop_workflow =
+        WorkflowFile::load_dir(&loop_dir, WorkflowOrigin::Project).expect("the loop loads");
+    let mut loop_slots = filled(&loop_workflow);
+    loop_slots.insert("check_failures".to_string(), Value::from(failures.clone()));
+    for step in ["implement", "fix"] {
+        let prompt = loop_workflow.render(step, &loop_slots).expect("it renders");
+        checked(&prompt, step, &under_the_failures);
+    }
+
+    let build_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workflows/build");
+    let build_workflow = WorkflowFile::load_dir(&build_dir, WorkflowOrigin::Bundled)
+        .expect("the bundled build workflow loads");
+    let mut build_slots = filled(&build_workflow);
+    build_slots.insert("check_failures".to_string(), Value::from(failures.clone()));
+    for ui in [true, false] {
+        build_slots.insert("ui".to_string(), Value::Bool(ui));
+        let prompt = build_workflow
+            .render("implement-alone", &build_slots)
+            .expect("it renders");
+        checked(
+            &prompt,
+            &format!("implement-alone (ui {ui})"),
+            &under_the_failures,
+        );
+    }
+}
+
+/// A step on its first attempt is not sent back: the failures it is told to
+/// fix are absent, so the section holding the rerun rule goes with them.
+#[test]
+fn a_first_attempt_is_not_told_to_rerun_a_test() {
+    /// Every declared slot filled by its kind, so optional sections are
+    /// kept and no tag is left empty.
+    fn filled(loaded: &LoadedWorkflow) -> BTreeMap<String, Value> {
+        loaded
+            .workflow
+            .slots
+            .iter()
+            .map(|slot| {
+                let value = match slot.kind {
+                    SlotKind::Bool => Value::Bool(true),
+                    SlotKind::String => Value::String(format!("x {}", slot.name)),
+                };
+                (slot.name.clone(), value)
+            })
+            .collect()
+    }
+
+    fn checked(prompt: &str, step: &str) {
+        assert!(
+            !prompt.contains("## Sent back by the runner"),
+            "{step}: a first attempt carries the send-back section"
+        );
+        assert!(
+            !prompt.contains(SEND_BACK_RERUN),
+            "{step}: a first attempt is told to rerun a test"
+        );
+    }
+
+    let loop_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.aigentic/workflows/loop");
+    let loop_workflow =
+        WorkflowFile::load_dir(&loop_dir, WorkflowOrigin::Project).expect("the loop loads");
+    let mut loop_slots = filled(&loop_workflow);
+    loop_slots.remove("check_failures");
+    for step in ["implement", "fix"] {
+        let prompt = loop_workflow.render(step, &loop_slots).expect("it renders");
+        checked(&prompt, step);
+    }
+
+    let build_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workflows/build");
+    let build_workflow = WorkflowFile::load_dir(&build_dir, WorkflowOrigin::Bundled)
+        .expect("the bundled build workflow loads");
+    let mut build_slots = filled(&build_workflow);
+    build_slots.remove("check_failures");
+    build_slots.insert("ui".to_string(), Value::Bool(false));
+    let prompt = build_workflow
+        .render("implement-alone", &build_slots)
+        .expect("it renders");
+    checked(&prompt, "implement-alone");
+}
+
 const LOOP_TOML: &str = r###"
 name = "loop-test"
 version = 1
