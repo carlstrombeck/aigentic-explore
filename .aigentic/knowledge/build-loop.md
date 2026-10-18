@@ -8,21 +8,27 @@ procedure; `lessons.md` holds the reasons behind it.
 ## The steps
 
 Every step is its own thread, started fresh (`/new`), with one prompt.
-Steps hand off through the issue's comments, under fixed headings. All
-steps run on the `flash` profile.
+Steps hand off through the issue's comments, under fixed headings. Most
+steps run on the `flash` profile; the spec check and the decider run on
+`tensorx`.
 
 1. **Size**: map the code, then split if needed (supervisor).
 2. **`## Spec`**: written by the supervisor and posted on the issue.
-3. **`## Spec check`**: one checker thread.
-4. **`## Spec v2 (consolidated)`**: one merger thread. Its prompt carries the
+3. **`## Spec check`**: one checker thread, on `tensorx`.
+4. **`## Decide answer`**: one decider thread, on `tensorx`: it opens every
+   `file:line` the check cites and reports a proposal. The loop answers the
+   gate itself when the proposal is `go` with no choice among its items,
+   unless the project sets `[workflow] decide_auto_go = false`; an `amend` or
+   any choice waits for a person.
+5. **`## Spec v2 (consolidated)`**: one merger thread. Its prompt carries the
    supervisor's binding decisions.
-5. **`## Implementation`**: one implementer thread, which commits and pushes.
-6. **`## Review`**: one judge thread. On `approve` it closes the issue.
-7. **`## Fix`**: when the judge says `changes needed`, one lean fixer thread.
-8. **Close**: the supervisor reviews the fix, waits for green CI on the fix
+6. **`## Implementation`**: one implementer thread, which commits and pushes.
+7. **`## Review`**: one judge thread. On `approve` it closes the issue.
+8. **`## Fix`**: when the judge says `changes needed`, one lean fixer thread.
+9. **Close**: the supervisor reviews the fix, waits for green CI on the fix
    commit, and closes with a comment that states the release impact.
 
-A trivial change (a one-line fix, a docs edit) skips 3, 4 and 6.
+A trivial change (a one-line fix, a docs edit) skips 3, 4, 5 and 7.
 
 **Searching the repository, in every step:** use `rg`, which skips what
 `.gitignore` names and is a read-only command to the checks. Never run a bare `grep -r` from the repository
