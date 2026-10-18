@@ -4122,6 +4122,7 @@ fn the_repositorys_loop_workflow_loads() {
         [
             "spec",
             "speccheck",
+            "decider",
             "decide",
             "merge",
             "implement",
@@ -4131,6 +4132,34 @@ fn the_repositorys_loop_workflow_loads() {
         ]
     );
     assert!(loaded.step("decide").unwrap().checkpoint);
+
+    // The decider reads the spec with the checker's own model, proposes
+    // the gate's answer one step before it, and every gate's decider is a
+    // step of this workflow.
+    let decider = loaded.step("decider").expect("the decider is a step");
+    let speccheck = loaded.step("speccheck").expect("the check is a step");
+    assert_eq!(decider.profile, speccheck.profile);
+    assert_eq!(decider.next.as_deref(), Some("decide"));
+    assert_eq!(
+        loaded.step("decide").unwrap().decided_by.as_deref(),
+        Some("decider")
+    );
+    for step in loaded
+        .workflow
+        .steps
+        .iter()
+        .filter(|s| s.decided_by.is_some())
+    {
+        let named = step.decided_by.as_deref().unwrap();
+        assert!(loaded.step(named).is_some(), "{} names {named}", step.id);
+    }
+    // The proposal is the runner's to fill and optional, so a gate with no
+    // decider report renders as it did before the slot existed.
+    let proposal = loaded
+        .slot("proposal")
+        .expect("the proposal slot is declared");
+    assert!(!proposal.required);
+    assert_eq!(proposal.filled_by, "runner");
     for id in ["implement", "fix"] {
         let step = loaded.step(id).unwrap();
         assert!(step.writes && step.push && step.ci && !step.install, "{id}");
@@ -4144,6 +4173,66 @@ fn the_repositorys_loop_workflow_loads() {
             .map(String::as_str),
         Some("fix")
     );
+}
+
+/// The loop's `decide.md` renders today's text when there is no proposal,
+/// and the decider's reading when there is one.
+///
+/// The plain case's expectation is the template's own text with the
+/// proposal block cut out: a section the runner does not fill leaves
+/// nothing behind, not even a blank line.
+#[test]
+fn the_loops_decide_template_shows_a_proposal_only_when_there_is_one() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.aigentic/workflows/loop");
+    let loaded = WorkflowFile::load_dir(&dir, WorkflowOrigin::Project).expect("the loop loads");
+    let template = std::fs::read_to_string(dir.join("templates/decide.md")).unwrap();
+
+    // The required slots alone: what a run whose decider reported nothing
+    // has.
+    let plain: BTreeMap<String, Value> = loaded
+        .workflow
+        .slots
+        .iter()
+        .filter(|slot| slot.required)
+        .map(|slot| {
+            let value = match slot.kind {
+                SlotKind::Bool => Value::Bool(true),
+                SlotKind::String => Value::String(format!("<{}>", slot.name)),
+            };
+            (slot.name.clone(), value)
+        })
+        .collect();
+    let out = loaded.render("decide", &plain).expect("it renders");
+
+    const OPEN: &str = "{{#proposal}}";
+    const CLOSE: &str = "{{/proposal}}\n";
+    let from = template
+        .find(OPEN)
+        .expect("the template has a proposal section");
+    let to = template.find(CLOSE).expect("the section is closed") + CLOSE.len();
+    let mut expected = format!("{}{}", &template[..from], &template[to..]);
+    for (name, value) in &plain {
+        let text = match value {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        expected = expected.replace(&format!("{{{{{name}}}}}"), &text);
+    }
+    assert_eq!(out, expected);
+    assert!(!out.contains("{{"), "no tag is left behind");
+
+    // With a proposal: one blank line, the runner's header, the text, and
+    // the gate's own lines straight after it.
+    let word = serde_json::to_value(aigentic_runtime::aigentic_log::DecideProposal::Amend).unwrap();
+    let header = format!("The decider proposed `{}`.", word.as_str().unwrap());
+    let text = format!("{header}\n\n3. fact: the spec is right about the file");
+    let mut with = plain.clone();
+    with.insert("proposal".into(), Value::String(text.clone()));
+    let out = loaded.render("decide", &with).expect("it renders");
+    assert!(out.contains(&header), "the header is shown: {out}");
+    assert!(out.contains(&text), "the proposal's text is shown: {out}");
+    assert!(!out.contains("{{"), "no tag is left behind");
+    assert!(!out.contains("\n\n\n"), "the section leaves one blank line");
 }
 
 /// Both loop prompts and the bundled standalone implementer name the one

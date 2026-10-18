@@ -44,6 +44,13 @@ kind = "string"
 required = false
 filled_by = "runner"
 
+# The decider's reading of the spec gate, when it made one.
+[[slots]]
+name = "proposal"
+kind = "string"
+required = false
+filled_by = "runner"
+
 # Filled by the runner only when a check sent a writing step back.
 [[slots]]
 name = "check_failures"
@@ -88,7 +95,7 @@ next = "speccheck"
 [[steps]]
 id = "speccheck"
 role = "speccheck"
-profile = "flash"
+profile = "tensorx"
 template = "templates/speccheck.md"
 marker = "## Spec check"
 wall_secs = 3600
@@ -102,10 +109,31 @@ deny = [
     "git add",
     "copy .env",
 ]
+next = "decider"
+
+# The reading the person used to do at the gate: the decider checks the
+# spec against the code and proposes the answer. It writes nothing.
+[[steps]]
+id = "decider"
+role = "decider"
+profile = "tensorx"
+template = "templates/decider.md"
+marker = "## Decide answer"
+wall_secs = 3600
+deny = [
+    "git push",
+    "git commit",
+    "git reset",
+    "git checkout --",
+    "git stash",
+    "git clean",
+    "git add",
+    "copy .env",
+]
 next = "decide"
 
-# The person reads the spec and the check, then answers `/answer go` (the
-# merger settles open choices itself) or `/answer amend <decisions>`.
+# The gate's answer: the runner takes the decider's `go` when it left no
+# choice open, and everything else waits for a person's `/answer`.
 [[steps]]
 id = "decide"
 role = "person"
@@ -113,6 +141,7 @@ profile = "flash"
 template = "templates/decide.md"
 marker = "## Decisions"
 checkpoint = true
+decided_by = "decider"
 next = "merge"
 
 [[steps]]
