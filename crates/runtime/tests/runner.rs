@@ -4235,6 +4235,64 @@ fn the_loops_decide_template_shows_a_proposal_only_when_there_is_one() {
     assert!(!out.contains("\n\n\n"), "the section leaves one blank line");
 }
 
+/// A gate says what the decider proposed once: the runner's header follows
+/// the gate's own question after a single blank line, rather than a second
+/// sentence about the decider in the template.
+#[test]
+fn the_loops_gate_names_the_proposal_once() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.aigentic/workflows/loop");
+    let loaded = WorkflowFile::load_dir(&dir, WorkflowOrigin::Project).expect("the loop loads");
+    let template = std::fs::read_to_string(dir.join("templates/decide.md")).unwrap();
+
+    let mut slots: BTreeMap<String, Value> = loaded
+        .workflow
+        .slots
+        .iter()
+        .filter(|slot| slot.required)
+        .map(|slot| {
+            let value = match slot.kind {
+                SlotKind::Bool => Value::Bool(true),
+                SlotKind::String => Value::String(format!("<{}>", slot.name)),
+            };
+            (slot.name.clone(), value)
+        })
+        .collect();
+    let word = serde_json::to_value(aigentic_runtime::aigentic_log::DecideProposal::Go).unwrap();
+    let header = format!("The decider proposed `{}`.", word.as_str().unwrap());
+    slots.insert(
+        "proposal".into(),
+        Value::String(format!(
+            "{header}\n\n1. fact: the spec is right about the file"
+        )),
+    );
+    let out = loaded.render("decide", &slots).expect("it renders");
+
+    // The template's own text before the section, with its slots filled:
+    // the header follows it after one blank line, so no other sentence
+    // stands between the gate's question and the answer it shows.
+    const OPEN: &str = "{{#proposal}}";
+    let mut lead = template[..template
+        .find(OPEN)
+        .expect("the template has a proposal section")]
+        .to_owned();
+    for (name, value) in &slots {
+        let text = match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        lead = lead.replace(&format!("{{{{{name}}}}}"), &text);
+    }
+    assert!(
+        out.starts_with(&format!("{lead}\n{header}")),
+        "the header follows the gate's question: {out}"
+    );
+    assert_eq!(
+        out.matches(&header).count(),
+        1,
+        "the proposal is named once: {out}"
+    );
+}
+
 /// Both loop prompts and the bundled standalone implementer name the one
 /// form the checks can read: a named run as its own bash call, inside the
 /// gate section — and, where the prompt carries the `1 passed` rule, under
@@ -5300,6 +5358,78 @@ async fn a_decider_that_reported_no_proposal_leaves_the_gate_as_today() {
         }
     );
     assert_the_gate_is_todays(fx);
+}
+
+/// A decider whose first attempt ended partial and whose retry proposed
+/// `amend` is read from its last report: the gate shows the retry's
+/// proposal, never the one the abandoned attempt left behind.
+#[tokio::test]
+async fn the_gate_reads_the_deciders_last_attempt() {
+    let check = Ulid::generate();
+    let mut abandoned = proposing("go", json!([]));
+    abandoned["status"] = json!("partial");
+    abandoned["handoff"] = json!({
+        "done": "read the spec check",
+        "next": "read the spec",
+        "dirty": [],
+    });
+    // The steps after the gate are scripted too, so a gate wrongly
+    // answered by the loop ends the run rather than exhausting the fixture.
+    let implement = Ulid::generate();
+    let judge = Ulid::generate();
+    let fx = Fixture::with_workflow(
+        vec![
+            (
+                check,
+                vec![
+                    report("c1", abandoned),
+                    report("c2", proposing("amend", json!([]))),
+                ],
+            ),
+            (
+                implement,
+                vec![report("i1", reported("## Implementation", json!({})))],
+            ),
+            (
+                judge,
+                vec![report(
+                    "j1",
+                    reported("## Review", json!({"verdict": "approve"})),
+                )],
+            ),
+        ],
+        &decider_files(),
+    );
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "decide".into()
+        },
+        "an amend proposal is a person's decision, whatever the attempt before it said"
+    );
+    let last: StepReport = serde_json::from_value(
+        fx.child_events_of(check)
+            .into_iter()
+            .rev()
+            .find(|event| event.kind == EventKind::StepReported)
+            .expect("the retry reported")
+            .payload,
+    )
+    .expect("the report parses");
+    let decide = last.decide.expect("the retry proposed");
+    let shown = gate_shown(&fx.lead_events()).join("\n");
+    let header = proposal_header(&decide.proposal);
+    assert!(
+        shown.contains(&header),
+        "the retry's proposal is shown ({header:?}): {shown:?}"
+    );
+    let abandoned_header = proposal_header(&aigentic_log::DecideProposal::Go);
+    assert!(
+        !shown.contains(&abandoned_header),
+        "the abandoned attempt's proposal is not shown ({abandoned_header:?}): {shown:?}"
+    );
+    assert!(answers(&fx.lead_events()).is_empty(), "nothing answered it");
 }
 
 /// A decider whose turn ended without a report leaves the gate to the

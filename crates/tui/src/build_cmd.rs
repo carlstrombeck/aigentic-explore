@@ -242,21 +242,29 @@ fn takes_go(asked: &CheckpointAskedPayload) -> bool {
 /// answer's payload carries no gate id, so it answers the ask before it —
 /// the pairing the fold makes.
 fn answered(events: &[aigentic_runtime::aigentic_core::Event], gate: &str) -> bool {
+    // A gate asked twice is open again: an answer to the earlier ask does
+    // not stand for the later one, so the read is the last ask and whether
+    // an answer of its own follows it.
     let mut open: Option<String> = None;
-    for event in events {
+    let mut asked_at: Option<usize> = None;
+    let mut answered_at: Option<usize> = None;
+    for (index, event) in events.iter().enumerate() {
         match event.kind {
             EventKind::CheckpointAsked => {
                 open = serde_json::from_value::<CheckpointAskedPayload>(event.payload.clone())
                     .ok()
                     .map(|asked| asked.gate);
+                if open.as_deref() == Some(gate) {
+                    asked_at = Some(index);
+                }
             }
-            EventKind::CheckpointAnswered if open.take().is_some_and(|asked| asked == gate) => {
-                return true;
+            EventKind::CheckpointAnswered if open.take().as_deref() == Some(gate) => {
+                answered_at = Some(index);
             }
             _ => {}
         }
     }
-    false
+    matches!((asked_at, answered_at), (Some(asked), Some(answered)) if answered > asked)
 }
 
 /// Leave the run waiting at a person's checkpoint, say where to answer
@@ -1107,5 +1115,152 @@ mod tests {
             }
             daemon.abort();
         }
+    }
+
+    /// A gate asked a second time is open again: the answer to the earlier
+    /// ask does not stand for the later one, so the command leaves the run
+    /// to the person instead of waiting for events nobody will write.
+    #[tokio::test]
+    async fn a_re_asked_gate_is_not_answered_by_its_earlier_answer() {
+        use aigentic_api::{Body, Frame, Notice, ThreadState, Welcome, encode};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let lead = Ulid::generate();
+        let ask = |seq| {
+            event_at(
+                EventKind::CheckpointAsked,
+                seq,
+                lead,
+                serde_json::json!({
+                    "gate": "decide",
+                    "shown": ["read the spec check, then decide"],
+                    "options": ["go", "amend", "stop"],
+                }),
+            )
+        };
+        // The same gate asked a second time: the loop answered the first
+        // ask, and the second is a person's.
+        let live = vec![
+            ask(1),
+            event_at(
+                EventKind::CheckpointAnswered,
+                2,
+                lead,
+                serde_json::json!({"answer": "go", "amendment": null}),
+            ),
+            ask(3),
+        ];
+        // What the log holds while the second ask is live: nothing after it.
+        let in_log = live.clone();
+        // The read itself, on the same three events: the answer belongs to
+        // the first ask, so the second is open.
+        assert!(
+            !answered(&in_log, "decide"),
+            "an answer to the earlier ask does not answer the later one"
+        );
+        let notices: Vec<Notice> = live
+            .into_iter()
+            .map(|event| Notice::Event {
+                thread: lead,
+                event,
+            })
+            .collect();
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let mut opens = 0;
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let Ok(frame) = aigentic_api::decode(&line) else {
+                    break;
+                };
+                let id = frame.id.unwrap_or(0);
+                let Body::Request(request) = frame.body else {
+                    break;
+                };
+                let response = match request {
+                    Request::Hello { .. } => {
+                        for notice in &notices {
+                            let frame = Frame::notice(notice.clone());
+                            write
+                                .write_all(format!("{}\n", encode(&frame)).as_bytes())
+                                .await
+                                .unwrap();
+                        }
+                        Response::Welcome(Welcome {
+                            user: "steve".into(),
+                            projects: Vec::new(),
+                            server: "fake".into(),
+                        })
+                    }
+                    Request::Build { .. } => Response::Run {
+                        lead,
+                        resumed: true,
+                    },
+                    Request::Open { .. } => {
+                        opens += 1;
+                        Response::Opened {
+                            state: ThreadState::Idle,
+                            // The run starts with nothing behind it: what
+                            // the command knows of the asks comes live.
+                            events: if opens > 1 {
+                                in_log.clone()
+                            } else {
+                                Vec::new()
+                            },
+                            run: None,
+                            mode: "manual".into(),
+                            profile: None,
+                            model: "unknown".into(),
+                            effort: None,
+                        }
+                    }
+                    other => panic!("the command answered a checkpoint: {other:?}"),
+                };
+                let line = format!("{}\n", encode(&Frame::response(id, response)));
+                write.write_all(line.as_bytes()).await.unwrap();
+            }
+        });
+
+        let (client, _) = Client::connect(&aigentic_api::client::Addr::Unix(socket), "steve")
+            .await
+            .unwrap();
+        let notices = client.take_notices().expect("the notice stream");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run(
+                &client,
+                notices,
+                "p",
+                "steve",
+                &BuildArgs {
+                    issue: 174,
+                    workflow: Some("loop".into()),
+                    json: false,
+                },
+                &mut out,
+                &mut err,
+            ),
+        )
+        .await
+        .expect("the command returns at the second ask rather than waiting")
+        .expect("the command returns at the second ask");
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(
+            outcome.code, EXIT_NEEDS_HUMAN,
+            "the second ask waits for a person: {err}"
+        );
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some("waiting at checkpoint `decide`"),
+            "{err}"
+        );
+        daemon.abort();
     }
 }

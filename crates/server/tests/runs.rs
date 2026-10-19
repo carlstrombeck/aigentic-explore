@@ -3467,3 +3467,136 @@ async fn t19_a_thread_this_lead_does_not_own_is_not_pushed() {
         "the lead's own events are pushed by the run, not by its ticker"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The project's switch on the loop's own answer
+// ---------------------------------------------------------------------------
+
+/// Write a bundled workflow whose only gate is a checkpoint the `check`
+/// step decides: the `decided_by` shape the loop's `decide` gate has, small
+/// enough that no other step runs.
+fn write_decider_workflow(bundled: &Path) {
+    let dir = bundled.join("workflows").join("decider");
+    std::fs::create_dir_all(dir.join("templates")).unwrap();
+    std::fs::write(
+        dir.join("workflow.toml"),
+        "name = \"decider\"\nversion = 1\n\n[budget]\ntrivial = 10.0\nfull = 10.0\nmax_raise = 1.0\n\n\
+[[steps]]\nid = \"check\"\nrole = \"check\"\nprofile = \"flash\"\n\
+template = \"templates/check.md\"\nmarker = \"## Check\"\nnext = \"decide\"\n\n\
+[[steps]]\nid = \"decide\"\nrole = \"person\"\nprofile = \"flash\"\n\
+template = \"templates/decide.md\"\nmarker = \"## Decisions\"\ncheckpoint = true\n\
+decided_by = \"check\"\nnext = \"done\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("templates/check.md"), "read the issue\n").unwrap();
+    std::fs::write(
+        dir.join("templates/decide.md"),
+        "the spec check is on the issue; answer\n",
+    )
+    .unwrap();
+}
+
+/// The project's `[workflow] decide_auto_go` reaches the runner the daemon
+/// builds: the `go` proposal the loop answers by itself waits for a person
+/// when the repository's `aigentic.toml` turns the switch off, and the same
+/// run without that file answers the gate with the runner's own `go`.
+#[tokio::test]
+async fn a_gate_switched_back_to_people_waits_for_one() {
+    /// A check's report: `go`, with nothing left for a person to choose.
+    fn check_proposes_go() -> Value {
+        json!({
+            "status": "done",
+            "body": "## Check\n\nit holds",
+            "decide": {
+                "proposal": "go",
+                "items": [{"item": 1, "kind": "fact", "text": "the spec's line is right"}],
+            },
+        })
+    }
+
+    async fn started(client: &Client) -> Built {
+        match client
+            .request(Request::Build {
+                project: "p".into(),
+                issue: 174,
+                workflow: Some("decider".into()),
+            })
+            .await
+            .unwrap()
+        {
+            Response::Run { lead, resumed } => Built { lead, resumed },
+            other => panic!("a build is answered with a run: {other:?}"),
+        }
+    }
+
+    // Off: the repository says the gate is the person's, so the run waits
+    // at it until somebody answers.
+    let daemon = Daemon::new(
+        Scripts::of([vec![report("c1", check_proposes_go())]]),
+        false,
+    )
+    .await;
+    write_decider_workflow(&daemon.fixture.bundled);
+    std::fs::write(
+        daemon.fixture.repo.join("aigentic.toml"),
+        "[workflow]\ndecide_auto_go = false\n",
+    )
+    .unwrap();
+    let (client, _welcome) = daemon.connect("steve").await;
+    let built = started(&client).await;
+    assert!(
+        daemon
+            .wait_until(|| gate_of(&daemon.lead_events(built.lead)).as_deref() == Some("decide"))
+            .await,
+        "the run waits at the gate; the lead holds {:?}",
+        daemon
+            .lead_events(built.lead)
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !daemon
+            .lead_events(built.lead)
+            .iter()
+            .any(|event| event.kind == EventKind::CheckpointAnswered),
+        "the loop did not answer a gate it was told to leave"
+    );
+    let answered = client
+        .request(Request::AnswerCheckpoint {
+            lead: built.lead,
+            gate: "decide".to_owned(),
+            answer: CheckpointAnswer::Stop,
+            amendment: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(answered, Response::Ok), "{answered:?}");
+    assert_eq!(daemon.wait_finished(built.lead).await, RunOutcome::Stopped);
+
+    // On: the same files without that section answer the gate by
+    // themselves, and the run goes on to its end.
+    let daemon = Daemon::new(
+        Scripts::of([vec![report("c2", check_proposes_go())]]),
+        false,
+    )
+    .await;
+    write_decider_workflow(&daemon.fixture.bundled);
+    let (client, _welcome) = daemon.connect("steve").await;
+    let built = started(&client).await;
+    assert_eq!(
+        daemon.wait_finished(built.lead).await,
+        RunOutcome::Closed,
+        "the loop answered the gate and the run ended"
+    );
+    let answers: Vec<Event> = daemon
+        .lead_events(built.lead)
+        .into_iter()
+        .filter(|event| event.kind == EventKind::CheckpointAnswered)
+        .collect();
+    assert_eq!(answers.len(), 1, "one answer, and no person's");
+    let runner = Author::Agent(aigentic_runtime::aigentic_core::AgentId(
+        aigentic_runtime::runner::RUNNER.into(),
+    ));
+    assert_eq!(answers[0].author, runner, "the runner answered it");
+}

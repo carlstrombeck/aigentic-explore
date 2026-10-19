@@ -1,7 +1,6 @@
 #{{issue}}: {{title}}. The spec and the spec check are on the issue (`## Spec`, `## Spec check`). Read them, then answer:
 {{#proposal}}
 
-The decider, which read the spec and the spec check, proposes:
 {{proposal}}
 
 {{/proposal}}
