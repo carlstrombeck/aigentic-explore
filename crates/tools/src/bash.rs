@@ -110,9 +110,11 @@ impl BashTool {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         group::configure(&mut cmd);
+        // Naming the directory keeps an unreachable working directory from
+        // reading as a broken environment.
         let mut child = cmd
             .spawn()
-            .map_err(|e| ToolError::Execution(format!("spawn bash: {e}")))?;
+            .map_err(|e| ToolError::Execution(format!("spawn bash in {}: {e}", cwd.display())))?;
         let group = group::Group::of(&child);
         // An interrupt drops the call's future mid-run; the group is torn
         // down from `Drop` so it never outlives the call that way either.
@@ -476,6 +478,23 @@ mod tests {
             format!("{}\n", root.path().file_name().unwrap().to_string_lossy()),
             "the next call ran in the root and reported no second fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn bash_error_names_the_directory_when_no_directory_is_usable() {
+        // A root that was never a directory, so the repair has nowhere to go.
+        let gone = {
+            let d = tempfile::tempdir().unwrap();
+            d.path().join("nope")
+        };
+        let t = BashTool::new(Workdir::new(&gone));
+
+        let err = t.call(json!({"command": "echo ok"})).await.unwrap_err();
+        let ToolError::Execution(msg) = err else {
+            panic!("expected an execution error")
+        };
+        assert!(msg.starts_with("spawn bash in "), "{msg}");
+        assert!(msg.contains(&gone.display().to_string()), "{msg}");
     }
 
     #[tokio::test]
