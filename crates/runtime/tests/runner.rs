@@ -16,10 +16,12 @@ use aigentic_log::{
 };
 use aigentic_policy::Policy;
 use aigentic_runtime::runner::{
-    Advanced, FakeForge, FakeInstaller, Forge, GhForge, GitRepo, IssueView, Runner, RunnerError,
-    RunnerHost, WriteGuard,
+    Advanced, FakeForge, FakeInstaller, Forge, GhForge, GitRepo, IssueView, Repo, RepoError,
+    Runner, RunnerError, RunnerHost, WriteGuard,
 };
-use aigentic_runtime::workflow::{LoadedWorkflow, SlotKind, WorkflowFile, WorkflowOrigin};
+use aigentic_runtime::workflow::{
+    LoadedWorkflow, RUNNER_GATES, SlotKind, WorkflowFile, WorkflowOrigin,
+};
 use aigentic_runtime::{Answer, Approver, LENGTH_STOP, MAX_USD, Prices, Runtime};
 use aigentic_runtime::{
     RuntimeError, STEP_REPORTED,
@@ -429,8 +431,9 @@ struct Fixture {
 }
 
 /// The runner a fixture builds, named once so a helper's signature stays
-/// short.
-type TestRunner = Runner<Arc<FakeForge>, FakeHost, GitRepo>;
+/// short. The repository type is a parameter so a test can wrap the real
+/// one and change only the push.
+type TestRunner<R = GitRepo> = Runner<Arc<FakeForge>, FakeHost, R>;
 
 impl Fixture {
     /// A fixture whose children are scripted in the order they start. The
@@ -579,6 +582,12 @@ impl Fixture {
 
     /// A runner over the log as it stands, with the fixture's forge.
     fn runner(&self) -> TestRunner {
+        self.runner_with_repo(GitRepo::new(self.repo.clone()))
+    }
+
+    /// The same, over a repository the test supplies: everything but the
+    /// push behaves as `GitRepo` does.
+    fn runner_with_repo<R: Repo>(&self, repo: R) -> Runner<Arc<FakeForge>, FakeHost, R> {
         let log = ThreadLog::open(self.dir.path(), self.lead).unwrap();
         let host = FakeHost::new(
             self.dir.path().to_path_buf(),
@@ -595,7 +604,7 @@ impl Fixture {
             host,
             Box::new(self.installer.clone()),
             self.workflow.clone(),
-            GitRepo::new(self.repo.clone()),
+            repo,
         )
         .expect("the log is the lead's")
     }
@@ -1049,7 +1058,7 @@ async fn replay(fx: &Fixture, snapshot: &Snapshot) -> (Advanced, TestRunner) {
 /// Drive a runner to its pause, doing the git work a run's middle needs:
 /// once the implementer has reported, the commits its brief named land, so
 /// a rebuilt run's checks read them and not an empty range.
-async fn drive(fx: &Fixture, runner: &mut TestRunner) -> Advanced {
+async fn drive<R: Repo>(fx: &Fixture, runner: &mut TestRunner<R>) -> Advanced {
     let mut committed = false;
     drive_with(fx, runner, || {
         if let Some(child) = fx.implementer_child() {
@@ -1062,7 +1071,11 @@ async fn drive(fx: &Fixture, runner: &mut TestRunner) -> Advanced {
 /// The same, with `between` called after each move: a run whose middle
 /// needs other git work (a wrong subject, an amend) drives itself this
 /// way, so a rebuilt run is caught up the same way the full one was.
-async fn drive_with(_fx: &Fixture, runner: &mut TestRunner, mut between: impl FnMut()) -> Advanced {
+async fn drive_with<R: Repo>(
+    _fx: &Fixture,
+    runner: &mut TestRunner<R>,
+    mut between: impl FnMut(),
+) -> Advanced {
     // The move before this drive (a rebuild's first, say) may have run a
     // child's whole turn, so its git work is due before the next move.
     between();
@@ -3807,6 +3820,273 @@ async fn t7_an_install_that_does_not_name_the_head_escalates() {
     assert!(
         shown.iter().any(|line| line.contains(&head)),
         "and which commit it should have named: {shown:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A push the remote refuses
+// ---------------------------------------------------------------------------
+
+/// A repository whose push races a stranger's: the stranger's commit lands
+/// just before ours is offered, so git refuses it — the remote moving inside
+/// the window the pre-push check cannot see.
+#[derive(Clone)]
+struct RacingRepo<'a> {
+    inner: GitRepo,
+    fx: &'a Fixture,
+    raced: Arc<Mutex<Option<String>>>,
+    pushes: Arc<Mutex<Vec<String>>>,
+}
+
+impl<'a> RacingRepo<'a> {
+    fn new(
+        fx: &'a Fixture,
+        raced: Arc<Mutex<Option<String>>>,
+        pushes: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            inner: GitRepo::new(fx.repo.clone()),
+            fx,
+            raced,
+            pushes,
+        }
+    }
+}
+
+impl Repo for RacingRepo<'_> {
+    fn root(&self) -> &Path {
+        self.inner.root()
+    }
+
+    fn head(&self) -> Result<String, RepoError> {
+        self.inner.head()
+    }
+
+    fn branch(&self) -> Result<String, RepoError> {
+        self.inner.branch()
+    }
+
+    fn remote_head(&self, branch: &str) -> Result<Option<String>, RepoError> {
+        self.inner.remote_head(branch)
+    }
+
+    fn push(&self, branch: &str) -> Result<(), RepoError> {
+        self.pushes.lock().unwrap().push(branch.to_owned());
+        let stranger = self.fx.push_a_stranger();
+        *self.raced.lock().unwrap() = Some(stranger);
+        self.inner.push(branch)
+    }
+}
+
+/// A repository whose push is refused with a message of the test's choosing,
+/// leaving the remote where it stood: the refusal's words and its cause need
+/// not agree.
+#[derive(Clone)]
+struct RefusingRepo {
+    inner: GitRepo,
+    pushes: Arc<Mutex<Vec<String>>>,
+    message: &'static str,
+}
+
+impl Repo for RefusingRepo {
+    fn root(&self) -> &Path {
+        self.inner.root()
+    }
+
+    fn head(&self) -> Result<String, RepoError> {
+        self.inner.head()
+    }
+
+    fn branch(&self) -> Result<String, RepoError> {
+        self.inner.branch()
+    }
+
+    fn remote_head(&self, branch: &str) -> Result<Option<String>, RepoError> {
+        self.inner.remote_head(branch)
+    }
+
+    fn push(&self, branch: &str) -> Result<(), RepoError> {
+        self.pushes.lock().unwrap().push(branch.to_owned());
+        Err(RepoError::Command {
+            args: format!("push origin {branch}"),
+            message: self.message.to_owned(),
+        })
+    }
+}
+
+/// A push refused because the remote moved inside the push ends at the
+/// `push_error` gate: nothing is overwritten, nothing is retried, and a
+/// rebuilt run waits there instead of pushing again.
+#[tokio::test]
+async fn a_push_refused_by_a_moved_remote_asks_with_push_error() {
+    let h = happy_path();
+    let fx = &h.fx;
+    let pushes = Arc::new(Mutex::new(Vec::new()));
+    let raced: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let mut runner = fx.runner_with_repo(RacingRepo::new(fx, raced.clone(), pushes.clone()));
+    let advanced = drive(fx, &mut runner).await;
+
+    let gate = match advanced {
+        Advanced::WaitingHuman { gate } => gate,
+        other => panic!("a refused push asks the person, it does not answer {other:?}"),
+    };
+    assert_eq!(gate, "push_error", "the refusal opens its own gate");
+    assert!(
+        RUNNER_GATES.contains(&gate.as_str()),
+        "and the name is one no configured step may take: {gate}"
+    );
+
+    let stranger = raced.lock().unwrap().clone().expect("the push raced");
+    assert_eq!(
+        fx.remote_head(),
+        stranger,
+        "the remote holds the stranger's commit"
+    );
+    assert_ne!(
+        fx.remote_head(),
+        fx.head(),
+        "and not the step's: nothing was overwritten"
+    );
+
+    let events = fx.lead_events();
+    assert!(
+        pushed_events(&events).is_empty(),
+        "no push of the step's commits was recorded"
+    );
+    assert_eq!(fx.installer.calls(), 0, "nothing is installed");
+    assert_eq!(
+        WriteGuard::holder(&fx.repo),
+        None,
+        "the escalation gave the write lock back"
+    );
+
+    let pushing = fx
+        .workflow
+        .workflow
+        .steps
+        .iter()
+        .find(|step| step.push)
+        .expect("the fixture's workflow has a step that pushes");
+    let shown = gate_shown(&events);
+    assert_eq!(
+        shown.first().map(String::as_str),
+        Some(pushing.id.as_str()),
+        "the gate names the step first: {shown:?}"
+    );
+    let claim = format!(
+        "remote moved during the push: {}..{stranger}",
+        fx.initial_head()
+    );
+    assert!(
+        shown.contains(&claim),
+        "the gate says the remote moved, between the step's start and what it holds now: {shown:?}"
+    );
+    let branch = pushes.lock().unwrap()[0].clone();
+    assert!(
+        shown
+            .iter()
+            .any(|line| line.contains(&format!("git push origin {branch} failed:"))),
+        "and carries git's own words: {shown:?}"
+    );
+
+    // A rebuild over the parked log waits where the run stopped.
+    let snap = snapshot(fx);
+    fx.restore(&snap);
+    let mut rebuilt = fx.runner_with_repo(RacingRepo::new(fx, raced.clone(), pushes.clone()));
+    let again = rebuilt
+        .advance()
+        .await
+        .expect("the rebuilt runner advances");
+    assert_eq!(
+        again,
+        Advanced::WaitingHuman { gate: gate.clone() },
+        "the rebuilt run returns to the gate"
+    );
+    assert_eq!(
+        pushes.lock().unwrap().len(),
+        1,
+        "one push across both runs: the gate has no retry"
+    );
+
+    // The person stops at the gate, and the run ends there rather than
+    // erroring out.
+    let mut log = ThreadLog::open(fx.dir.path(), fx.lead).unwrap();
+    log.append(aigentic_log::NewEvent {
+        kind: EventKind::CheckpointAnswered,
+        author: Author::User(UserId("steve".into())),
+        payload: json!({"answer": "stop", "marks": []}),
+        parent_event: None,
+    })
+    .unwrap();
+    let mut runner = fx.runner_with_repo(RacingRepo::new(fx, raced.clone(), pushes.clone()));
+    let advanced = runner.advance().await.expect("the answer is read");
+    assert_eq!(
+        advanced,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Stopped
+        },
+        "a stop at the gate ends the run"
+    );
+    assert_eq!(
+        run_finished(&fx.lead_events()).outcome,
+        aigentic_log::RunOutcome::Stopped,
+        "and records that end"
+    );
+}
+
+/// The claim comes from the remote's head, not from the words git chose: a
+/// refusal worded like a non-fast-forward rejection, with the remote exactly
+/// where the step started, opens the gate with git's text and no claim — and
+/// still as a question rather than an error out of `advance`.
+#[tokio::test]
+async fn a_refused_push_whose_remote_did_not_move_makes_no_claim() {
+    let h = happy_path();
+    let fx = &h.fx;
+    let pushes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let message = "! [rejected] main -> main (fetch first)";
+    let mut runner = fx.runner_with_repo(RefusingRepo {
+        inner: GitRepo::new(fx.repo.clone()),
+        pushes: pushes.clone(),
+        message,
+    });
+    let advanced = drive(fx, &mut runner).await;
+
+    assert_eq!(
+        advanced,
+        Advanced::WaitingHuman {
+            gate: "push_error".to_owned()
+        },
+        "a refusal with any cause reaches the person as a question"
+    );
+    assert_eq!(pushes.lock().unwrap().len(), 1, "asked once, not retried");
+
+    let events = fx.lead_events();
+    let shown = gate_shown(&events);
+    assert!(
+        !shown.iter().any(|line| line.contains("remote moved")),
+        "the remote did not move, so the gate makes no such claim: {shown:?}"
+    );
+    let branch = pushes.lock().unwrap()[0].clone();
+    assert!(
+        shown
+            .iter()
+            .any(|line| line.contains(&format!("git push origin {branch} failed: {message}"))),
+        "git's own words arrive unchanged: {shown:?}"
+    );
+    assert_eq!(
+        fx.remote_head(),
+        fx.initial_head(),
+        "the remote never moved"
+    );
+    assert!(
+        pushed_events(&events).is_empty(),
+        "no push of the step's commits was recorded"
+    );
+    assert_eq!(fx.installer.calls(), 0, "nothing is installed");
+    assert_eq!(
+        WriteGuard::holder(&fx.repo),
+        None,
+        "the escalation gave the write lock back"
     );
 }
 

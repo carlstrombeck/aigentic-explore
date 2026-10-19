@@ -251,6 +251,7 @@ pub const RUNNER_GATES: &[&str] = &[
     "install_mismatch",
     "no_next_step",
     "no_start_record",
+    "push_error",
     "remote_moved",
     "render_failed",
     "route",

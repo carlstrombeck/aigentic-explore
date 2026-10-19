@@ -1150,7 +1150,29 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                     ],
                 );
             }
-            self.repo.push(&branch)?;
+            match self.repo.push(&branch) {
+                Ok(()) => {}
+                Err(err) => {
+                    // A plain push is refused when the remote has commits we lack.
+                    // The remote's own head says whether it moved, whatever git's
+                    // wording was: "non-fast-forward" and "fetch first" name it
+                    // differently across versions, and a hook or an unreachable
+                    // remote errors with the remote where it stood.
+                    let moved = match self.repo.remote_head(&branch) {
+                        Ok(Some(now)) if now != start.remote && now != head => Some(now),
+                        _ => None,
+                    };
+                    let mut shown = vec![step.id.clone()];
+                    if let Some(now) = moved {
+                        shown.push(format!(
+                            "remote moved during the push: {}..{now}",
+                            start.remote
+                        ));
+                    }
+                    shown.push(err.to_string());
+                    return self.escalate("push_error", shown);
+                }
+            }
         }
         let installed = if step.install {
             let installed = self.installer.install(&self.repo)?;
