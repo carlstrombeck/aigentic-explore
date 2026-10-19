@@ -332,12 +332,24 @@ def rendered(session):
 
 
 def write_dump(dumps, name, session, echo):
-    """Write `<name>.txt` and `<name>.raw`, and print the screen under a marker."""
+    """Write `<name>.txt` and `<name>.raw`, and print the screen under a marker.
+
+    Raises `Failure` when either file cannot be written, so an unwritable `--out`
+    ends the run in one line instead of a traceback. Nothing is printed before
+    both files are out.
+    """
     text = rendered(session)
-    with open(os.path.join(dumps, name + ".txt"), "wb") as handle:
-        handle.write(text.encode("utf-8", "replace"))
-    with open(os.path.join(dumps, name + ".raw"), "wb") as handle:
-        handle.write(bytes(session.raw))
+    for suffix, data in (
+        (".txt", text.encode("utf-8", "replace")),
+        (".raw", bytes(session.raw)),
+    ):
+        try:
+            with open(os.path.join(dumps, name + suffix), "wb") as handle:
+                handle.write(data)
+        except OSError as exc:
+            raise Failure(
+                "cannot write the %s dump into %s: %s" % (name, dumps, exc.strerror)
+            ) from exc
     if echo:
         sys.stdout.write("==== %s ====\n%s" % (name, text))
         sys.stdout.flush()
@@ -468,9 +480,25 @@ def main(argv):
         refuse("--rows must be 5..200, not %d" % args.rows)
     pyte = load_pyte(any(verb in ("wait", "dump") for _, verb, _ in steps))
 
-    link, config_home, data_home, dirs, dumps = make_tree(scratch, config, args.out)
+    if args.out:
+        # Refused before the tree exists, so a `--out` the driver cannot make
+        # leaves nothing behind.
+        try:
+            os.makedirs(args.out, exist_ok=True)
+        except OSError as exc:
+            refuse(
+                "--out must be a directory the driver can make, not %s: %s"
+                % (args.out, exc.strerror)
+            )
+
+    try:
+        link, config_home, data_home, dirs, dumps = make_tree(scratch, config, args.out)
+    except OSError as exc:
+        fail("cannot make the scratch tree under %s: %s" % (scratch, exc.strerror))
+        return 1
     os.makedirs(cwd, exist_ok=True)
     temp = None
+    temp_inside = False
     # Everything created below is removed on the way out, a failure included.
     try:
         temp, temp_inside = child_temp(scratch)
@@ -510,27 +538,42 @@ def main(argv):
         finally:
             os.close(session.fd)
     finally:
+        # A second ^C while the tree is being removed must not strand it.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         if not args.keep:
-            shutil.rmtree(scratch, ignore_errors=True)
-            if temp is not None and not temp_inside:
-                shutil.rmtree(temp, ignore_errors=True)
+            for path in (scratch, None if temp_inside else temp):
+                if path is None:
+                    continue
+                try:
+                    shutil.rmtree(path)
+                except OSError as exc:
+                    sys.stderr.write("%s: cannot remove %s: %s\n" % (PROG, path, exc.strerror))
+                    sys.stderr.flush()
 
 
 def run(session, steps, args, dumps):
-    """Drive the child to the end of the steps and report how it went."""
+    """Drive the child to the end of the steps and report how it went.
+
+    One verdict and one `final` dump, so every way a run can go wrong ends in a
+    single `drive.py: …` line and exit 1.
+    """
+    verdict = None
     try:
         run_steps(session, steps, args.wait, dumps)
     except Failure as failure:
+        verdict = str(failure)
+    if verdict is None:
+        state, code = await_exit(session, args.exit_time)
+        if state == "stalled":
+            verdict = "child did not exit"
+        elif code != 0:
+            verdict = "child %s" % describe(code)
+    try:
         write_dump(dumps, "final", session, False)
-        fail(str(failure))
-        return 1
-    state, code = await_exit(session, args.exit_time)
-    write_dump(dumps, "final", session, False)
-    if state == "stalled":
-        fail("child did not exit")
-        return 1
-    if code != 0:
-        fail("child %s" % describe(code))
+    except Failure as failure:
+        verdict = "%s; %s" % (verdict, failure) if verdict else str(failure)
+    if verdict is not None:
+        fail(verdict)
         return 1
     return 0
 

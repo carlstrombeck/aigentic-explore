@@ -73,6 +73,9 @@ under it makes a 150-byte path. So the child gets `<scratch>/tmp` when a socket
 fits there, and otherwise a directory of its own under `/tmp` (the `tmp=` line
 says which); either is made and deleted by the driver, and `--keep` keeps it.
 
+A directory the driver cannot delete is named on stderr
+(`drive.py: cannot remove <path>: <reason>`) rather than dropped silently.
+
 Three things it never touches:
 
 - **never a real project directory** — `--cwd` must be under `--data`; a cwd in

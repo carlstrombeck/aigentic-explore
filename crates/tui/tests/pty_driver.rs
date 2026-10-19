@@ -601,3 +601,98 @@ fn the_driver_starts_the_tui_and_ends_on_ctrl_d() {
         "the tui started without a terminal error:\n{text}"
     );
 }
+
+#[test]
+fn an_out_that_cannot_be_made_is_refused() {
+    let root = TempDir::new().expect("a temp dir");
+    let config = write_config(root.path());
+    let blocker = root.path().join("notadir");
+    fs::write(&blocker, "").expect("write a file where a directory is needed");
+    let out = blocker.join("out");
+
+    let output = drive(
+        root.path(),
+        &config,
+        "send: exit 0\n",
+        root.path(),
+        &["--bin", SH, "--out", out.to_str().expect("a UTF-8 path")],
+    );
+    refused(&output, out.to_str().expect("a UTF-8 path"));
+}
+
+/// The scratch tree must be made before anything else exists, so a tree it
+/// cannot make is a failed run, not a traceback over a half-made one.
+#[test]
+fn a_data_dir_that_cannot_hold_a_tree_ends_in_one_line() {
+    let root = TempDir::new().expect("a temp dir");
+    let config = write_config(root.path());
+    let blocker = root.path().join("notadir");
+    fs::write(&blocker, "").expect("write a file where a directory is needed");
+    let data = blocker.join("data");
+
+    let output = drive(
+        root.path(),
+        &config,
+        "send: exit 0\n",
+        &data,
+        &["--bin", SH],
+    );
+    assert_eq!(
+        code(&output),
+        1,
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let stderr = stderr(&output);
+    assert_eq!(stderr.lines().count(), 1, "one line says it: {stderr:?}");
+    assert!(
+        stderr.starts_with("drive.py: cannot make the scratch tree under "),
+        "the line says what could not be made: {stderr:?}"
+    );
+    assert!(
+        stderr.contains(data.to_str().expect("a UTF-8 path")),
+        "the line names the --data path: {stderr:?}"
+    );
+    assert!(!stderr.contains("Traceback"), "no traceback: {stderr:?}");
+}
+
+/// An `--out` can be there and still refuse a dump; the run says so on one
+/// line and still removes its tree.
+#[test]
+fn a_dump_that_cannot_be_written_ends_in_one_line() {
+    let root = TempDir::new().expect("a temp dir");
+    let config = write_config(root.path());
+    let out = root.path().join("out");
+    fs::create_dir_all(out.join("final.txt")).expect("make a directory where the dump goes");
+
+    let output = drive(
+        root.path(),
+        &config,
+        "",
+        root.path(),
+        &["--bin", SH, "--", "-c", "exit 0"],
+    );
+    assert_eq!(
+        code(&output),
+        1,
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let stderr = stderr(&output);
+    assert_eq!(stderr.lines().count(), 1, "one line says it: {stderr:?}");
+    assert!(
+        stderr.starts_with("drive.py: cannot write the final dump into "),
+        "the line names the dump and where it was to go: {stderr:?}"
+    );
+    assert!(
+        stderr.contains(out.to_str().expect("a UTF-8 path")),
+        "the line names the --out path: {stderr:?}"
+    );
+    assert!(!stderr.contains("Traceback"), "no traceback: {stderr:?}");
+    assert!(
+        !scratch_of(&output).exists(),
+        "the tree goes even when the dump cannot be written"
+    );
+}
