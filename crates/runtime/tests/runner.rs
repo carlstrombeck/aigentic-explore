@@ -3914,6 +3914,70 @@ impl Repo for RefusingRepo {
     }
 }
 
+/// What the remote answers when the runner re-reads its head after a refused
+/// push, so a test can pin that the re-read is a diagnostic whose own failure
+/// never becomes an error out of `advance`.
+#[derive(Clone, Copy)]
+enum AfterPush {
+    /// The read itself fails, as it does against an unreachable remote.
+    Errors,
+    /// The read works and the remote has no such branch.
+    BranchGone,
+}
+
+/// The words a refused push answers with: git's own, for a push the remote
+/// turned down.
+const PUSH_REFUSED: &str = "! [rejected] main -> main (fetch first)";
+
+/// A repository whose push is refused and whose head then cannot be read in
+/// the way `after` says: the runner's diagnostic re-read fails on its own
+/// account, and the escalation must survive that.
+#[derive(Clone)]
+struct UnreadableAfterPushRepo {
+    inner: GitRepo,
+    pushes: Arc<Mutex<Vec<String>>>,
+    /// Whether the push has been offered, so a head read from then on is the
+    /// diagnostic one.
+    pushed: Arc<Mutex<bool>>,
+    after: AfterPush,
+}
+
+impl Repo for UnreadableAfterPushRepo {
+    fn root(&self) -> &Path {
+        self.inner.root()
+    }
+
+    fn head(&self) -> Result<String, RepoError> {
+        self.inner.head()
+    }
+
+    fn branch(&self) -> Result<String, RepoError> {
+        self.inner.branch()
+    }
+
+    fn remote_head(&self, branch: &str) -> Result<Option<String>, RepoError> {
+        if *self.pushed.lock().unwrap() {
+            return match self.after {
+                AfterPush::Errors => Err(RepoError::Command {
+                    args: format!("ls-remote origin {branch}"),
+                    message: "fatal: could not read from remote repository".into(),
+                }),
+                AfterPush::BranchGone => Ok(None),
+            };
+        }
+        self.inner.remote_head(branch)
+    }
+
+    fn push(&self, branch: &str) -> Result<(), RepoError> {
+        self.pushes.lock().unwrap().push(branch.to_owned());
+        *self.pushed.lock().unwrap() = true;
+        Err(RepoError::Command {
+            args: format!("push origin {branch}"),
+            message: PUSH_REFUSED.into(),
+        })
+    }
+}
+
 /// A push refused because the remote moved inside the push ends at the
 /// `push_error` gate: nothing is overwritten, nothing is retried, and a
 /// rebuilt run waits there instead of pushing again.
@@ -4088,6 +4152,65 @@ async fn a_refused_push_whose_remote_did_not_move_makes_no_claim() {
         None,
         "the escalation gave the write lock back"
     );
+}
+
+/// The re-read after a refused push is a diagnostic, not a step: when it
+/// fails on its own account the push is still a question for the person,
+/// carrying git's words and no claim about the remote, rather than an error
+/// out of `advance`.
+#[tokio::test]
+async fn a_refused_push_whose_diagnostic_read_fails_still_asks() {
+    for after in [AfterPush::Errors, AfterPush::BranchGone] {
+        let h = happy_path();
+        let fx = &h.fx;
+        let pushes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = fx.runner_with_repo(UnreadableAfterPushRepo {
+            inner: GitRepo::new(fx.repo.clone()),
+            pushes: pushes.clone(),
+            pushed: Arc::new(Mutex::new(false)),
+            after,
+        });
+        let advanced = drive(fx, &mut runner).await;
+
+        assert_eq!(
+            advanced,
+            Advanced::WaitingHuman {
+                gate: "push_error".to_owned()
+            },
+            "a refused push reaches the person as a question whatever the re-read answers"
+        );
+        assert_eq!(pushes.lock().unwrap().len(), 1, "asked once, not retried");
+
+        let events = fx.lead_events();
+        let shown = gate_shown(&events);
+        assert!(
+            !shown.iter().any(|line| line.contains("remote moved")),
+            "the re-read said nothing about where the remote stands, so no claim: {shown:?}"
+        );
+        let branch = pushes.lock().unwrap()[0].clone();
+        assert!(
+            shown
+                .iter()
+                .any(|line| line
+                    .contains(&format!("git push origin {branch} failed: {PUSH_REFUSED}"))),
+            "git's own words still arrive: {shown:?}"
+        );
+        assert_eq!(
+            fx.remote_head(),
+            fx.initial_head(),
+            "the remote never moved"
+        );
+        assert!(
+            pushed_events(&events).is_empty(),
+            "no push of the step's commits was recorded"
+        );
+        assert_eq!(fx.installer.calls(), 0, "nothing is installed");
+        assert_eq!(
+            WriteGuard::holder(&fx.repo),
+            None,
+            "the escalation gave the write lock back"
+        );
+    }
 }
 
 /// T8: a gate answered `stop` finishes the run and gives the write lock
