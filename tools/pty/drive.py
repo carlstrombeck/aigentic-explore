@@ -435,6 +435,52 @@ def await_exit(session, limit):
     return "stalled", None
 
 
+def group_alive(pid):
+    """True while the process group led by `pid` still has a member."""
+    try:
+        os.killpg(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def stop(session):
+    """Stop the child and every process it started, before its tree goes.
+
+    A `pty.fork` child is a session leader, so its pid is the id of the group
+    holding everything it started, and that id is the only one signalled here:
+    `getpgid` straight after the fork can report the driver's own group.
+
+    A survivor matters because a tree removed while one is alive comes back:
+    the next `mkdir -p` of a writer recreates it. So the group is drained after
+    the leader is reaped, and a group that will not go is left to the removal's
+    own message.
+    """
+    if session.poll() is None:
+        for number, grace in ((signal.SIGTERM, 1.0), (signal.SIGKILL, 5.0)):
+            for send in (os.killpg, os.kill):
+                try:
+                    send(session.pid, number)
+                except ProcessLookupError:
+                    pass
+            end = time.monotonic() + grace
+            while time.monotonic() < end:
+                if session.poll() is not None:
+                    break
+                session.read(0.02)
+    for _ in range(3):
+        if not group_alive(session.pid):
+            return
+        for number in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(session.pid, number)
+            except ProcessLookupError:
+                return
+            time.sleep(0.2)
+
+
 def main(argv):
     args = parse_args(argv)
 
@@ -536,6 +582,7 @@ def main(argv):
         try:
             return run(session, steps, args, dumps)
         finally:
+            stop(session)
             os.close(session.fd)
     finally:
         # A second ^C while the tree is being removed must not strand it.
@@ -579,4 +626,11 @@ def run(session, steps, args, dumps):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    # Outside `main`, so the finally that stops the child and removes the tree
+    # has already run during the unwind: no dump is written for an interrupt.
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.stderr.write("%s: interrupted\n" % PROG)
+        sys.stderr.flush()
+        sys.exit(1)

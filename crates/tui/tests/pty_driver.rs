@@ -7,7 +7,8 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -19,6 +20,17 @@ const WAIT: &str = "5";
 const EXIT_TIME: &str = "1";
 const MARKER: &str = "pty-driver-marker";
 const CHILD_EXIT: i32 = 3;
+
+/// Long enough for the header to be out and the child to have spawned: the
+/// header takes about 230 ms, and a run signalled before it leaves no
+/// `scratch=` fact to read.
+const SETTLE: Duration = Duration::from_millis(1500);
+/// How long a beat file is watched for a writer that should be gone.
+const BEAT_WINDOW: Duration = Duration::from_millis(300);
+/// The beat file the writer script appends to, in the test's own root.
+const BEATS: &str = "beats";
+/// How many runs in a row the leak check makes.
+const RUNS: usize = 50;
 
 /// The config every run is given. One line, and no `threads_dir`.
 fn write_config(root: &Path) -> PathBuf {
@@ -599,6 +611,169 @@ fn the_driver_starts_the_tui_and_ends_on_ctrl_d() {
     assert!(
         !text.contains("Error:"),
         "the tui started without a terminal error:\n{text}"
+    );
+}
+
+/// Run the driver and signal it while it waits on its child.
+fn drive_signalled(
+    root: &Path,
+    config: &Path,
+    steps: &str,
+    data: &Path,
+    args: &[&str],
+    signal: &str,
+) -> Output {
+    let script = root.join("steps.txt");
+    fs::write(&script, steps).expect("write the steps");
+    let child = driver(&[], root, config, data)
+        .arg("--script")
+        .arg(&script)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("python3 runs tools/pty/drive.py");
+    thread::sleep(SETTLE);
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(child.id().to_string())
+        .status()
+        .expect("kill is on PATH");
+    assert!(status.success(), "kill -{signal} reached the driver");
+    child.wait_with_output().expect("the driver exits")
+}
+
+/// A `drive()` call on a data dir of its own, for the runs a leak shows in.
+fn clean_run(root: &Path, config: &Path, data: &Path) {
+    let output = drive(root, config, "", data, &["--bin", SH, "--", "-c", "exit 0"]);
+    assert_eq!(
+        code(&output),
+        0,
+        "a run that exits 0: stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_eq!(stderr(&output), "", "a clean run says nothing");
+}
+
+#[test]
+fn an_interrupt_ends_with_one_line_and_no_tree() {
+    let root = TempDir::new().expect("a temp dir");
+    let config = write_config(root.path());
+
+    let output = drive_signalled(
+        root.path(),
+        &config,
+        "sleep: 30\n",
+        root.path(),
+        &["--bin", SH, "--", "-c", "sleep 30"],
+        "INT",
+    );
+    assert_eq!(
+        code(&output),
+        1,
+        "an interrupted run exits by itself, not by the signal: {}",
+        stderr(&output)
+    );
+    assert_eq!(
+        stderr(&output),
+        "drive.py: interrupted\n",
+        "one line says it, and there is no traceback"
+    );
+    assert!(
+        !scratch_of(&output).exists(),
+        "the tree goes when the run is interrupted"
+    );
+}
+
+/// A child that leaves a writer behind outlives the child's own exit; the
+/// writer's next `mkdir` would recreate a tree removed before it is stopped.
+#[test]
+fn the_childs_group_is_stopped_before_the_tree_goes() {
+    let root = TempDir::new().expect("a temp dir");
+    let config = write_config(root.path());
+    let writer = root.path().join("writer.sh");
+    fs::write(
+        &writer,
+        // One beat before the fork, so the beat file is non-empty even when the
+        // group is stopped before the loop's first turn.
+        "echo beat >> \"$1\"\n\
+         ( trap \"\" HUP; while :; do mkdir -p \"$XDG_DATA_HOME/aigentic/threads\"; \
+         echo x > \"$XDG_DATA_HOME/aigentic/threads/f$$\"; echo beat >> \"$1\"; \
+         sleep 0.01; done ) &\nexit 0\n",
+    )
+    .expect("write the writer script");
+    let beats = root.path().join(BEATS);
+    fs::write(&beats, "").expect("make the writer's beat file");
+
+    let output = drive(
+        root.path(),
+        &config,
+        "",
+        root.path(),
+        &[
+            "--bin",
+            SH,
+            "--",
+            writer.to_str().expect("a UTF-8 path"),
+            beats.to_str().expect("a UTF-8 path"),
+        ],
+    );
+    assert_eq!(
+        code(&output),
+        0,
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_eq!(
+        stderr(&output),
+        "",
+        "the writer does not make the run complain"
+    );
+    assert!(
+        !scratch_of(&output).exists(),
+        "the tree goes before the writer can recreate it"
+    );
+
+    let first = fs::read(&beats).expect("the writer's beat file").len();
+    assert!(
+        first > 0,
+        "the writer got one beat out before its group was stopped"
+    );
+    thread::sleep(BEAT_WINDOW);
+    let second = fs::read(&beats)
+        .expect("the writer's beat file again")
+        .len();
+    assert_eq!(
+        first, second,
+        "the writer is stopped with the child's group, so it writes nothing more"
+    );
+}
+
+#[test]
+fn fifty_runs_in_a_row_leave_nothing_behind() {
+    let root = TempDir::new().expect("a temp dir");
+    let config = write_config(root.path());
+    let data = root.path().join("data");
+
+    for _ in 0..RUNS {
+        clean_run(root.path(), &config, &data);
+    }
+
+    let leftovers: Vec<PathBuf> = fs::read_dir(&data)
+        .expect("list the data dir the runs used")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("aigentic-pty-"))
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "{RUNS} runs left these behind: {leftovers:?}"
     );
 }
 

@@ -54,7 +54,8 @@ dump says which binary and which screen produced it.
 
 Exit `0`: every step ran and the child exited 0. Exit `1`: a step failed, or the
 child exited non-zero, or it was still alive after `--exit-time` and was
-terminated. Exit `2`: a refusal, one line on stderr.
+terminated, or the run was interrupted (`drive.py: interrupted`). Exit `2`: a
+refusal, one line on stderr.
 
 ## What the scratch tree gives
 
@@ -72,6 +73,10 @@ capped near 103 bytes, and macOS's temp dir is long enough that a scratch tree
 under it makes a 150-byte path. So the child gets `<scratch>/tmp` when a socket
 fits there, and otherwise a directory of its own under `/tmp` (the `tmp=` line
 says which); either is made and deleted by the driver, and `--keep` keeps it.
+
+Before the tree is deleted, the child and everything it started are stopped: a
+`pty.fork` child leads its own process group, and a tree removed under a writer
+the child left in the background comes back with the writer's next `mkdir`.
 
 A directory the driver cannot delete is named on stderr
 (`drive.py: cannot remove <path>: <reason>`) rather than dropped silently.
