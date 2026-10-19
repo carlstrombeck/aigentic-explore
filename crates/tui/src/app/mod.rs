@@ -1028,16 +1028,9 @@ async fn run_shell(
                         let was_armed = armed.take().map(|(a, _)| a);
                         match action {
                             Action::Submit => {
-                                if let Some(text) = composer.take() {
-                                    // The composer clears, so the message
-                                    // itself goes to the transcript here.
-                                    out.cell(Cell::User(text.clone()), true);
-                                    if !text.starts_with('/') {
-                                        last_sent =
-                                            Some(text.trim_start_matches('!').trim().to_owned());
-                                    }
-                                    engine.handle_line(&text, &mut out).await;
-                                }
+                                engine
+                                    .submit_draft(&mut composer, &mut last_sent, &mut out)
+                                    .await;
                             }
                             Action::Newline => composer.newline(),
                             Action::Insert(c) => composer.insert_char(c),

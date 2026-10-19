@@ -26,6 +26,7 @@ use aigentic_runtime::harness_tools::{TaskState, open_checklist};
 use aigentic_runtime::{ASKED_HUMAN, INTERRUPTED, LENGTH_STOP, NOT_RUN_OVER_LIMIT, NOT_RUN_SOLO};
 
 use crate::app::cells::full_command;
+use crate::app::composer::Composer;
 use tokio::sync::mpsc;
 use ulid::Ulid;
 
@@ -450,6 +451,9 @@ pub struct OpenGate {
     /// What a raise would prefill, rounded up to a whole dollar at the
     /// gate that offered it. `None` when the ask named no figure.
     raise_usd: Option<f64>,
+    /// The last line this REPL refused to send as chat at this gate: the
+    /// same line sent again is the person insisting, and goes.
+    refused: Option<String>,
 }
 
 pub struct ClientRepl {
@@ -739,6 +743,71 @@ impl ClientRepl {
         }
     }
 
+    /// Why a line typed now is not chat: a followed run's gate is the
+    /// prompt on screen, and a line it did not answer is not the front
+    /// thread's. The same line sent again is the person insisting, so the
+    /// refusal is remembered on the gate.
+    pub(crate) fn chat_refusal(&mut self, line: &str) -> Option<String> {
+        let typed = line.trim();
+        // The allowance is keyed on the text alone, and a refusal only
+        // ever names a line the gate could not answer, so it is checked
+        // first: nothing else has to expire it.
+        let insisting = self
+            .checkpoint
+            .as_ref()
+            .filter(|open| open.shown)
+            .is_some_and(|open| open.refused.as_deref() == Some(typed));
+        if insisting || self.watch.is_some() || line.starts_with('!') || typed.is_empty() {
+            return None;
+        }
+        let open = self.checkpoint.as_ref().filter(|open| open.shown)?;
+        let command = typed.starts_with('/');
+        if command
+            || self.prompted.is_some()
+            || self.answering().is_some()
+            || (!command
+                && self
+                    .confirm_new
+                    .as_ref()
+                    .is_some_and(|m| m.line(line).is_some()))
+            || open.menu.line(line).is_some()
+        {
+            return None;
+        }
+        let gate = open.gate.clone();
+        if let Some(open) = self.checkpoint.as_mut() {
+            open.refused = Some(typed.to_owned());
+        }
+        Some(format!(
+            "[the {gate} gate is waiting: /answer answers it; send this line again to post it as chat]"
+        ))
+    }
+
+    /// The shell's Submit: the draft goes to the transcript and the engine
+    /// only when the gate on screen lets it through as chat. A refused
+    /// draft stays in the composer, so the next Enter sends the same text.
+    pub(crate) async fn submit_draft(
+        &mut self,
+        composer: &mut Composer,
+        last_sent: &mut Option<String>,
+        out: &mut dyn Printer,
+    ) {
+        let draft = composer.submit_text();
+        if let Some(refusal) = draft.as_deref().and_then(|text| self.chat_refusal(text)) {
+            out.line(&refusal);
+            return;
+        }
+        let Some(text) = composer.take() else {
+            return;
+        };
+        // The composer clears, so the message itself goes to the transcript here.
+        out.cell(Cell::User(text.clone()), true);
+        if !text.starts_with('/') {
+            *last_sent = Some(text.trim_start_matches('!').trim().to_owned());
+        }
+        self.handle_line(&text, out).await;
+    }
+
     pub async fn handle_line(&mut self, line: &str, out: &mut dyn Printer) {
         // Inside a watch the front thread is read-only:
         // `/answer` is the one line the watch needs, and it goes to the
@@ -796,13 +865,7 @@ impl ClientRepl {
         // A figure or an amendment typed for the gate: whichever the
         // pick armed, that is what the line answers. It returns before
         // the menu sees the line, so a figure is never read as a row.
-        let answering = self.checkpoint.as_ref().and_then(|open| {
-            open.raising
-                .then_some(aigentic_api::CheckpointAnswer::Raise)
-                .or(open
-                    .amending
-                    .then_some(aigentic_api::CheckpointAnswer::Amend))
-        });
+        let answering = self.answering();
         if self.prompted.is_none()
             && !line.trim_start().starts_with('/')
             && !line.trim().is_empty()
@@ -824,6 +887,13 @@ impl ClientRepl {
                 .and_then(|open| open.menu.line(line))
         {
             self.apply_checkpoint(keyed, out).await;
+            return;
+        }
+        // The gate on screen owns a line it did not answer: it is not
+        // chat, and printing the hint holds it on the gate rather than
+        // sending it to the front thread.
+        if let Some(hint) = self.chat_refusal(line) {
+            out.line(&hint);
             return;
         }
         // A pending question, request or switch proposal this client
@@ -1292,6 +1362,12 @@ impl ClientRepl {
     }
 
     async fn post(&mut self, text: &str, interrupt: bool, out: &mut dyn Printer) {
+        // The refused line going out is the allowance's only expiry: a
+        // command that sends nothing leaves it in place, and the only
+        // text it ever lets through is the one the gate refused.
+        if let Some(open) = self.checkpoint.as_mut() {
+            open.refused = None;
+        }
         let r = self
             .request(Request::Post {
                 thread: self.thread,
@@ -1583,6 +1659,7 @@ impl ClientRepl {
                         amending: false,
                         raising: false,
                         raise_usd,
+                        refused: None,
                     });
                 }
             }
@@ -1850,6 +1927,20 @@ impl ClientRepl {
     /// Whether a raise is waiting for its figure.
     pub fn raising(&self) -> bool {
         self.checkpoint.as_ref().is_some_and(|open| open.raising)
+    }
+
+    /// The answer an armed gate is waiting for: `Raise` while the raise
+    /// row took the composer, `Amend` while the amendment row did. Both
+    /// arms read a plain line as their own, so a line typed then is the
+    /// figure or the text and never chat.
+    fn answering(&self) -> Option<aigentic_api::CheckpointAnswer> {
+        self.checkpoint.as_ref().and_then(|open| {
+            open.raising
+                .then_some(aigentic_api::CheckpointAnswer::Raise)
+                .or(open
+                    .amending
+                    .then_some(aigentic_api::CheckpointAnswer::Amend))
+        })
     }
 
     /// Drop a raise whose figure the composer no longer holds: nothing is
@@ -8364,6 +8455,357 @@ mod tests {
             out.0.0
         );
         daemon.stop();
+    }
+
+    /// The refusal a gate prints when a line typed at it is not chat, as
+    /// the engine's own wording has it.
+    fn gate_refusal(gate: &str) -> String {
+        format!(
+            "[the {gate} gate is waiting: /answer answers it; send this line again to post it as chat]"
+        )
+    }
+
+    /// A sentence a person might type while a gate waits.
+    const SENTENCE: &str = "the plan looks fine to me";
+
+    /// A REPL following a run whose gate `wait-here` is waiting and
+    /// offers `go`, `amend` and `stop`.
+    async fn at_a_waiting_gate() -> (ClientRepl, Copies, GuardedLead) {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            serde_json::json!({
+                "gate": "wait-here",
+                "shown": ["plan ready"],
+                "options": ["go", "amend", "stop"],
+            }),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        (repl, out, daemon)
+    }
+
+    /// The same, at a gate whose one checkpoint offers only `options`.
+    async fn at_a_gate_offering(options: &[&str]) -> (ClientRepl, Copies, GuardedLead) {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            serde_json::json!({
+                "gate": "wait-here",
+                "shown": ["plan ready"],
+                "options": options,
+            }),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        (repl, out, daemon)
+    }
+
+    /// Reading punctuation through does not widen what a gate offers: a
+    /// word it did not offer is refused, never quietly answered, and the
+    /// word it did offer is answered by the gate rather than sent as chat.
+    #[tokio::test]
+    async fn the_punctuation_the_gate_did_not_offer_does_not_reach_the_thread() {
+        let (mut repl, mut out, daemon) = at_a_gate_offering(&["stop"]).await;
+        let refused = gate_refusal("wait-here");
+        let drawn = out.0.0.len();
+        let before = daemon.requests().len();
+        repl.handle_line("go.", &mut out).await;
+        assert_eq!(
+            out.0.0.last(),
+            Some(&refused),
+            "`go.` is not an answer here: {:#?}",
+            &out.0.0[drawn..]
+        );
+        assert!(repl.menu().is_some(), "the prompt is still up");
+        // `stop.` is the row this gate offers, so the gate answers it and
+        // the thread receives no line at all.
+        repl.handle_line("stop.", &mut out).await;
+        let sent = daemon.requests();
+        assert!(
+            sent[before..]
+                .iter()
+                .all(|request| !matches!(request, Request::Post { .. })),
+            "no line reaches the thread: {:?}",
+            &sent[before..]
+        );
+        daemon.stop();
+    }
+
+    /// A sentence typed at a waiting gate is not chat: the gate prints
+    /// what it needs instead, and nothing reaches the front thread.
+    #[tokio::test]
+    async fn a_sentence_typed_at_a_waiting_gate_is_refused_as_chat() {
+        let (mut repl, mut out, daemon) = at_a_waiting_gate().await;
+        let refused = gate_refusal("wait-here");
+        let drawn = out.0.0.len();
+        let before = daemon.requests().len();
+        repl.handle_line(SENTENCE, &mut out).await;
+        assert_eq!(
+            out.0.0.last(),
+            Some(&refused),
+            "the gate's words: {:#?}",
+            &out.0.0[drawn..]
+        );
+        assert_eq!(daemon.requests().len(), before, "nothing was sent");
+        assert!(repl.menu().is_some(), "the prompt is still up");
+
+        // A bare Enter sends nothing and refuses nothing.
+        let drawn = out.0.0.len();
+        repl.handle_line("", &mut out).await;
+        assert_eq!(out.0.0.len(), drawn, "no further line");
+        assert_eq!(daemon.requests().len(), before, "still nothing sent");
+        assert!(repl.menu().is_some(), "the prompt is still up");
+        daemon.stop();
+    }
+
+    /// The line the gate refused, sent again, goes to the front thread:
+    /// the second send is the person insisting, and it is the only line
+    /// that crosses.
+    #[tokio::test]
+    async fn the_same_line_sent_again_goes_to_the_front_thread() {
+        let (mut repl, mut out, daemon) = at_a_waiting_gate().await;
+        let before = daemon.requests().len();
+        repl.handle_line(SENTENCE, &mut out).await;
+        repl.handle_line(SENTENCE, &mut out).await;
+        let posted = vec![ContentBlock::Text(SENTENCE.to_owned())];
+        assert_one_post(&daemon, before, posted, false);
+        daemon.stop();
+    }
+
+    /// The allowance names one line, the last one refused: a second,
+    /// different sentence is refused on its own account, and only the
+    /// line sent twice in a row goes.
+    #[tokio::test]
+    async fn the_allowance_is_the_line_it_named() {
+        const OTHER: &str = "and the third item can wait";
+        let (mut repl, mut out, daemon) = at_a_waiting_gate().await;
+        let refused = gate_refusal("wait-here");
+        let before = daemon.requests().len();
+        let drawn = out.0.0.len();
+        for (i, line) in [SENTENCE, OTHER].into_iter().enumerate() {
+            repl.handle_line(line, &mut out).await;
+            assert_eq!(
+                out.0.0.last(),
+                Some(&refused),
+                "{line:?} is refused on its own account: {:#?}",
+                &out.0.0[drawn..]
+            );
+            assert_eq!(out.0.0.len(), drawn + i + 1, "one hint for one line");
+        }
+        assert_eq!(daemon.requests().len(), before, "two refusals send nothing");
+        repl.handle_line(OTHER, &mut out).await;
+        let posted = vec![ContentBlock::Text(OTHER.to_owned())];
+        assert_one_post(&daemon, before, posted, false);
+        daemon.stop();
+    }
+
+    /// A line starting `!` is the person interrupting, and the gate does
+    /// not swallow it: that is why the hint points at `/answer` alone and
+    /// not at the whole grammar.
+    #[tokio::test]
+    async fn a_bang_line_still_interrupts_at_a_waiting_gate() {
+        let (mut repl, mut out, daemon) = at_a_waiting_gate().await;
+        let bang = format!("!{SENTENCE}");
+        let drawn = out.0.0.len();
+        let before = daemon.requests().len();
+        repl.handle_line(&bang, &mut out).await;
+        let posted = vec![ContentBlock::Text(SENTENCE.to_owned())];
+        assert_one_post(&daemon, before, posted, true);
+        assert!(
+            !out.0.0[drawn..]
+                .iter()
+                .any(|line| line.contains("gate is waiting")),
+            "the interrupt is not refused: {:#?}",
+            &out.0.0[drawn..]
+        );
+        daemon.stop();
+    }
+
+    /// With no gate waiting the same sentence is chat, first time: the
+    /// guard is scoped to a gate on screen.
+    #[tokio::test]
+    async fn a_line_typed_with_no_gate_waiting_still_posts() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::StepStarted,
+            step_started("implement", 1, Ulid::generate()),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let drawn = out.0.0.len();
+        let before = daemon.requests().len();
+        repl.handle_line(SENTENCE, &mut out).await;
+        let posted = vec![ContentBlock::Text(SENTENCE.to_owned())];
+        assert_one_post(&daemon, before, posted, false);
+        assert!(
+            !out.0.0[drawn..]
+                .iter()
+                .any(|line| line.contains("gate is waiting")),
+            "a lead with no gate says nothing about one: {:#?}",
+            &out.0.0[drawn..]
+        );
+        daemon.stop();
+    }
+
+    /// The shell's half of the rule, driven inside the gate: a refused
+    /// draft draws no transcript row, keeps its place in the composer and
+    /// is sent, expanded, when the same text is sent again.
+    #[tokio::test]
+    async fn the_shells_submit_keeps_a_refused_draft_and_sends_it_on_the_second_enter() {
+        let (mut repl, mut out, daemon) = at_a_waiting_gate().await;
+        let big = "x".repeat(crate::app::composer::LARGE_PASTE_CHARS);
+        let mut composer = Composer::default();
+        composer.insert_str("see: ");
+        composer.paste(&big);
+        let draft = composer.text();
+        assert_eq!(
+            draft,
+            format!(
+                "see: [pasted {} chars #1]",
+                crate::app::composer::LARGE_PASTE_CHARS
+            ),
+            "the composer holds the placeholder"
+        );
+        let refusal = gate_refusal("wait-here");
+        let drawn = out.0.0.len();
+        let before = daemon.requests().len();
+        let mut last_sent = None;
+        repl.submit_draft(&mut composer, &mut last_sent, &mut out)
+            .await;
+        assert_eq!(
+            out.0.0.last(),
+            Some(&refusal),
+            "the gate's words: {:#?}",
+            &out.0.0[drawn..]
+        );
+        assert_eq!(
+            out.0.0.len(),
+            drawn + 1,
+            "one line, and no transcript row for the draft: {:#?}",
+            &out.0.0[drawn..]
+        );
+        assert_eq!(composer.text(), draft, "the draft is kept");
+        assert!(last_sent.is_none(), "nothing was sent to recall");
+        assert_eq!(daemon.requests().len(), before, "nothing was sent");
+
+        // The same text again is the person insisting: it goes, expanded.
+        repl.submit_draft(&mut composer, &mut last_sent, &mut out)
+            .await;
+        assert_eq!(composer.text(), "", "the composer clears");
+        let sent = format!("see: {big}");
+        assert_eq!(last_sent.as_deref(), Some(sent.as_str()));
+        let posted = vec![ContentBlock::Text(sent)];
+        assert_one_post(&daemon, before, posted, false);
+        daemon.stop();
+    }
+
+    /// Every line the ladder answers before chat is never refused, and
+    /// the arm that owns the line keeps it — the shell never prints a
+    /// gate's hint over another prompt's words.
+    #[tokio::test]
+    async fn a_line_the_gate_answers_is_never_refused() {
+        let (mut repl, _out, daemon) = at_a_waiting_gate().await;
+        let before = daemon.requests().len();
+        // The gate's own picker answers these.
+        for line in [
+            "1",
+            "go",
+            "go.",
+            "Go.",
+            "stop",
+            "amend: use the third option",
+        ] {
+            assert_eq!(repl.chat_refusal(line), None, "{line:?} is an answer");
+        }
+        // The ladder handles these before chat: the interrupt, `/answer`,
+        // a command that sends nothing, a bare Enter, whitespace.
+        for line in ["!stop it", "/answer go", "/help", "", "   "] {
+            assert_eq!(repl.chat_refusal(line), None, "{line:?} is the ladder's");
+        }
+        assert_eq!(daemon.requests().len(), before, "none of them sent chat");
+
+        // Each prompt below owns the next line, so a sentence is theirs.
+        repl.prompted = Some("c1".to_owned());
+        assert_eq!(
+            repl.chat_refusal(SENTENCE),
+            None,
+            "the chat's prompt owns the line"
+        );
+        repl.prompted = None;
+
+        repl.confirm_new = Some(Menu::new_thread());
+        assert_eq!(
+            repl.chat_refusal("y"),
+            None,
+            "the /new question owns the line"
+        );
+        repl.confirm_new = None;
+
+        assert_eq!(
+            repl.chat_refusal(SENTENCE),
+            Some(gate_refusal("wait-here")),
+            "a plain sentence at the gate is the one refused"
+        );
+        daemon.stop();
+
+        // A gate armed by the amendment row keeps the line as its text.
+        let (mut armed, mut out, daemon) = at_a_waiting_gate().await;
+        armed.start_amending(&mut out);
+        assert!(armed.answering().is_some(), "the gate is armed");
+        assert_eq!(
+            armed.chat_refusal(SENTENCE),
+            None,
+            "an armed amendment owns the line"
+        );
+        daemon.stop();
+
+        // A watch's child owns the line, and its words stand.
+        const ISSUE: u64 = 140;
+        let lead_id = Ulid::generate();
+        let spec = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, spec),
+            ),
+        ];
+        let mut lead =
+            Lead::watching(lead_id, backlog, ISSUE, vec![(spec, child_backlog(spec))]).await;
+        lead.line(&format!("/watch {ISSUE} spec")).await;
+        assert_eq!(
+            lead.repl.chat_refusal(SENTENCE),
+            None,
+            "the step being followed owns the line"
+        );
+    }
+
+    /// The requests the daemon saw after `from` are one `Post` of exactly
+    /// `blocks`, interrupting or not — the lone line a gate let through.
+    fn assert_one_post(
+        daemon: &GuardedLead,
+        from: usize,
+        blocks: Vec<ContentBlock>,
+        interrupt: bool,
+    ) {
+        let sent = daemon.requests();
+        assert!(
+            matches!(
+                &sent[from..],
+                [Request::Post { blocks: post, interrupt: posting, .. }]
+                    if *post == blocks && *posting == interrupt
+            ),
+            "one post of {blocks:?}, interrupt {interrupt}: {sent:?}"
+        );
     }
 
     /// `/build 58` sends the project and the issue, then opens the
