@@ -1672,7 +1672,8 @@ impl ClientRepl {
             return;
         }
         let (word, rest) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
-        let (answer, amendment) = match (word, rest.trim()) {
+        let (answer, amendment) = match (crate::app::menu::answer_word(word).as_str(), rest.trim())
+        {
             ("go", "") => (aigentic_api::CheckpointAnswer::Go, None),
             ("retry", "") => (aigentic_api::CheckpointAnswer::Retry, None),
             ("stop", "") => (aigentic_api::CheckpointAnswer::Stop, None),
@@ -8321,6 +8322,46 @@ mod tests {
             ),
             "{:?}",
             daemon.requests()
+        );
+        daemon.stop();
+    }
+
+    /// `/answer` reads a word the way the gate's picker does, so the
+    /// `/answer Go.` a person writes answers `Go` instead of printing the
+    /// usage line at a gate that is waiting.
+    #[tokio::test]
+    async fn answer_go_reads_the_punctuation_a_person_types() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            serde_json::json!({
+                "gate": "wait-here",
+                "shown": ["plan ready"],
+                "options": ["go", "amend", "stop"],
+            }),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let before = daemon.requests().len();
+        repl.handle_line("/answer Go.", &mut out).await;
+        assert!(
+            matches!(
+                daemon.requests()[before..],
+                [Request::AnswerCheckpoint {
+                    answer: aigentic_api::CheckpointAnswer::Go,
+                    amendment: None,
+                    ..
+                }]
+            ),
+            "{:?}",
+            daemon.requests()
+        );
+        assert!(
+            !out.0.0.iter().any(|line| line.contains("usage:")),
+            "the word was read, not refused: {:#?}",
+            out.0.0
         );
         daemon.stop();
     }

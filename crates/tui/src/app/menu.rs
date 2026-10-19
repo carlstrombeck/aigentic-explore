@@ -12,6 +12,15 @@ use ulid::Ulid;
 
 use crate::app::commands::truncate_for_display;
 
+/// A picker word as a person writes it: `go`, `Go`, `go.`, `amend:`.
+/// Only the word's own trailing punctuation goes, so `amend: use
+/// option 3` keeps its text.
+pub(crate) fn answer_word(word: &str) -> String {
+    word.trim()
+        .trim_end_matches(['.', ',', ';', ':', '!', '?'])
+        .to_ascii_lowercase()
+}
+
 /// What picking a row does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pick {
@@ -770,7 +779,8 @@ impl Menu {
         let (word, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
         let rest = rest.trim();
         let offers = |pick: &Pick| self.rows.iter().any(|row| &row.pick == pick);
-        match (word.to_ascii_lowercase().as_str(), rest.is_empty()) {
+        let word = answer_word(word);
+        match (word.as_str(), rest.is_empty()) {
             (digits, true) if digits.parse::<usize>().is_ok() => {
                 let n: usize = digits.parse().ok()?;
                 (n >= 1 && n <= self.rows.len()).then(|| self.pick(n - 1))
@@ -1796,5 +1806,63 @@ mod tests {
         ] {
             assert_eq!(menu.line(line), None, "{line:?} is not an answer");
         }
+    }
+
+    /// The gate is answered by a person, and a person writes `go.` with
+    /// the full stop that ends a sentence. A word the gate offers, typed
+    /// with its own punctuation, is still that word.
+    #[test]
+    fn a_picker_word_reads_through_the_punctuation_people_type() {
+        let options: Vec<String> = ["go", "amend", "stop"]
+            .iter()
+            .map(|word| word.to_string())
+            .collect();
+        let menu = Menu::checkpoint("decide", &[], &options, None);
+        for (typed, pick) in [
+            ("go.", Pick::ContinueRun),
+            ("Go.", Pick::ContinueRun),
+            ("Stop.", Pick::StopRun),
+        ] {
+            assert_eq!(
+                menu.checkpoint_line(typed),
+                Some(menu.pick_of(&pick)),
+                "{typed:?} picks {pick:?}"
+            );
+        }
+        // The rows are what answered, not the label typed: `1.` reaches
+        // the first row.
+        assert_eq!(
+            menu.checkpoint_line("1."),
+            Some(menu.pick_of(&Pick::ContinueRun))
+        );
+    }
+
+    /// Only the word's own punctuation goes. An amendment's text is the
+    /// person's, punctuation and all, and punctuation tolerance never
+    /// widens which picks a gate offers.
+    #[test]
+    fn an_amendment_with_a_colon_is_still_an_amendment() {
+        let options: Vec<String> = ["go", "amend", "stop"]
+            .iter()
+            .map(|word| word.to_string())
+            .collect();
+        let menu = Menu::checkpoint("decide", &[], &options, None);
+        let picked = menu
+            .checkpoint_line("amend: use the third option")
+            .expect("an amendment");
+        match picked {
+            Keyed::Decide {
+                pick: Pick::AmendRun,
+                reason: Some(text),
+                ..
+            } => assert_eq!(text, "use the third option"),
+            other => panic!("{other:?} is not an amendment"),
+        }
+        // A picker word with text after it is not an answer.
+        assert_eq!(menu.checkpoint_line("go now"), None);
+        // A gate that offers `stop` alone offers no amendment, whatever
+        // the punctuation.
+        let stop_only = Menu::checkpoint("decide", &[], &["stop".to_string()], None);
+        assert_eq!(stop_only.checkpoint_line("amend: x"), None);
     }
 }
