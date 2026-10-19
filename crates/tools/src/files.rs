@@ -3,7 +3,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::truncate::{DEFAULT_OUTPUT_CAP, truncate_output};
-use crate::workdir::Workdir;
+use crate::workdir::{Workdir, with_notice};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -62,7 +62,10 @@ impl Tool for ReadFileTool {
                 ToolError::Execution(format!("{}: not valid UTF-8", path.display()))
             })?;
             Ok(ToolOutput {
-                content: truncate_output(&text, self.output_cap),
+                content: with_notice(
+                    self.workdir.take_notice(),
+                    truncate_output(&text, self.output_cap),
+                ),
                 is_error: false,
             })
         })
@@ -127,13 +130,16 @@ impl Tool for WriteFileTool {
             let shown = path.strip_prefix(self.workdir.current()).unwrap_or(&path);
             let diff = crate::diff::unified(shown, &before, &args.content);
             Ok(ToolOutput {
-                content: truncate_output(
-                    &format!(
-                        "{diff}wrote {} bytes to {}",
-                        args.content.len(),
-                        path.display()
+                content: with_notice(
+                    self.workdir.take_notice(),
+                    truncate_output(
+                        &format!(
+                            "{diff}wrote {} bytes to {}",
+                            args.content.len(),
+                            path.display()
+                        ),
+                        DEFAULT_OUTPUT_CAP,
                     ),
-                    DEFAULT_OUTPUT_CAP,
                 ),
                 is_error: false,
             })
@@ -253,6 +259,66 @@ mod tests {
         let out = read.call(json!({"path": "big.txt"})).await.unwrap();
         assert!(out.content.contains("bytes omitted"));
         assert!(out.content.ends_with("1000\n"));
+    }
+
+    #[tokio::test]
+    async fn read_file_resolves_against_the_root_and_reports_it_once() {
+        let root = tempfile::tempdir().unwrap();
+        let text: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(root.path().join("note.txt"), &text).unwrap();
+        let gone = root.path().join("gone");
+        std::fs::create_dir(&gone).unwrap();
+        let workdir = Workdir::new(root.path());
+        workdir.set(&gone);
+        std::fs::remove_dir_all(&gone).unwrap();
+        let cap = 60;
+        let read = ReadFileTool::new(workdir).with_output_cap(cap);
+
+        let notice = format!(
+            "the working directory {} is gone; ran in {}\n",
+            gone.display(),
+            root.path().display()
+        );
+        let out = read.call(json!({"path": "note.txt"})).await.unwrap();
+        assert_eq!(
+            out.content,
+            format!("{}{}", notice, truncate_output(&text, cap))
+        );
+
+        let out = read.call(json!({"path": "note.txt"})).await.unwrap();
+        assert_eq!(out.content, truncate_output(&text, cap));
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_leaves_the_notice_for_the_next_one() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note.txt"), "one\n").unwrap();
+        let gone = root.path().join("gone");
+        std::fs::create_dir(&gone).unwrap();
+        let workdir = Workdir::new(root.path());
+        workdir.set(&gone);
+        std::fs::remove_dir_all(&gone).unwrap();
+        let read = ReadFileTool::new(workdir);
+
+        let err = read.call(json!({"path": "missing.txt"})).await.unwrap_err();
+        let ToolError::Execution(msg) = err else {
+            panic!("expected an execution error")
+        };
+        assert!(
+            msg.starts_with(&format!("{}: ", root.path().join("missing.txt").display())),
+            "{msg}"
+        );
+
+        let notice = format!(
+            "the working directory {} is gone; ran in {}\n",
+            gone.display(),
+            root.path().display()
+        );
+        let out = read.call(json!({"path": "note.txt"})).await.unwrap();
+        assert_eq!(out.content, format!("{notice}one\n"));
+
+        let out = read.call(json!({"path": "note.txt"})).await.unwrap();
+        assert_eq!(out.content, "one\n");
     }
 
     #[test]

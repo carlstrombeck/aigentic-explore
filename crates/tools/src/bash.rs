@@ -11,7 +11,7 @@ use tokio::process::Command;
 
 use crate::files::parse_args;
 use crate::truncate::{BoundedCapture, DEFAULT_OUTPUT_CAP};
-use crate::workdir::Workdir;
+use crate::workdir::{Workdir, with_notice};
 
 /// Default wall-clock limit for one command.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -83,6 +83,8 @@ impl BashTool {
     }
 
     async fn run(&self, command: &str, timeout: Duration) -> Result<ToolOutput, ToolError> {
+        // A directory that no longer exists is replaced by the root here, and
+        // the line saying so rides on this call's content.
         let cwd = self.workdir.current();
         // The shell reports its final directory so `cd` persists. It writes
         // a temp file in the same directory and renames it over the real
@@ -145,6 +147,9 @@ impl BashTool {
         }
         // This path has torn the group down itself.
         kill_on_drop.disarm();
+        // Taken before the reported `pwd` is stored, so the line names the
+        // directory the command ran in rather than the one it left behind.
+        let notice = self.workdir.take_notice();
 
         if !timed_out && let Ok(reported) = std::fs::read_to_string(&cwd_file) {
             let reported = reported.trim_end();
@@ -185,6 +190,7 @@ impl BashTool {
                 true
             }
         };
+        content = with_notice(notice, content);
         Ok(ToolOutput { content, is_error })
     }
 }
@@ -431,6 +437,45 @@ mod tests {
         let out = t.call(json!({"command": "cd /tmp && true"})).await.unwrap();
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(canon(workdir.current()), canon("/tmp"));
+    }
+
+    #[tokio::test]
+    async fn bash_runs_in_the_root_when_its_directory_was_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let workdir = Workdir::new(root.path());
+        let t = BashTool::new(workdir.clone());
+
+        t.call(json!({"command": "cd work"})).await.unwrap();
+        assert_eq!(canon(workdir.current()), canon(&work));
+
+        // The path the repair reports as gone, exactly as bash stored it.
+        let stored = workdir.current();
+        std::fs::remove_dir_all(&work).unwrap();
+
+        let out = t.call(json!({"command": "echo ok"})).await.unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            out.content,
+            format!(
+                "the working directory {} is gone; ran in {}\nok\n",
+                stored.display(),
+                root.path().display()
+            ),
+            "both halves are the stored paths, not canonical ones"
+        );
+        assert_eq!(canon(workdir.current()), canon(root.path()));
+
+        let out = t
+            .call(json!({"command": "printf '%s\\n' \"${PWD##*/}\""}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.content,
+            format!("{}\n", root.path().file_name().unwrap().to_string_lossy()),
+            "the next call ran in the root and reported no second fallback"
+        );
     }
 
     #[tokio::test]

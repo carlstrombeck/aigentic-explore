@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::files::parse_args;
 use crate::truncate::{DEFAULT_OUTPUT_CAP, truncate_output};
-use crate::workdir::Workdir;
+use crate::workdir::{Workdir, with_notice};
 
 /// Default cap on `grep` matches, before the byte cap applies.
 pub const DEFAULT_GREP_MATCHES: usize = 200;
@@ -87,7 +87,10 @@ impl Tool for ListDirTool {
                 lines.join("\n") + "\n"
             };
             Ok(ToolOutput {
-                content: truncate_output(&text, self.output_cap),
+                content: with_notice(
+                    self.workdir.take_notice(),
+                    truncate_output(&text, self.output_cap),
+                ),
                 is_error: false,
             })
         })
@@ -171,7 +174,7 @@ impl Tool for GrepTool {
                     .await
                     .map_err(|e| ToolError::Execution(format!("grep task failed: {e}")))??;
             Ok(ToolOutput {
-                content: truncate_output(&text, cap),
+                content: with_notice(self.workdir.take_notice(), truncate_output(&text, cap)),
                 is_error: false,
             })
         })
@@ -335,9 +338,12 @@ impl Tool for EditFileTool {
             let shown = path.strip_prefix(self.workdir.current()).unwrap_or(&path);
             let diff = crate::diff::unified(shown, &text, &edited);
             Ok(ToolOutput {
-                content: truncate_output(
-                    &format!("{diff}edited {} at line {line}", path.display()),
-                    DEFAULT_OUTPUT_CAP,
+                content: with_notice(
+                    self.workdir.take_notice(),
+                    truncate_output(
+                        &format!("{diff}edited {} at line {line}", path.display()),
+                        DEFAULT_OUTPUT_CAP,
+                    ),
                 ),
                 is_error: false,
             })
