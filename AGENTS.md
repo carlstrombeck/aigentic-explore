@@ -88,7 +88,9 @@ cargo test
 - Every tool caps what it returns, keeping the head and the tail of long
   output and stating how many bytes were omitted.
 - The working directory is shared by the built-in tools and persists across
-  bash calls; a `cd` in a call that times out is discarded.
+  bash calls; a `cd` in a call that times out is discarded. A call whose
+  working directory no longer exists runs in the session's root instead, and
+  its result starts with a line saying so.
 
 ## Configuration and secrets
 
