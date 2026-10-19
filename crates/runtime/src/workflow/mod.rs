@@ -1211,6 +1211,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// A checkpoint's id is the gate it raises, so a step may not take any
+    /// name the runner raises itself. The ids come from the const, so a gate
+    /// added later is covered without an edit, and a name misspelt there is
+    /// caught here.
+    #[test]
+    fn every_runner_gate_name_is_reserved_by_a_checkpoint() {
+        for gate in RUNNER_GATES {
+            let root = temp();
+            let toml = format!(
+                "{HEAD}{}{}",
+                one_slot(),
+                step(
+                    gate,
+                    "templates/b.md",
+                    "checkpoint = true\nnext = \"done\"\n"
+                )
+            );
+            write_folder(
+                &root.path().join("test"),
+                &toml,
+                &[("templates/b.md", "x {{issue}}\n")],
+            );
+            match load(root.path(), "test") {
+                Err(WorkflowError::BadStep { step: id, .. }) => {
+                    assert_eq!(id, *gate, "the refused step is the gate's name");
+                }
+                Err(other) => panic!("{gate} is refused as a bad step, not {other:?}"),
+                Ok(_) => panic!("{gate} is the runner's, so a step may not take it"),
+            }
+            let refused = load(root.path(), "test").unwrap_err().to_string();
+            assert!(
+                refused.contains(gate),
+                "the refusal names the gate: {refused}"
+            );
+        }
+    }
+
     /// A checkpoint with a `next`, and a pushing step with `ci`, load;
     /// `install` defaults to true.
     #[test]
