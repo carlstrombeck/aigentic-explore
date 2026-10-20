@@ -591,6 +591,12 @@ fn e4_edit_table_row_by_row() {
         ("git reflog show HEAD", false),
         ("git reflog --all", false),
         ("git reflog list", false),
+        ("git --no-pager log -5", false),
+        ("git -P diff", false),
+        ("git --no-pager status --short", false),
+        ("git --no-pager grep -n verdict -- crates/", false),
+        ("git --no-pager branch -D topic", true),
+        ("git -c core.pager=sh log -5", true),
         ("git reflog -8 | head -3", false),
         ("git reflog expire --expire=now --all", true),
         ("git reflog delete HEAD@{1}", true),
@@ -656,6 +662,9 @@ fn e4_edit_table_row_by_row() {
         ("git grep -O vim verdict", true),
         ("git grep --textconv -n verdict -- a.bin", true),
         ("git reflog -8", false),
+        ("git --no-pager log -5", false),
+        ("git --no-pager reflog -8", false),
+        ("git --no-pager branch -D topic", true),
         ("git reflog expire --expire=now --all", true),
     ] {
         let mut log = Log::new();
