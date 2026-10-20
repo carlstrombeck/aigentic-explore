@@ -7,11 +7,12 @@ version = 1
 # thread; each report is posted on the issue under the step's marker, and
 # the next step reads the issue.
 
-# What a run of this loop may spend: the figure the runner holds for the
-# run it drives, not a step's. The runner parks at the `budget` gate at 80%
-# of the figure in force before it starts a step or an attempt; a step's
-# turn is capped by its profile's `max_iterations`, `max_tokens` and
-# `max_wall_time` instead.
+# What a run of this loop may spend. The runner parks at the `budget` gate
+# at 80% of the figure in force before it starts a step or an attempt, so
+# this bounds the run. A step that carries a `budget` of its own is held to
+# that figure instead: the turn that crosses it ends, and the next advance
+# parks at `step_stop`. A step with neither is bounded only by its
+# profile's `max_iterations`, `max_tokens` and `max_wall_time`.
 [budget]
 trivial = 10.0
 full = 10.0
@@ -99,6 +100,7 @@ profile = "tensorx"
 template = "templates/speccheck.md"
 marker = "## Spec check"
 wall_secs = 3600
+budget = 3.50
 deny = [
     "git push",
     "git commit",
@@ -120,6 +122,7 @@ profile = "tensorx"
 template = "templates/decider.md"
 marker = "## Decide answer"
 wall_secs = 3600
+budget = 3.50
 deny = [
     "git push",
     "git commit",

@@ -4578,6 +4578,31 @@ fn the_repositorys_loop_workflow_loads() {
     );
 }
 
+/// The loop's two reading steps carry a figure of their own: a check that
+/// runs long costs more than the step that writes the code, so it is held
+/// to a number rather than to the run's room. The figure sits above every
+/// check that has finished and below the one that ran away.
+#[test]
+fn the_loops_checking_steps_carry_their_own_figure() {
+    let loaded = WorkflowFile::load_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.aigentic/workflows/loop"),
+        WorkflowOrigin::Project,
+    )
+    .expect("the loop workflow loads");
+    let figure = 3.5;
+    for id in ["speccheck", "decider"] {
+        let step = loaded.step(id).expect("a checking step");
+        assert_eq!(step.budget, Some(figure), "{id}");
+        assert_eq!(step.profile, "tensorx", "{id}");
+    }
+    for step in &loaded.workflow.steps {
+        if step.id == "speccheck" || step.id == "decider" {
+            continue;
+        }
+        assert_eq!(step.budget, None, "{} carries no figure", step.id);
+    }
+}
+
 /// The loop's `decide.md` renders today's text when there is no proposal,
 /// and the decider's reading when there is one.
 ///
