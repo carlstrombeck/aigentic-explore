@@ -940,6 +940,61 @@ fn git_reflog_writes(args: &[&Word]) -> bool {
         .any(|w| args.iter().any(|a| a.text == *w))
 }
 
+/// Subcommands whose output is a repository token — an object id, or
+/// several — and never a word git reads as an option.
+const GIT_PRINTS_A_TOKEN: &[&str] = &["rev-parse", "rev-list"];
+
+/// Whether a substitution's inner line prints only such a token: one
+/// segment, every word readable, nothing written, and a dash-free
+/// `git rev-parse` or `git rev-list` behind git's global options.
+///
+/// The dash rule is the load-bearing one: git echoes an argument it
+/// cannot resolve to stdout before it fails (`git rev-parse --x` prints
+/// `--x`), so only a dash-free line cannot make one of the two print a
+/// word the outer command would read as an option.
+fn prints_a_token(inner: &str) -> bool {
+    let segs = segments(Scanner::scan(inner));
+    let mut occupied = segs
+        .iter()
+        .filter(|s| !s.words.is_empty() || !s.redirects.is_empty());
+    let Some(seg) = occupied.next() else {
+        return false;
+    };
+    if occupied.next().is_some() {
+        return false;
+    }
+    if seg
+        .words
+        .iter()
+        .any(|w| w.var || !w.subs.is_empty() || w.broken)
+    {
+        return false;
+    }
+    if !seg
+        .redirects
+        .iter()
+        .all(|(kind, target)| writes_nothing(*kind, target))
+    {
+        return false;
+    }
+    let words: Vec<&Word> = seg.words.iter().collect();
+    let aligned = past_git_globals(&words);
+    let words: &[&Word] = aligned.as_deref().unwrap_or(&words);
+    words.first().is_some_and(|head| head.text == "git")
+        && words
+            .get(1)
+            .is_some_and(|sub| GIT_PRINTS_A_TOKEN.contains(&sub.text.as_str()))
+        && !words[2..].iter().any(|w| w.text.starts_with('-'))
+}
+
+/// A redirection that writes nothing: reading a file, sparing a stream
+/// (`/dev/null`), or duplicating a descriptor.
+fn writes_nothing(kind: Redir, target: &Word) -> bool {
+    matches!(kind, Redir::In)
+        || redirect_kind(target) == Kind::Harmless
+        || duplicates_a_descriptor(kind, target)
+}
+
 /// A sed script can write a file or run a command: `w file`, `W file`
 /// and `s/x/y/w file` write; `e cmd` and `s/x/y/e` run a shell
 /// command. Those letters count only at a script boundary — starting
@@ -1045,15 +1100,17 @@ fn flag_sensitive(command: &str, rules: &[&Word]) -> bool {
 /// Whether an allow-listed command has an argument whose text the rules
 /// cannot read, and so may hold one of its writing flags.
 ///
-/// For `git log` and `git show` only a parameter counts: a substitution
-/// there is nearly always a revision (`$(git rev-parse HEAD)`), and
-/// asking on it would make that common form ask. So a substitution that
-/// prints `--textconv` or `--output` runs without asking; its own command
-/// is still classified. Every other command asks on either.
+/// `git log` and `git show` ask on a substitution too: its words land in
+/// the argument list as words, so it may hide `--textconv` or
+/// `--output`. Only a query that can print nothing but a repository token
+/// ([`prints_a_token`]) stays read without asking. `git diff` and the
+/// rest ask on a substitution whatever it prints.
 fn argument_the_rules_cannot_read(command: &str, rules: &[&Word]) -> bool {
     let git_subcommand = rules.get(1).map(|w| w.text.as_str());
     if command == "git" && matches!(git_subcommand, Some("log" | "show")) {
-        return rules.iter().any(|a| a.var);
+        return rules
+            .iter()
+            .any(|a| a.var || a.subs.iter().any(|sub| !prints_a_token(sub)));
     }
     rules.iter().any(|a| a.var || !a.subs.is_empty())
 }
@@ -3048,10 +3105,72 @@ mod tests {
         }
 
         // A parameter may hold a writing flag, so it asks; a substitution
-        // is taken as a revision, so `git log --oneline $(git rev-parse
-        // HEAD)` stays read-only.
+        // is read as a revision only when it prints one, so `git log
+        // --oneline $(git rev-parse HEAD)` stays read-only.
         assert_eq!(scan("git log --oneline \"$opt\"")[0].kind, Kind::Unknown);
         assert_eq!(scan("git show \"$opt\"")[0].kind, Kind::Unknown);
+    }
+
+    #[test]
+    fn git_log_and_show_ask_on_a_substitution_that_may_carry_a_writing_flag() {
+        // A substitution's words land in the argument list as words, so
+        // an inner command whose output the rules cannot read may print
+        // one of the writing flags.
+        assert!(!allows("git log -p $(echo --textconv)"));
+        assert!(!allows("git show $(echo --output=/tmp/x)"));
+        assert!(!allows("git log --oneline $(cat flags)"));
+        assert!(!allows("git log $(some-script)"));
+        assert!(!allows("git log `echo --textconv`"));
+        assert!(!allows("git --no-pager log -p $(echo --textconv)"));
+        assert!(!allows("git log --format=$(echo --textconv)"));
+        assert!(!allows("git log $(echo $(git rev-parse HEAD))"));
+        assert!(!allows("git show $(echo x; echo --output=/tmp/x)"));
+        assert!(!allows("git log -p $(echo --textconv > /tmp/flags)"));
+        assert!(!allows("git log -p $(printf -- '--textconv')"));
+
+        // A dash inside the query over-asks: git echoes an unresolved
+        // argument, and no list of the options that print arbitrary text
+        // is worth keeping.
+        assert!(!allows("git log $(git rev-parse --short HEAD)"));
+        assert!(!allows("git log --oneline $(git rev-list --count a..b)"));
+    }
+
+    #[test]
+    fn git_log_and_show_keep_a_substitution_that_prints_a_revision_read_only() {
+        assert!(allows("git log --oneline $(git rev-parse HEAD)"));
+        assert!(allows("git log --oneline $(git rev-list HEAD)"));
+        assert!(allows("git show $(git rev-parse HEAD)"));
+        assert!(allows(
+            "git show $(git rev-parse HEAD):crates/tui/src/app/engine.rs"
+        ));
+        assert!(allows("git log --oneline `git rev-parse HEAD`"));
+        assert!(allows("git log -p $(git rev-parse HEAD 2>/dev/null)"));
+        assert!(allows("git --no-pager log --oneline $(git rev-parse HEAD)"));
+        assert!(allows("echo \"$(git rev-parse HEAD)\""));
+    }
+
+    #[test]
+    fn git_log_and_show_read_a_flagged_substitution_as_unknown() {
+        let flagged = scan("git log -p $(echo --textconv)");
+        assert_eq!(flagged[0].kind, Kind::Unknown);
+        assert!(!flagged[0].write_from_command);
+
+        // A token printer folds read-only, which never lowers the
+        // segment's own `Harmless`.
+        assert_eq!(
+            scan("git log --oneline $(git rev-parse HEAD)")[0].kind,
+            Kind::Harmless
+        );
+
+        assert_eq!(
+            riskiest("git log -p $(echo --textconv)"),
+            Some("git log -p".to_owned())
+        );
+        assert!(
+            classify("git log -p $(echo --textconv)", &default_bash_allow(), &[])
+                .patterns
+                .is_empty()
+        );
     }
 
     #[test]

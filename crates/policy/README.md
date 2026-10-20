@@ -20,7 +20,9 @@ segment is an allow-list command without its writing flags (`sed -i`,
 `git log --textconv`, `git show --textconv`, `git grep -O`,
 `git grep --textconv`, an
 awk program with `system(` or a redirection, `gh api` without GET),
-`cd`, an assignment, or a substitution that is itself read-only.
+`cd`, an assignment, or a substitution that is itself read-only —
+inside a `git log` or `git show` argument, one that can print only a
+repository token.
 `2>&1`, `>/dev/null` and `2>/dev/null` are harmless; any other `>` or
 `>>` writes. `Policy::configured` maps `[policy]` in `aigentic.toml`:
 `rules` are prepended, `bash_allow` replaces the defaults.
