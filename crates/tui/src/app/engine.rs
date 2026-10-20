@@ -1719,6 +1719,28 @@ impl ClientRepl {
         self.watch.as_ref().map(|watch| watch.inside())
     }
 
+    /// The gate waiting on the person, by the name the run gave it: the
+    /// watched step's own while a watch is open, else this thread's.
+    ///
+    /// This reads the open gate itself, not the prompt a person can see, so
+    /// a gate left waiting, an amendment being typed or a raise pending
+    /// still names itself: the run holds there until a person answers.
+    pub fn gate(&self) -> Option<&str> {
+        // Inside a watch the run's gate is the only one drawn, so the front
+        // thread's own must not name the title.
+        let open = match &self.watch {
+            Some(watch) => watch.child_ref().checkpoint.as_ref(),
+            None => self.checkpoint.as_ref(),
+        };
+        open.map(|open| open.gate.as_str())
+    }
+
+    /// Whether work is under way: a turn of this thread, a run it follows,
+    /// or a step open in a watch.
+    pub fn busy(&self) -> bool {
+        self.turn.is_some() || self.following.is_some() || self.watch.is_some()
+    }
+
     /// The watched run's figures, while a watch is open and the daemon
     /// has pushed a status for its run.
     pub fn watch_figures(&self) -> Option<&str> {
@@ -7139,6 +7161,9 @@ mod tests {
         })
     }
 
+    /// The gate the title tests name.
+    const GATE: &str = "decide";
+
     /// A `run_finished` payload.
     fn run_finished(outcome: aigentic_runtime::aigentic_log::RunOutcome) -> serde_json::Value {
         serde_json::json!({ "outcome": outcome, "cost_usd": 1.5 })
@@ -7706,6 +7731,46 @@ mod tests {
             Some(format!("inside #{ISSUE} spec")),
             "the same gate a second time does not move the watch"
         );
+    }
+
+    /// A watch reads its own step's gate for the title, never the front
+    /// thread's, and the answer that clears it clears the title too.
+    #[tokio::test]
+    async fn the_watched_runs_gate_is_the_title_gate() {
+        const ISSUE: u64 = 140;
+        let lead_id = Ulid::generate();
+        let spec = Ulid::generate();
+        let backlog = vec![
+            run_event(lead_id, 0, EventKind::RunStarted, run_started(ISSUE)),
+            run_event(
+                lead_id,
+                1,
+                EventKind::StepStarted,
+                step_started("spec", 1, spec),
+            ),
+        ];
+        let mut lead =
+            Lead::watching(lead_id, backlog, ISSUE, vec![(spec, child_backlog(spec))]).await;
+        lead.line(&format!("/watch {ISSUE} pin")).await;
+        let asked = run_event(
+            lead_id,
+            2,
+            EventKind::CheckpointAsked,
+            checkpoint_asked(GATE),
+        );
+        lead.push_lead(asked).await;
+        assert_eq!(
+            lead.repl.gate(),
+            Some(GATE),
+            "the run's own gate names the title"
+        );
+        lead.line("/answer go").await;
+        assert_eq!(
+            lead.repl.gate(),
+            None,
+            "the answer cleared the watch's gate"
+        );
+        lead.daemon.stop();
     }
 
     /// another thread's waiting prompt is named, and never moves the
@@ -9256,6 +9321,33 @@ mod tests {
         assert_eq!(used, MenuKey::Used, "Esc is the prompt's");
         assert!(repl.menu().is_none(), "the prompt went");
         assert_eq!(daemon.requests().len(), before, "nothing was sent");
+        daemon.stop();
+    }
+
+    /// A gate left waiting still holds the run, so the terminal title must
+    /// keep naming it: the prompt going away is not the run going on.
+    #[tokio::test]
+    async fn the_gate_left_waiting_is_still_the_title_gate() {
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_asked(GATE),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        assert!(repl.menu().is_some(), "the prompt is up");
+        assert_eq!(repl.gate(), Some(GATE), "the prompt's gate names the title");
+        repl.handle_line("1", &mut out).await;
+        assert!(repl.menu().is_none(), "the prompt went without an answer");
+        assert_eq!(
+            repl.gate(),
+            Some(GATE),
+            "a gate left waiting still holds the run"
+        );
+        repl.handle_line("/answer stop", &mut out).await;
+        assert_eq!(repl.gate(), None, "the answer cleared the gate");
         daemon.stop();
     }
 

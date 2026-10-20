@@ -34,6 +34,11 @@ pub const MIN_ROWS: u16 = 5;
 /// reads) the viewport shows at most; the rest is in the scrollback.
 pub const MAX_ACTIVE_ROWS: usize = 12;
 
+/// The terminal's title stack: push saves the window's title and sets a new
+/// one, pop restores what was there before.
+pub const PUSH_TITLE: &str = "\u{1b}[22;0t";
+pub const POP_TITLE: &str = "\u{1b}[23;0t";
+
 /// The rows the pane needs: what `layout` draws, the active part
 /// capped, plus the blank row that ends the transcript.
 pub fn needed_rows(pane: &Pane<'_>) -> u16 {
@@ -390,6 +395,9 @@ pub struct Shell {
     rows: u16,
     /// The window size the viewport was last fitted to.
     last_size: (u16, u16),
+    /// The title last written to the terminal, so a frame that changes
+    /// nothing writes nothing.
+    title: Option<String>,
 }
 
 impl Shell {
@@ -404,6 +412,11 @@ impl Shell {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )
         .is_ok();
+        // Push the window's title before the viewport draws, so a terminal
+        // that logs it does so on a clean screen. A terminal that refuses
+        // the sequence must not stop the REPL, as the enhancement call
+        // above already allows.
+        let _ = crossterm::execute!(stdout, crossterm::style::Print(PUSH_TITLE));
         let terminal = Terminal::with_options(
             Tracked::new(),
             TerminalOptions {
@@ -416,6 +429,7 @@ impl Shell {
             stopped: false,
             rows: MIN_ROWS,
             last_size: crossterm::terminal::size()?,
+            title: None,
         })
     }
 
@@ -515,6 +529,7 @@ impl Shell {
             stopped: false,
             rows: height,
             last_size: (width, height),
+            title: None,
         }
     }
 
@@ -534,6 +549,7 @@ impl Shell {
             stopped: false,
             rows,
             last_size: (width, height),
+            title: None,
         }
     }
 
@@ -573,6 +589,12 @@ impl Shell {
             return;
         }
         self.stopped = true;
+        // Restore the window's own title first, so what the person had is
+        // back before the transcript's last lines land. A test screen has
+        // no title stack to pop.
+        if matches!(self.terminal.backend().inner, Screen::Terminal(_)) {
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::style::Print(POP_TITLE));
+        }
         let _ = self.terminal.draw(|f| f.render_widget(Blank, f.area()));
         let mut out = std::io::stdout();
         if self.enhanced_keys {
@@ -649,6 +671,25 @@ impl Shell {
         // leaves the terminal holding its output back.
         self.sync(false)?;
         result
+    }
+
+    /// Write `title` as the window's title, and say whether it went out.
+    ///
+    /// A title written on the last frame is not written again: the frame
+    /// block runs several times a second, and a terminal would flicker.
+    /// The write itself goes to a real terminal only, so a test screen
+    /// records the change and emits no escape bytes. An error is the
+    /// write's, which ends the run as a failed frame does.
+    pub fn set_title(&mut self, title: &str) -> std::io::Result<bool> {
+        if self.title.as_deref() == Some(title) {
+            return Ok(false);
+        }
+        self.title = Some(title.to_owned());
+        if matches!(self.terminal.backend().inner, Screen::Terminal(_)) {
+            let mut out = std::io::stdout();
+            crossterm::execute!(out, crossterm::terminal::SetTitle(title))?;
+        }
+        Ok(true)
     }
 
     /// Begin or end a synchronized update on the real terminal; a test
@@ -1328,5 +1369,36 @@ mod tests {
             shell.screen_lines()[usize::from(top_before) - 1],
             "only line"
         );
+    }
+
+    /// The frame block runs several times a second, so a title already on
+    /// the window is not written again.
+    #[test]
+    fn the_title_is_written_only_when_it_changes() {
+        let mut shell = Shell::test_inline(40, 30, MIN_ROWS);
+        assert!(
+            shell.set_title("aigentic").expect("a title"),
+            "the first write"
+        );
+        assert!(
+            !shell.set_title("aigentic").expect("a title"),
+            "no change, no write"
+        );
+        assert!(
+            shell.set_title("✳ aigentic").expect("a title"),
+            "a change writes"
+        );
+        assert!(
+            !shell.set_title("✳ aigentic").expect("a title"),
+            "the change is what was written"
+        );
+    }
+
+    /// The title stack is addressed by these two sequences: a typo leaves a
+    /// person's own window title un-restored.
+    #[test]
+    fn the_title_push_and_pop_are_the_terminal_ones() {
+        assert_eq!(PUSH_TITLE, "\u{1b}[22;0t");
+        assert_eq!(POP_TITLE, "\u{1b}[23;0t");
     }
 }

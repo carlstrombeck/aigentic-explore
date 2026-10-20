@@ -113,6 +113,33 @@ impl Status {
         parts.join(" · ")
     }
 
+    /// The terminal title: the gate waiting on the person, else the work
+    /// under way, else the thread's name. `gate` is the name of a gate the
+    /// run left open; `busy` is work under way on this terminal.
+    ///
+    /// The gate wins over both the work marker and the thread's name,
+    /// because a run parked at one waits until a person looks. Below it the
+    /// app's name stays first and the thread's title, else the project,
+    /// follows, so a tab shows which thread is which; with neither known
+    /// the app's name stands alone rather than trailing a separator. It
+    /// reads no clock: a string that changed every second would flicker in
+    /// a tab list.
+    pub fn title(&self, gate: Option<&str>, busy: bool) -> String {
+        if let Some(gate) = gate {
+            return format!("● {APP} · {gate} · waiting");
+        }
+        let name = match (&self.title, self.project.as_str()) {
+            (Some(title), _) if !title.is_empty() => Some(progress::clip(title, TITLE_CHARS)),
+            (_, project) if !project.is_empty() => Some(progress::clip(project, TITLE_CHARS)),
+            _ => None,
+        };
+        let title = match name {
+            Some(name) => format!("{APP} · {name}"),
+            None => APP.to_owned(),
+        };
+        if busy { format!("✳ {title}") } else { title }
+    }
+
     /// The parts that come from the thread's state.
     pub fn apply_state(&mut self, state: &ThreadState) {
         match state {
@@ -207,6 +234,9 @@ pub struct Figures {
 
 /// How much of the title the footer shows.
 const TITLE_CHARS: usize = 40;
+
+/// The app's own name: the status line's head and the terminal title's.
+const APP: &str = "aigentic";
 
 /// `950`, `4.0k`, `128k`, `1.3M`: a size in decimal thousands — the
 /// one vocabulary for the footer's context and `/cost`'s counts
@@ -343,6 +373,8 @@ mod tests {
 
     const STEP: &str = "spec";
     const GATE: &str = "decide";
+    const THREAD: &str = "Spec for #185";
+    const PROJECT: &str = "vendela";
 
     #[test]
     fn the_segment_reads_the_issues_step_its_figures_and_its_checklist() {
@@ -646,5 +678,81 @@ mod tests {
         s.apply_state(&ThreadState::Idle);
         assert_eq!(s.queued, 0);
         assert_eq!(s.waiting, None);
+    }
+
+    /// A `Status` named by its thread, in its project.
+    fn a_named_thread() -> Status {
+        Status {
+            title: Some(THREAD.into()),
+            project: PROJECT.into(),
+            ..Status::default()
+        }
+    }
+
+    /// A gate is where a run sits idle until someone looks, so it outranks
+    /// both the work marker and the thread's name.
+    #[test]
+    fn the_gate_outranks_a_turn_and_the_thread_name() {
+        assert_eq!(
+            a_named_thread().title(Some(GATE), true),
+            format!("● {APP} · {GATE} · waiting")
+        );
+        assert_eq!(
+            a_named_thread().title(Some(GATE), false),
+            format!("● {APP} · {GATE} · waiting")
+        );
+    }
+
+    /// While a turn runs the marker says so, and the name is the thread's
+    /// title, else its project.
+    #[test]
+    fn the_title_marks_work_and_names_the_thread() {
+        assert_eq!(
+            a_named_thread().title(None, true),
+            format!("✳ {APP} · {THREAD}")
+        );
+        let untitled = Status {
+            project: PROJECT.into(),
+            ..Status::default()
+        };
+        assert_eq!(untitled.title(None, true), format!("✳ {APP} · {PROJECT}"));
+    }
+
+    #[test]
+    fn an_idle_thread_names_the_thread() {
+        assert_eq!(
+            a_named_thread().title(None, false),
+            format!("{APP} · {THREAD}")
+        );
+    }
+
+    /// A long thread name is clipped, so it cannot push the app's name or
+    /// the gate's word out of a tab.
+    #[test]
+    fn the_title_clips_a_long_thread_name() {
+        let long = THREAD.repeat(TITLE_CHARS);
+        let status = Status {
+            title: Some(long.clone()),
+            ..Status::default()
+        };
+        let shown: String = long.chars().take(TITLE_CHARS).collect();
+        assert_eq!(status.title(None, false), format!("{APP} · {shown}…"));
+        assert!(
+            long.chars().count() > TITLE_CHARS,
+            "the name is past the limit it is clipped at"
+        );
+    }
+
+    /// Nothing known: the app's own name, never an empty string and never
+    /// a dangling separator.
+    #[test]
+    fn with_nothing_known_the_title_is_the_app_name() {
+        assert_eq!(Status::default().title(None, false), APP);
+        let blank = Status {
+            title: Some(String::new()),
+            ..Status::default()
+        };
+        assert_eq!(blank.title(None, false), APP);
+        assert_eq!(Status::default().title(None, true), format!("✳ {APP}"));
     }
 }

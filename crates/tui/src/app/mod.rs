@@ -897,6 +897,8 @@ async fn run_shell(
         // grows when it must and shrinks once, when the turn ends.
         held = held_rows(held, needed_rows(&pane), engine.turn().is_some());
         out.shell.frame(&pane, held)?;
+        out.shell
+            .set_title(&status.title(engine.gate(), engine.busy()))?;
         if let Some((title, text)) = out.page.take() {
             let lines = if title == "diff" {
                 diff::lines(&text)
