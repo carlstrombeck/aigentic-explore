@@ -514,8 +514,11 @@ pub fn origin_url(root: &Path) -> Option<String> {
 /// from the environment and handed to the adapter; it never appears in
 /// the report.
 ///
-/// The probe never retries (issue #90): a doctor reports the endpoint as
-/// it is, now, rather than sitting out a retry window before it answers.
+/// The probe never retries: a doctor reports the endpoint as it is, now,
+/// rather than sitting out a retry window before it answers. A `400` or
+/// `422` costs one more one-token request per optional parameter, left
+/// out one at a time, so a refusal that clears names the parameter it
+/// was about instead of leaving the body to be guessed at.
 pub async fn check_probe(name: &str, profile: &Profile) -> Check {
     let check_name = format!("probe {name}");
     let key = match profile.api_key() {
@@ -524,7 +527,7 @@ pub async fn check_probe(name: &str, profile: &Profile) -> Check {
             return Check::skip(&check_name, format!("{} is not set", profile.api_key_env));
         }
     };
-    let provider = profile.build_provider_no_retries(key);
+    let provider = profile.build_provider_no_retries(key.clone());
     let messages = [Message {
         role: Role::User,
         author: Author::User(UserId("doctor".into())),
@@ -536,34 +539,100 @@ pub async fn check_probe(name: &str, profile: &Profile) -> Check {
         max_output_tokens: Some(1),
     };
     let started = Instant::now();
-    let mut stream = provider.complete(&request);
+    match probe_once(&*provider, &request).await {
+        Ok(finish) => {
+            let ms = started.elapsed().as_millis();
+            match finish {
+                Some(reason) => Check::ok(
+                    &check_name,
+                    format!("{} answered in {ms} ms (finish {reason})", profile.model),
+                ),
+                None => Check::fail(
+                    &check_name,
+                    format!(
+                        "{} · stream ended without a done event after {ms} ms",
+                        profile.model
+                    ),
+                ),
+            }
+        }
+        Err(e) => {
+            // A status about the body is worth a comparison; the others
+            // are about the request's credentials, path or rate, which
+            // leaving a parameter out cannot clear.
+            let body_status = match &e {
+                ProviderError::Http { status, .. } if matches!(*status, 400 | 422) => Some(*status),
+                _ => None,
+            };
+            if let Some(status) = body_status {
+                for param in optional_params(profile) {
+                    let variant = param.without.build_provider_no_retries(key.clone());
+                    let asked = Instant::now();
+                    if let Ok(Some(reason)) = probe_once(&*variant, &request).await {
+                        let ms = asked.elapsed().as_millis();
+                        return Check::fail(
+                            &check_name,
+                            format!(
+                                "{} · http {status} when it sends `{}` = {}; without it the \
+                                 endpoint answered in {ms} ms (finish {reason})",
+                                profile.model, param.name, param.value
+                            ),
+                        );
+                    }
+                }
+            }
+            if let Some(note) = warn_note(profile, &e) {
+                return Check::new(&check_name, Status::Warn, note);
+            }
+            Check::fail(&check_name, format!("{} · {e}", profile.model))
+        }
+    }
+}
+
+/// One optional parameter a probe can leave out, and the profile that
+/// leaves it out: `name` is the field's path in the request body and
+/// `value` what the profile sends there.
+struct ProbeParam {
+    name: String,
+    value: String,
+    without: Profile,
+}
+
+/// The parameters `--probe` can drop to find out which one a refused
+/// request was about. Today one: the effort, under the param name the
+/// profile chooses. A profile with no effort has none, which leaves its
+/// `4xx` reported as it always is.
+fn optional_params(profile: &Profile) -> Vec<ProbeParam> {
+    let (Some(name), Some(value)) = (profile.effort_param(), profile.effort_label()) else {
+        return Vec::new();
+    };
+    let mut without = profile.clone();
+    without.reasoning_effort = None;
+    without.reasoning_effort_param = None;
+    vec![ProbeParam {
+        name: name.to_owned(),
+        value,
+        without,
+    }]
+}
+
+/// One probe request: the finish reason when the endpoint completed an
+/// answer, `None` when the stream ended without a done event, and the
+/// adapter's failure when the call failed.
+async fn probe_once(
+    provider: &dyn Provider,
+    request: &CompletionRequest<'_>,
+) -> Result<Option<String>, ProviderError> {
+    let mut stream = provider.complete(request);
     let mut finish = None;
     while let Some(event) = stream.next().await {
         match event {
             ProviderEvent::Done { finish_reason } => finish = Some(finish_reason),
-            ProviderEvent::Error(e) => {
-                if let Some(note) = warn_note(profile, &e) {
-                    return Check::new(&check_name, Status::Warn, note);
-                }
-                return Check::fail(&check_name, format!("{} · {e}", profile.model));
-            }
+            ProviderEvent::Error(e) => return Err(e),
             _ => {}
         }
     }
-    let ms = started.elapsed().as_millis();
-    match finish {
-        Some(reason) => Check::ok(
-            &check_name,
-            format!("{} answered in {ms} ms (finish {reason})", profile.model),
-        ),
-        None => Check::fail(
-            &check_name,
-            format!(
-                "{} · stream ended without a done event after {ms} ms",
-                profile.model
-            ),
-        ),
-    }
+    Ok(finish)
 }
 
 /// Issue #44: an endpoint that rejects the configured effort still
@@ -725,7 +794,7 @@ pub async fn compare_efforts(
 const PROMPT: &str = "Name the capital of France in one word. Answer with the word only.";
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use aigentic_runtime::aigentic_core::Capabilities;
     use aigentic_server::awake::detect_with;
@@ -780,7 +849,7 @@ mod tests {
     /// A `400` is not retried (`retryable` excludes it), so one
     /// connection is one call; the loop still accepts more than one so a
     /// test that expects a retry cannot hang the stub thread.
-    fn stub_endpoint(
+    pub(crate) fn stub_endpoint(
         status: u16,
         body: &'static str,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
@@ -808,6 +877,62 @@ mod tests {
                         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
                          content-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (format!("http://{addr}/v1"), seen)
+    }
+
+    /// The streamed answer `openai_compat` reads as a finished reply: one
+    /// text delta with its reason, then the end marker.
+    const ANSWERED_SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\
+        \"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+
+    /// A stub endpoint that refuses one request shape and answers any
+    /// other: a request whose body carries `rejected` is answered
+    /// `status`, everything else `200` with a streamed reply. Every
+    /// connection carrying the same body is refused, so a probe that
+    /// re-sent the parameter it had dropped is refused again rather than
+    /// passing by accident. Returns the base URL and the shared request
+    /// slot.
+    pub(crate) fn stub_rejecting(
+        rejected: &'static str,
+        status: u16,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { break };
+                let mut buf = [0u8; 65536];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let asked = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                let refused = asked.contains(rejected);
+                recorded.lock().unwrap().push(request);
+                let (status, answer) = if refused {
+                    let message =
+                        format!(r#"{{"error":{{"message":"unknown field: {rejected}"}}}}"#);
+                    (status, message)
+                } else {
+                    (200, ANSWERED_SSE.to_owned())
+                };
+                let reason = match status {
+                    400 => "Bad Request",
+                    401 => "Unauthorized",
+                    422 => "Unprocessable Entity",
+                    _ => "OK",
+                };
+                let _ = conn.write_all(
+                    format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{answer}",
+                        answer.len()
                     )
                     .as_bytes(),
                 );
@@ -1275,13 +1400,196 @@ mod tests {
         assert!(c.message.contains("AIGENTIC_DOCTOR_TEST_KEY"));
     }
 
-    /// Issue #44, T12 (amendment 1.3): a stub endpoint answers `400` with
-    /// a body naming the configured param, and `check_probe` reports
-    /// `Status::Warn` — the profile still runs at the provider's
-    /// default. The fixture sets `api_key_env = "PATH"`, which is set in
-    /// any process, so the probe reaches the stub instead of skipping;
-    /// the note names the param and never the response body, so no
-    /// request or secret can leak through it.
+    /// The table the subtraction walks: one entry, the effort, named by
+    /// the path it takes in the body, and a variant that keeps the
+    /// provider, URL and model so the two requests differ only in that
+    /// field. A profile the field cannot apply to has no entry.
+    #[test]
+    fn the_effort_is_the_only_optional_param_a_probe_can_drop() {
+        let labelled = Config::parse(
+            "[profiles.a]\nbase_url = \"http://127.0.0.1:1/v1\"\nmodel = \"m\"\n\
+             api_key_env = \"PATH\"\nreasoning_effort = \"medium\"\n",
+        )
+        .unwrap();
+        let labelled = labelled.profiles["a"].clone();
+        let params = optional_params(&labelled);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, labelled.effort_param().unwrap());
+        assert_eq!(params[0].value, labelled.effort_label().unwrap());
+        assert!(params[0].without.effort_param().is_none());
+        assert_eq!(params[0].without.provider, labelled.provider);
+        assert_eq!(params[0].without.base_url, labelled.base_url);
+        assert_eq!(params[0].without.model, labelled.model);
+
+        // A dotted param is the field's path in the body, so it is the
+        // name the endpoint is asked about.
+        let nested = Config::parse(
+            "[profiles.a]\nbase_url = \"http://127.0.0.1:1/v1\"\nmodel = \"m\"\n\
+             api_key_env = \"PATH\"\nreasoning_effort = \"medium\"\n\
+             reasoning_effort_param = \"thinking.effort\"\n",
+        )
+        .unwrap();
+        let nested = nested.profiles["a"].clone();
+        let params = optional_params(&nested);
+        assert_eq!(params.len(), 1);
+        assert_eq!(
+            params[0].name,
+            nested.reasoning_effort_param.clone().unwrap()
+        );
+
+        // Anthropic's effort is a config field with no wire path here, and
+        // a profile with no effort sends no such field at all.
+        let anthropic = Config::parse(
+            "[profiles.a]\nprovider = \"anthropic\"\nmodel = \"m\"\n\
+             api_key_env = \"PATH\"\neffort = \"high\"\n",
+        )
+        .unwrap();
+        let anthropic = anthropic.profiles["a"].clone();
+        assert!(anthropic.effort_label().is_some());
+        assert!(optional_params(&anthropic).is_empty());
+
+        let plain = Config::parse(GOOD).unwrap();
+        assert!(optional_params(&plain.profiles["a"]).is_empty());
+    }
+
+    /// Acceptance 1: an endpoint that refuses a body carrying the effort
+    /// and answers one without it makes the probe name the parameter and
+    /// the value. The message quotes nothing the endpoint said, so it can
+    /// only know the param by having found it by omission.
+    #[tokio::test]
+    async fn a_400_cleared_by_dropping_the_effort_names_it() {
+        const REJECTED: &str = "reasoning_effort";
+        const STATUS: u16 = 400;
+        let (base, seen) = stub_rejecting(REJECTED, STATUS);
+        let config = Config::parse(&format!(
+            "[profiles.a]\nbase_url = \"{base}\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n\
+             reasoning_effort = \"medium\"\n"
+        ))
+        .unwrap();
+        let profile = config.profiles["a"].clone();
+        assert_eq!(profile.effort_param(), Some(REJECTED));
+        let label = profile.effort_label().unwrap();
+
+        let c = check_probe("a", &profile).await;
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains(REJECTED), "{}", c.message);
+        assert!(c.message.contains(&label), "{}", c.message);
+        assert!(
+            c.message.contains(&format!("http {STATUS}")),
+            "{}",
+            c.message
+        );
+        // The note the fall-through writes instead says the profile runs
+        // at the provider default; this message came from the subtraction.
+        assert!(!c.message.contains("provider default"), "{}", c.message);
+        // A fragment only the stub's body carries, so the body cannot be
+        // where the param name came from.
+        assert!(!c.message.contains("unknown field"), "{}", c.message);
+
+        let asked = seen.lock().unwrap();
+        assert_eq!(
+            asked.len(),
+            1 + optional_params(&profile).len(),
+            "{asked:?}"
+        );
+        let second = asked[1].split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(!second.contains(REJECTED), "{second}");
+    }
+
+    /// The same subtraction on `422`, the status a schema-validating
+    /// endpoint uses for a body it will not accept.
+    #[tokio::test]
+    async fn a_422_cleared_by_dropping_the_effort_names_it() {
+        const REJECTED: &str = "reasoning_effort";
+        const STATUS: u16 = 422;
+        let (base, seen) = stub_rejecting(REJECTED, STATUS);
+        let config = Config::parse(&format!(
+            "[profiles.a]\nbase_url = \"{base}\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n\
+             reasoning_effort = \"medium\"\n"
+        ))
+        .unwrap();
+        let profile = config.profiles["a"].clone();
+        assert_eq!(profile.effort_param(), Some(REJECTED));
+        let label = profile.effort_label().unwrap();
+
+        let c = check_probe("a", &profile).await;
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains(REJECTED), "{}", c.message);
+        assert!(c.message.contains(&label), "{}", c.message);
+        assert!(
+            c.message.contains(&format!("http {STATUS}")),
+            "{}",
+            c.message
+        );
+        assert!(!c.message.contains("provider default"), "{}", c.message);
+        assert!(!c.message.contains("unknown field"), "{}", c.message);
+
+        let asked = seen.lock().unwrap();
+        assert_eq!(
+            asked.len(),
+            1 + optional_params(&profile).len(),
+            "{asked:?}"
+        );
+        let second = asked[1].split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(!second.contains(REJECTED), "{second}");
+    }
+
+    /// A status about credentials is not about the body: no parameter is
+    /// left out, so the report is one request and never names the effort.
+    /// The stub's body names no parameter, so the message can only be the
+    /// one the fall-through writes.
+    #[tokio::test]
+    async fn an_unauthorised_probe_is_not_blamed_on_the_effort() {
+        let (base, seen) = stub_endpoint(401, "denied");
+        let config = Config::parse(&format!(
+            "[profiles.a]\nbase_url = \"{base}\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n\
+             reasoning_effort = \"medium\"\n"
+        ))
+        .unwrap();
+        let profile = config.profiles["a"].clone();
+        let param = profile.effort_param().unwrap().to_owned();
+
+        let c = check_probe("a", &profile).await;
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("http 401"), "{}", c.message);
+        assert!(!c.message.contains(&param), "{}", c.message);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// Acceptance 2: an endpoint that answers costs the one request, and
+    /// the effort goes out under its param, so no subtraction runs.
+    #[tokio::test]
+    async fn an_accepted_probe_asks_once_and_carries_the_effort() {
+        let (base, seen) = stub_endpoint(200, ANSWERED_SSE);
+        let config = Config::parse(&format!(
+            "[profiles.a]\nbase_url = \"{base}\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n\
+             reasoning_effort = \"medium\"\n"
+        ))
+        .unwrap();
+        let profile = config.profiles["a"].clone();
+        let field = format!(
+            "\"{}\":\"{}\"",
+            profile.effort_param().unwrap(),
+            profile.effort_label().unwrap()
+        );
+
+        let c = check_probe("a", &profile).await;
+        assert_eq!(c.status, Status::Ok, "{}", c.message);
+
+        let asked = seen.lock().unwrap();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        let body = asked[0].split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(body.contains(&field), "{body}");
+    }
+
+    /// Issue #44, T12 (amendment 1.3): a stub endpoint answers `400` to
+    /// every request, so clearing it is not a matter of leaving a field
+    /// out, and `check_probe` reports `Status::Warn` with the note the
+    /// direct matrix below tests — the profile still runs at the
+    /// provider's default. The fixture sets `api_key_env = "PATH"`,
+    /// which is set in any process, so the probe reaches the stub
+    /// instead of skipping; the note names the param and never the
+    /// response body, so no request or secret can leak through it.
     #[tokio::test]
     async fn a_rejected_reasoning_effort_probe_is_a_warning() {
         let (base, seen) = stub_endpoint(
@@ -1304,12 +1612,19 @@ mod tests {
         // said can reach the report.
         assert!(!c.message.contains("unknown field"), "{}", c.message);
 
-        // The stub saw the effort the profile configured, under the
-        // param the profile named.
+        // The stub refuses every request, so the subtraction ends where
+        // it began: the refusal, then the same request without the
+        // effort, which is refused too.
         let asked = seen.lock().unwrap();
-        assert_eq!(asked.len(), 1, "a 400 is not retried: {asked:?}");
+        assert_eq!(
+            asked.len(),
+            1 + optional_params(&profile).len(),
+            "the refusal, then the subtraction: {asked:?}"
+        );
         let body = asked[0].split("\r\n\r\n").nth(1).unwrap_or_default();
         assert!(body.contains("\"reasoning_effort\":50"), "{body}");
+        let without = asked[1].split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(!without.contains("reasoning_effort"), "{without}");
     }
 
     /// The direct matrix behind the note: only a `400` whose body names

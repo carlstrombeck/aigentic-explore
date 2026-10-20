@@ -342,4 +342,43 @@ mod tests {
             1
         );
     }
+
+    /// One `PATH`-keyed profile with an effort, pointed at `base_url` and
+    /// keeping its threads under `root`, so a probe run reaches the stub
+    /// and writes nothing outside the tempdir.
+    fn probe_config(base_url: &str, root: &Path) -> String {
+        format!(
+            "default_profile = \"a\"\nthreads_dir = {:?}\n\
+             [profiles.a]\nbase_url = \"{base_url}\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n\
+             reasoning_effort = 50\n",
+            root.join("threads").to_string_lossy()
+        )
+    }
+
+    /// Acceptance 1, end to end: an endpoint that refuses the profile's
+    /// effort makes the doctor exit 1, and the same profile against an
+    /// endpoint that answers exits 0, so the 1 came from the probe and
+    /// not from another check.
+    #[tokio::test]
+    async fn a_named_culprit_fails_the_doctor() {
+        use crate::checks::tests::stub_rejecting;
+
+        let (refusing, _) = stub_rejecting("reasoning_effort", 400);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, probe_config(&refusing, dir.path())).unwrap();
+        assert_eq!(run(&path, dir.path(), true, false, None).await.unwrap(), 1);
+
+        // A fragment no request carries, so every request is answered
+        // `200`; the probe still runs and the report passes.
+        let (answering, seen) = stub_rejecting("never_sent_field", 400);
+        let clean = tempfile::tempdir().unwrap();
+        let path = clean.path().join("config.toml");
+        std::fs::write(&path, probe_config(&answering, clean.path())).unwrap();
+        assert_eq!(
+            run(&path, clean.path(), true, false, None).await.unwrap(),
+            0
+        );
+        assert!(!seen.lock().unwrap().is_empty(), "the probe ran");
+    }
 }
