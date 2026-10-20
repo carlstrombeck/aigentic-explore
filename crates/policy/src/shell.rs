@@ -946,7 +946,8 @@ const GIT_PRINTS_A_TOKEN: &[&str] = &["rev-parse", "rev-list"];
 
 /// Whether a substitution's inner line prints only such a token: one
 /// segment, every word readable, nothing written, and a dash-free
-/// `git rev-parse` or `git rev-list` behind git's global options.
+/// `git rev-parse` or `git rev-list` behind git's transparent pager and
+/// pathspec options.
 ///
 /// The dash rule is the load-bearing one: git echoes an argument it
 /// cannot resolve to stdout before it fails (`git rev-parse --x` prints
@@ -3127,6 +3128,16 @@ mod tests {
         assert!(!allows("git show $(echo x; echo --output=/tmp/x)"));
         assert!(!allows("git log -p $(echo --textconv > /tmp/flags)"));
         assert!(!allows("git log -p $(printf -- '--textconv')"));
+
+        // The inner line counts as a token printer only when it is one
+        // segment the rules read in full: a second segment can print a
+        // flag after the token, an unreadable word may hold one, and an
+        // empty line names no command to read.
+        assert!(!allows(
+            "git log --oneline $(git rev-parse HEAD; echo --output=/tmp/x)"
+        ));
+        assert!(!allows("git log $(git rev-parse $flag)"));
+        assert!(!allows("git log $()"));
 
         // A dash inside the query over-asks: git echoes an unresolved
         // argument, and no list of the options that print arbitrary text
