@@ -648,6 +648,88 @@ mod tests {
         assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
     }
 
+    /// A server error reported inside the stream is one steady failure,
+    /// not something to try again: content already reached the person, so
+    /// a second attempt would restart a reply on screen. The status comes
+    /// from the object's own `code`.
+    #[tokio::test]
+    async fn a_streamed_server_error_reaches_the_caller_as_one_transient_failure() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const ERROR_OBJECT: &str = r#"{"error":{"code":"500","message":"An error occurred during generation.","type":"server_error"}}"#;
+        let error_object: serde_json::Value = serde_json::from_str(ERROR_OBJECT).unwrap();
+        let expected_status: u16 = error_object["error"]["code"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let message = error_object["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let hi = json!({"choices": [{"delta": {"content": "hi"}}]});
+        let sse = format!("data: {hi}\n\ndata: {ERROR_OBJECT}\n\n");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+            sse.len()
+        );
+        // Enough connections for the ceiling the policy could allow, so a
+        // regression that retried cannot leave an attempt on a closed
+        // listener; this call uses one.
+        let ceiling = attempts_ceiling(&quick_policy()) as usize + 1;
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for _ in 0..ceiling {
+                let (mut conn, _) = listener.accept().unwrap();
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 65536];
+                let _ = conn.read(&mut buf);
+                conn.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+
+        let config =
+            OpenAiCompatConfig::new(format!("http://{addr}/v1"), "m").with_retry(quick_policy());
+        let provider = OpenAiCompat::new(config);
+        let request = CompletionRequest {
+            messages: &[],
+            tools: &[],
+            max_output_tokens: None,
+        };
+        let events: Vec<ProviderEvent> = provider.complete(&request).collect().await;
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "{events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::Retried { .. })),
+            "{events:?}"
+        );
+        assert!(
+            matches!(events.first(), Some(ProviderEvent::TextDelta(t)) if t == "hi"),
+            "{events:?}"
+        );
+        let errors: Vec<&ProviderError> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::Error(error) => Some(error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors.len(), 1, "{events:?}");
+        let ProviderError::Http { status, body } = errors[0] else {
+            panic!("a streamed server error is the transient class: {events:?}");
+        };
+        assert_eq!(*status, expected_status, "{events:?}");
+        assert!(errors[0].is_transient(), "{events:?}");
+        assert!(body.contains(&message), "{body}");
+    }
+
     /// Issue #90: a server that is down for five requests — more than
     /// the three the adapter used to try — is ridden out, and the reply
     /// arrives. Each retry is reported with the policy's own wait.
