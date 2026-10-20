@@ -158,9 +158,14 @@ impl Translator {
         };
         if let Some(err) = chunk.error {
             self.done = true;
-            return vec![ProviderEvent::Error(ProviderError::Protocol(
-                err.to_string(),
-            ))];
+            let error = match status_of(&err) {
+                Some(status) => ProviderError::Http {
+                    status,
+                    body: err.to_string(),
+                },
+                None => ProviderError::Protocol(err.to_string()),
+            };
+            return vec![ProviderEvent::Error(error)];
         }
 
         let mut out = Vec::new();
@@ -306,6 +311,33 @@ impl Translator {
                 })
             })
             .collect()
+    }
+}
+
+/// The status an in-stream `error` object stands for, or `None` when it
+/// names none that is worth retrying.
+///
+/// A parsed `code` decides, and the `type` table is only a fallback: a
+/// provider sending `code: "404"` beside `type: "server_error"` is
+/// contradicting itself, and retrying its refusal forever would be worse
+/// than trusting the specific field.
+fn status_of(object: &serde_json::Value) -> Option<u16> {
+    let code = match object.get("code") {
+        Some(serde_json::Value::String(text)) => text.trim().parse::<u16>().ok(),
+        Some(serde_json::Value::Number(number)) => {
+            number.as_u64().and_then(|n| u16::try_from(n).ok())
+        }
+        _ => None,
+    };
+    if let Some(code) = code {
+        let transient = code == 429 || (500..600).contains(&code);
+        return transient.then_some(code);
+    }
+    let kind = object.get("type")?.as_str()?.trim().to_ascii_lowercase();
+    match kind.as_str() {
+        "server_error" | "api_error" => Some(500),
+        "overloaded_error" => Some(503),
+        _ => None,
     }
 }
 
@@ -585,12 +617,123 @@ mod tests {
         );
     }
 
+    /// The error one in-stream `error` object comes out as, run through the
+    /// translator the adapter uses for every chunk.
+    fn error_of(object: &serde_json::Value) -> ProviderError {
+        let mut translator = Translator::new();
+        let events = translator.on_data(&json!({ "error": object }).to_string());
+        assert_eq!(events.len(), 1, "{events:?}");
+        match events.into_iter().next().unwrap() {
+            ProviderEvent::Error(error) => error,
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn server_error_object_and_bad_json_become_protocol_errors() {
+    fn a_server_error_object_is_transient_with_its_message_kept() {
+        // The whole payload the provider sent when a step's stream died.
+        let payload = r#"{"error":{"code":"500","message":"An error occurred during generation.","type":"server_error"}}"#;
+        let mut translator = Translator::new();
+        let events = translator.on_data(payload);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let ProviderEvent::Error(error) = &events[0] else {
+            panic!("expected one error, got {events:?}");
+        };
+        let fixture: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let ProviderError::Http { status, body } = error else {
+            panic!("a server error object is the transient class, got {error:?}");
+        };
+        assert_eq!(
+            Some(*status),
+            fixture["error"]["code"].as_str().unwrap().parse().ok(),
+            "{payload}"
+        );
+        assert!(
+            body.contains(fixture["error"]["message"].as_str().unwrap()),
+            "{body}"
+        );
+        assert!(error.is_transient(), "{error:?}");
+    }
+
+    #[test]
+    fn a_code_naming_a_status_decides_the_class() {
+        let transient: [(serde_json::Value, u16); 4] = [
+            (json!({"code": "429"}), 429),
+            (json!({"code": 429}), 429),
+            (json!({"code": "503", "message": "busy"}), 503),
+            (json!({"code": " 529 "}), 529),
+        ];
+        for (object, expected) in transient {
+            let error = error_of(&object);
+            assert!(
+                matches!(&error, ProviderError::Http { status, .. } if *status == expected),
+                "{object}: {error:?}"
+            );
+            assert!(error.is_transient(), "{object}: {error:?}");
+        }
+
+        let refused = json!({"code": "404", "message": "model not found"});
+        let error = error_of(&refused);
+        assert!(!error.is_transient(), "{error:?}");
+        let ProviderError::Protocol(message) = &error else {
+            panic!("a 404 code names no transient class, got {error:?}");
+        };
+        assert!(message.contains("model not found"), "{message}");
+
+        // The code is the specific claim, so a server-side type beside it
+        // does not rescue a client fault.
+        let contradicted = json!({"code": "400", "type": "server_error"});
+        let error = error_of(&contradicted);
+        assert!(matches!(&error, ProviderError::Protocol(_)), "{error:?}");
+        assert!(!error.is_transient(), "{error:?}");
+    }
+
+    #[test]
+    fn a_server_or_overload_type_names_the_status_it_stands_for() {
+        let named: [(serde_json::Value, u16); 6] = [
+            (json!({"type": "server_error"}), 500),
+            (json!({"code": null, "type": "server_error"}), 500),
+            (json!({"code": "server_error", "type": "server_error"}), 500),
+            (json!({"type": " SERVER_ERROR "}), 500),
+            (json!({"type": "api_error", "message": "x"}), 500),
+            (json!({"type": "overloaded_error"}), 503),
+        ];
+        for (object, expected) in named {
+            let error = error_of(&object);
+            assert!(
+                matches!(&error, ProviderError::Http { status, .. } if *status == expected),
+                "{object}: {error:?}"
+            );
+            assert!(error.is_transient(), "{object}: {error:?}");
+        }
+
+        let protocol: [(serde_json::Value, &str); 2] = [
+            (
+                json!({"type": "invalid_request_error", "message": "bad"}),
+                "bad",
+            ),
+            (json!({"message": "model not found"}), "model not found"),
+        ];
+        for (object, text) in protocol {
+            let error = error_of(&object);
+            assert!(!error.is_transient(), "{object}: {error:?}");
+            let ProviderError::Protocol(message) = &error else {
+                panic!("{object} names no transient class, got {error:?}");
+            };
+            assert!(message.contains(text), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_object_and_bad_json_become_protocol_errors() {
         let mut t = Translator::new();
         let out = t.on_data(r#"{"error":{"message":"model not found"}}"#);
         assert!(
             matches!(&out[0], ProviderEvent::Error(ProviderError::Protocol(m)) if m.contains("model not found"))
+        );
+        assert!(
+            matches!(&out[0], ProviderEvent::Error(e) if !e.is_transient()),
+            "an object naming no status is no transient class: {out:?}"
         );
         assert!(
             t.on_data("anything after").is_empty(),
