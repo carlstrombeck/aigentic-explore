@@ -355,10 +355,9 @@ mod tests {
         )
     }
 
-    /// Acceptance 1, end to end: an endpoint that refuses the profile's
-    /// effort makes the doctor exit 1, and the same profile against an
-    /// endpoint that answers exits 0, so the 1 came from the probe and
-    /// not from another check.
+    /// An endpoint that refuses the profile's effort makes the doctor exit
+    /// 1, and the same profile against an endpoint that answers exits 0, so
+    /// the 1 came from the probe and not from another check.
     #[tokio::test]
     async fn a_named_culprit_fails_the_doctor() {
         use crate::checks::tests::stub_rejecting;

@@ -1452,10 +1452,10 @@ pub(crate) mod tests {
         assert!(optional_params(&plain.profiles["a"]).is_empty());
     }
 
-    /// Acceptance 1: an endpoint that refuses a body carrying the effort
-    /// and answers one without it makes the probe name the parameter and
-    /// the value. The message quotes nothing the endpoint said, so it can
-    /// only know the param by having found it by omission.
+    /// An endpoint that refuses a body carrying the effort and answers one
+    /// without it makes the probe name the parameter and the value. The
+    /// message quotes nothing the endpoint said, so it can only know the
+    /// param by having found it by omission.
     #[tokio::test]
     async fn a_400_cleared_by_dropping_the_effort_names_it() {
         const REJECTED: &str = "reasoning_effort";
@@ -1556,8 +1556,8 @@ pub(crate) mod tests {
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
-    /// Acceptance 2: an endpoint that answers costs the one request, and
-    /// the effort goes out under its param, so no subtraction runs.
+    /// An endpoint that answers costs the one request, and the effort goes
+    /// out under its param, so no subtraction runs.
     #[tokio::test]
     async fn an_accepted_probe_asks_once_and_carries_the_effort() {
         let (base, seen) = stub_endpoint(200, ANSWERED_SSE);
@@ -1582,14 +1582,12 @@ pub(crate) mod tests {
         assert!(body.contains(&field), "{body}");
     }
 
-    /// Issue #44, T12 (amendment 1.3): a stub endpoint answers `400` to
-    /// every request, so clearing it is not a matter of leaving a field
-    /// out, and `check_probe` reports `Status::Warn` with the note the
-    /// direct matrix below tests — the profile still runs at the
-    /// provider's default. The fixture sets `api_key_env = "PATH"`,
-    /// which is set in any process, so the probe reaches the stub
-    /// instead of skipping; the note names the param and never the
-    /// response body, so no request or secret can leak through it.
+    /// A stub that refuses every request, the subtraction included, leaves
+    /// the fall-through's note standing: `Warn`, because the profile still
+    /// runs at the provider's default. The note names the param and never
+    /// the response body, so nothing the endpoint said can leak through
+    /// it. The fixture keys on `PATH`, which is set in any process, so the
+    /// probe reaches the stub instead of skipping.
     #[tokio::test]
     async fn a_rejected_reasoning_effort_probe_is_a_warning() {
         let (base, seen) = stub_endpoint(
