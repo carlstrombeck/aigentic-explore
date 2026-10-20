@@ -769,6 +769,23 @@ mod tests {
         ));
     }
 
+    /// The public matcher, the one that backs the allow rule and the
+    /// `/allow` menu, reports the row the line matched and only that row.
+    /// A row written with a global option still matches its own line as
+    /// written.
+    #[test]
+    fn a_git_allow_row_matches_past_a_harmless_global_option() {
+        assert!(command_matches("git --no-pager log -5", "git log"));
+        assert!(command_matches("git -P diff", "git diff"));
+        assert!(command_matches("git --no-pager reflog -8", "git reflog"));
+        assert!(!command_matches(
+            "git --no-pager branch -D topic",
+            "git branch"
+        ));
+        assert!(!command_matches("git -c core.pager=sh log -5", "git log"));
+        assert!(command_matches("git --no-pager log -5", "git --no-pager"));
+    }
+
     #[test]
     fn patterns_match_whole_leading_words() {
         assert!(command_matches("cargo test", "cargo test"));

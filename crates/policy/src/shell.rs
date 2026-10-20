@@ -507,6 +507,56 @@ impl Worst {
     }
 }
 
+/// `git`'s global options that change neither what the subcommand runs
+/// nor what it reads or writes. The classifier reads the words past
+/// them, so `git --no-pager log -5` reads as `git log -5`. An option
+/// that names a file, a directory, a config key or a program is not
+/// here: it changes where git looks or what it runs.
+///
+/// `-p`/`--paginate` are harmless because stdout is captured to a pipe,
+/// so git starts no pager; `core.pager = always` can only be set through
+/// `-c` (still asking) or a repository's `.git/config`, which is an edit.
+const GIT_TRANSPARENT: &[&str] = &[
+    "-p",
+    "--paginate",
+    "-P",
+    "--no-pager",
+    "--literal-pathspecs",
+    "--glob-pathspecs",
+    "--noglob-pathspecs",
+    "--icase-pathspecs",
+    "--no-replace-objects",
+];
+
+/// The segment's words past `git`'s transparent global options
+/// ([`GIT_TRANSPARENT`]), or `None` when there are none to read past: a
+/// line that is not `git`, a bare `git`, or a word the table does not
+/// hold — which leaves the words as written, so the line asks as it
+/// does without the table. Only a table entry is dropped; every other
+/// word, the subcommand's own options included, stays in the result.
+fn past_git_globals<'a>(rest: &[&'a Word]) -> Option<Vec<&'a Word>> {
+    let head = *rest.first()?;
+    if head.broken || head.text != "git" || !head.literal() {
+        return None;
+    }
+    let mut at = 1;
+    while let Some(word) = rest.get(at) {
+        if word.broken || !word.literal() || !GIT_TRANSPARENT.contains(&word.text.as_str()) {
+            break;
+        }
+        at += 1;
+    }
+    // Two words past the head are needed: an option and something after
+    // it. A bare `git --no-pager` stays as written.
+    if at == 1 || at == rest.len() {
+        return None;
+    }
+    let mut words = Vec::with_capacity(rest.len() - at + 1);
+    words.push(head);
+    words.extend_from_slice(&rest[at..]);
+    Some(words)
+}
+
 fn classify_segment(seg: &Segment, allow: &[String], grants: &[String], depth: usize) -> SegClass {
     let mut w = Worst {
         kind: Kind::Harmless,
@@ -559,6 +609,12 @@ fn classify_segment(seg: &Segment, allow: &[String], grants: &[String], depth: u
         .iter()
         .skip_while(|w| is_assignment(w) || introduces(w))
         .collect();
+    // `git --no-pager log -5` reads as `git log -5`: the allow rows are
+    // written without the global options that change nothing, so the
+    // writing flags and the unreadable-argument check read the same words
+    // the rows are matched against.
+    let aligned = past_git_globals(&rest);
+    let rules: &[&Word] = aligned.as_deref().unwrap_or(&rest);
     let mut pattern = None;
     if let Some(cmd) = rest.first() {
         if is_control(&rest) {
@@ -571,17 +627,24 @@ fn classify_segment(seg: &Segment, allow: &[String], grants: &[String], depth: u
             w.fold(Kind::Unknown, None, false);
         } else if cmd.text == "cd" {
             // Changes the directory: harmless on its own (#15).
-        } else if let Some((p, granted)) = match_leading(&rest, allow, grants) {
+        } else if let Some((p, granted)) = match_leading(&rest, allow, grants).or_else(|| {
+            // A row is written without the options, so it is tried again on
+            // the words past them. A grant is not: consent covers the words
+            // the person saw.
+            aligned
+                .as_deref()
+                .and_then(|view| match_leading(view, allow, &[]))
+        }) {
             if granted {
                 // The user allowed these words: consent covers the
                 // flags between them, and has covered them since the
                 // rule existed. Only a redirection still asks.
                 pattern = Some(p);
                 w.fold(Kind::ReadOnly, None, false);
-            } else if writing_flag(cmd.text.as_str(), &rest) {
+            } else if writing_flag(cmd.text.as_str(), rules) {
                 w.fold(Kind::Write, None, false);
-            } else if flag_sensitive(cmd.text.as_str(), &rest)
-                && argument_the_rules_cannot_read(cmd.text.as_str(), &rest)
+            } else if flag_sensitive(cmd.text.as_str(), rules)
+                && argument_the_rules_cannot_read(cmd.text.as_str(), rules)
             {
                 // An argument the rules cannot read may hold one of
                 // the writing flags.
@@ -729,8 +792,8 @@ fn prefix_words(rest: &[&Word]) -> Vec<String> {
 
 /// The writing flags of the allow list (issue #15): a listed command
 /// with one of these modifies something, so it asks after all.
-fn writing_flag(command: &str, rest: &[&Word]) -> bool {
-    let mut args = rest.iter().skip(1);
+fn writing_flag(command: &str, rules: &[&Word]) -> bool {
+    let mut args = rules.iter().skip(1);
     match command {
         "sed" => args.any(|w| {
             let t = &w.text;
@@ -754,17 +817,17 @@ fn writing_flag(command: &str, rest: &[&Word]) -> bool {
             let t = &w.text;
             t == "-i" || (!t.starts_with('-') && awk_program_writes(t))
         }),
-        "git" => match rest.get(1).map(|w| w.text.as_str()) {
-            Some("branch") => git_branch_writes(&rest[2..]),
-            Some("grep") => git_grep_runs_program(&rest[2..]),
-            Some("reflog") => git_reflog_writes(&rest[2..]),
+        "git" => match rules.get(1).map(|w| w.text.as_str()) {
+            Some("branch") => git_branch_writes(&rules[2..]),
+            Some("grep") => git_grep_runs_program(&rules[2..]),
+            Some("reflog") => git_reflog_writes(&rules[2..]),
             Some("diff" | "log" | "show") => {
-                rest.iter().skip(2).any(|w| w.text.starts_with("--output"))
-                    || git_diff_runs_program(&rest[2..])
+                rules.iter().skip(2).any(|w| w.text.starts_with("--output"))
+                    || git_diff_runs_program(&rules[2..])
             }
             _ => false,
         },
-        "gh" if rest.get(1).map(|w| w.text.as_str()) == Some("api") => gh_api_writes(&rest[2..]),
+        "gh" if rules.get(1).map(|w| w.text.as_str()) == Some("api") => gh_api_writes(&rules[2..]),
         _ => false,
     }
 }
@@ -967,14 +1030,14 @@ fn gh_api_writes(args: &[&Word]) -> bool {
 
 /// Commands whose writing flags the rules read closely enough that an
 /// argument they cannot read might be one of them.
-fn flag_sensitive(command: &str, rest: &[&Word]) -> bool {
+fn flag_sensitive(command: &str, rules: &[&Word]) -> bool {
     match command {
         "sed" | "find" | "sort" | "awk" => true,
         "git" => matches!(
-            rest.get(1).map(|w| w.text.as_str()),
+            rules.get(1).map(|w| w.text.as_str()),
             Some("branch" | "diff" | "grep" | "log" | "reflog" | "show")
         ),
-        "gh" => rest.get(1).map(|w| w.text.as_str()) == Some("api"),
+        "gh" => rules.get(1).map(|w| w.text.as_str()) == Some("api"),
         _ => false,
     }
 }
@@ -987,12 +1050,12 @@ fn flag_sensitive(command: &str, rest: &[&Word]) -> bool {
 /// asking on it would make that common form ask. So a substitution that
 /// prints `--textconv` or `--output` runs without asking; its own command
 /// is still classified. Every other command asks on either.
-fn argument_the_rules_cannot_read(command: &str, rest: &[&Word]) -> bool {
-    let git_subcommand = rest.get(1).map(|w| w.text.as_str());
+fn argument_the_rules_cannot_read(command: &str, rules: &[&Word]) -> bool {
+    let git_subcommand = rules.get(1).map(|w| w.text.as_str());
     if command == "git" && matches!(git_subcommand, Some("log" | "show")) {
-        return rest.iter().any(|a| a.var);
+        return rules.iter().any(|a| a.var);
     }
-    rest.iter().any(|a| a.var || !a.subs.is_empty())
+    rules.iter().any(|a| a.var || !a.subs.is_empty())
 }
 
 fn segments(pieces: Vec<Piece>) -> Vec<Segment> {
@@ -2728,6 +2791,7 @@ mod tests {
         assert!(allows("git reflog -8 | head -3"));
         assert!(allows("git reflog | head -20"));
         assert!(allows("git reflog --no-pager -8"));
+        assert!(allows("git --no-pager reflog -8"));
         assert!(allows("git reflog -8 && cargo test"));
 
         // The three subcommands that rewrite the log.
@@ -2747,9 +2811,6 @@ mod tests {
         assert!(!allows(
             "git reflog expire --expire=now --all > /tmp/reflog.txt"
         ));
-
-        // A `git` global option is not skipped by the classifier.
-        assert!(!allows("git --no-pager reflog -8"));
     }
 
     #[test]
@@ -2802,6 +2863,111 @@ mod tests {
         assert!(!off[0].write_from_command);
 
         assert_eq!(scan("git grep -n x \"$opt\"")[0].kind, Kind::Unknown);
+    }
+
+    /// A global option the table holds must change no verdict for a
+    /// read row, or the classifier would be widening more than the rows.
+    #[test]
+    fn every_git_harmless_global_option_leaves_a_git_read_allowed() {
+        let allow = default_bash_allow();
+        for option in GIT_TRANSPARENT {
+            assert!(option.starts_with('-'), "{option}");
+            assert!(!option.contains(' '), "{option}");
+        }
+
+        let rows = [
+            "git log -5",
+            "git diff",
+            "git status --short",
+            "git reflog -8",
+            "git show --stat",
+            "git grep -n verdict -- crates/",
+            "git branch --contains HEAD",
+            "git rev-parse --show-toplevel",
+        ];
+        for option in GIT_TRANSPARENT {
+            for row in rows {
+                let pair: Vec<&str> = row.split_whitespace().take(2).collect();
+                let pair = pair.join(" ");
+                assert!(allow.contains(&pair), "{pair} is a read row");
+                let rest = row.strip_prefix("git ").expect("every row starts with git");
+                assert_eq!(
+                    allows(&format!("git {option} {rest}")),
+                    allows(row),
+                    "{option} {row}"
+                );
+            }
+        }
+
+        // The walk repeats, and a chain is classified segment by segment.
+        assert!(allows("git --no-pager --no-pager log -5"));
+        assert!(allows(
+            "git --no-pager --no-pager --literal-pathspecs log -5"
+        ));
+        assert!(allows("git --no-pager log -5 | head -3"));
+
+        // The row the line matched is the row's text, not the line.
+        let classified = classify("git --no-pager log -5", &allow, &[]);
+        assert_eq!(classified.patterns, vec!["git log".to_owned()]);
+    }
+
+    /// The other half: an option that names a file, a directory, a config
+    /// key or a program changes where git looks or what it runs, so it
+    /// stays outside the table and the line keeps asking.
+    #[test]
+    fn git_global_options_that_change_what_runs_still_ask() {
+        for command in [
+            "git -c core.pager=sh log -5",
+            "git -c alias.l='!sh -c ls' l",
+            "git --config-env=core.pager=PAGER log -5",
+            "git --exec-path=/tmp/x log",
+            "git --git-dir=/tmp/g log",
+            "git --work-tree=/tmp g status",
+            "git --namespace=ns log",
+            "git --attr-source=HEAD log",
+            "git --super-prefix=x log",
+            "git -C /tmp log -5",
+            "git --bare log -5",
+            "git --no-advice log -5",
+            "git --no-pager",
+            "git -P",
+            "git --no-pager $sub",
+            "git --no-pager \"$(echo log)\"",
+            "git \"--no-pager\" log -5",
+        ] {
+            assert!(!allows(command), "{command}");
+        }
+    }
+
+    /// Reading past the options must not hide a write from the writing
+    /// flags or from E4's `write_from_command`.
+    #[test]
+    fn a_git_harmless_global_option_does_not_hide_a_write() {
+        for command in [
+            "git --no-pager branch -D topic",
+            "git --no-pager branch -C topic",
+            "git --no-pager grep -O vim verdict",
+            "git --no-pager grep --textconv -n verdict -- a.bin",
+            "git --no-pager reflog expire --expire=now --all",
+            "git --no-pager reflog delete HEAD@{1}",
+            "git --no-pager log --output=/tmp/x",
+            "git --no-pager show --textconv",
+        ] {
+            assert!(!allows(command), "{command}");
+            let seg = scan(command);
+            assert_eq!(seg[0].kind, Kind::Write, "{command}");
+            assert!(seg[0].write_from_command, "{command}");
+        }
+
+        for command in [
+            "git --no-pager log -5",
+            "git -P diff",
+            "git --no-pager status --short",
+        ] {
+            let seg = scan(command);
+            assert_eq!(seg[0].kind, Kind::Harmless, "{command}");
+            assert!(!seg[0].write_from_command, "{command}");
+        }
     }
 
     #[test]
