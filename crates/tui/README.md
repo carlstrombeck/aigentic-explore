@@ -197,7 +197,11 @@ user when that file is beside `config.toml`, else the config's `user`):
 an empty table is fine, and a table that names anyone but the owner
 fails, since the owner then has no role. `--probe` adds one
 completion per profile with a one-token cap and reports the model and
-latency; it is the only check that uses the network.
+latency; it is the only check that uses the network. An endpoint that
+answers `400` or `422` is asked once more with the profile's effort left
+out: when that answers, the line names the parameter and the value it was
+sent and the doctor fails, so a refused effort is one line rather than a
+body to decode.
 
 The profile is `--profile`, else the project's `[model] profile`, else the
 config's `default_profile`; with `--server` the flag is refused, since the
