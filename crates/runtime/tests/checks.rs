@@ -894,6 +894,14 @@ fn e4_reads_a_substitutions_commands_through_its_own_table() {
         ("echo $()", true),
         ("cat <(git log --oneline)", false),
         ("cat <(touch crates/runtime/src/new.rs)", true),
+        // A flagged substitution in a `git log` or `git show` argument is
+        // a word git reads as an option, so it asks and counts as an
+        // edit; one that prints a revision does neither.
+        ("git log -p $(echo --textconv)", true),
+        ("git show $(echo --output=/tmp/x)", true),
+        ("git log --oneline $(cat flags)", true),
+        ("git log --oneline $(git rev-parse HEAD)", false),
+        ("git log --oneline $(git rev-list HEAD)", false),
     ] {
         assert_eq!(is_an_edit(command, Path::new(REPO)), wanted, "{command}");
     }
