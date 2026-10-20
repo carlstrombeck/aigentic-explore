@@ -379,7 +379,10 @@ fn e5_full_suites(input: &CheckInput<'_>) -> Result<(), String> {
 /// debugging run that found nothing is superseded by the run that
 /// repeats it, so a name is judged by the last word in the log about it,
 /// not the first. The rule is #34's: `running 0 tests` is never a pass
-/// unless a later run of the same filter says otherwise.
+/// unless a later run of the same filter says otherwise. A run whose
+/// command was piped or redirected, and whose surviving lines show neither
+/// a pass nor a failure, fails as missing output rather than as a wrong
+/// name: the cut can have taken the pass with it.
 fn e7_named_runs(input: &CheckInput<'_>) -> Result<(), String> {
     let calls = calls(input.events);
     let mut latest: HashMap<String, (usize, ScanSegment, Option<Cut>)> = HashMap::new();
@@ -409,10 +412,11 @@ fn e7_named_runs(input: &CheckInput<'_>) -> Result<(), String> {
     for (index, name) in judged {
         let (_, segment, cut) = &latest[name];
         let call = &calls[index];
-        // Only a run the line redirected or piped gets the reason's
-        // parenthesis and the rerun clause: with no cut to name, the
-        // check says only that the output is missing (a wrong claim
-        // would send the implementer after the wrong thing).
+        // A run the line redirected or piped gets the reason's parenthesis
+        // and the rerun clause, whether its output never came back or the
+        // lines that survived show no pass; with no cut to name, the check
+        // says only that the output is missing (a wrong claim would send
+        // the implementer after the wrong thing).
         let missing = match cut {
             Some(Cut::Piped(_)) => "output not in the log (piped)",
             Some(Cut::Redirected(_)) => "output not in the log (redirected)",
@@ -431,6 +435,12 @@ fn e7_named_runs(input: &CheckInput<'_>) -> Result<(), String> {
         if passed_count(&answer.content) == 0 {
             let failed = failed_count(&answer.content);
             if failed == 0 {
+                // A cut can take the target that passed with it, so a
+                // surviving 0/0 says nothing about the name: name the cut
+                // and the rerun.
+                if cut.is_some() {
+                    return Err(format!("{name:?}: {missing}{clause}"));
+                }
                 return Err(format!("running 0 tests for {name:?}"));
             }
             return Err(format!("{name:?}: 0 passed, {failed} failed"));

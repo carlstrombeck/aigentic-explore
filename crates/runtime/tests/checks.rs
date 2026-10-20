@@ -1078,7 +1078,10 @@ fn e7_reads_a_name_after_a_target_only_segment() {
 fn e7_fails_the_zero_test_run_and_passes_one_pass() {
     let events = fixture_events("34-01M3KD9HZXX1YX7SFRRR5N6Y80.jsonl");
     let got = verdict_of(&events, "E7").expect_err("0 tests");
-    assert!(got.starts_with("running 0 tests for"), "{got}");
+    assert!(
+        got.starts_with("\"turn_reads_the_file_only_once\": output not in the log (piped)"),
+        "{got}"
+    );
 
     // The fixture's own line, with its zero replaced by a run's one pass.
     let mut passing = events.clone();
@@ -1117,7 +1120,64 @@ fn e7_fails_the_zero_test_run_and_passes_one_pass() {
     );
     log.ok(8, &call, ZERO_TESTS);
     let got = verdict_of(&log.take(), "E7").expect_err("0 tests last");
-    assert!(got.starts_with("running 0 tests for"), "{got}");
+    assert!(
+        got.starts_with("\"form\": output not in the log (redirected)"),
+        "{got}"
+    );
+}
+
+/// A run whose output was piped or redirected, and whose surviving lines
+/// show no pass and no failure, fails as missing output with the rerun the
+/// cut asks for. Naming the cut points at the pipe or the redirect, which
+/// can have taken the pass with them, rather than at a correct name; a run
+/// with no cut keeps the wrong-name message.
+#[test]
+fn e7_names_the_cut_when_a_capped_run_showed_no_pass() {
+    let piped = "cargo test -p aigentic-runtime --test checks form | tail -8";
+    let redirected = "cargo test -p aigentic-runtime --test checks form > /tmp/zero 2>&1";
+    let bare = "cargo test -p aigentic-runtime --test checks form";
+
+    let mut log = Log::new();
+    let call = log.bash(1, piped);
+    log.ok(2, &call, ZERO_TESTS);
+    let got = verdict_of(&log.take(), "E7").expect_err("a pipe can hide the pass");
+    assert!(
+        got.starts_with("\"form\": output not in the log (piped)"),
+        "{got}"
+    );
+    assert!(got.contains("unpiped"), "{got}");
+
+    let mut log = Log::new();
+    let call = log.bash(1, redirected);
+    log.ok(2, &call, ZERO_TESTS);
+    let got = verdict_of(&log.take(), "E7").expect_err("a redirect can hide the pass");
+    assert!(
+        got.starts_with("\"form\": output not in the log (redirected)"),
+        "{got}"
+    );
+    assert!(got.contains("/tmp/zero"), "{got}");
+
+    // Nothing cut the output, so a 0/0 is the name's own fault.
+    let mut log = Log::new();
+    let call = log.bash(1, bare);
+    log.ok(2, &call, ZERO_TESTS);
+    let got = verdict_of(&log.take(), "E7").expect_err("nothing ran");
+    assert_eq!(got, "running 0 tests for \"form\"");
+
+    // A pass the cut left behind is a pass.
+    let mut log = Log::new();
+    let call = log.bash(1, piped);
+    log.ok(2, &call, ONE_TEST);
+    assert_eq!(verdict_of(&log.take(), "E7"), Ok(()));
+
+    // A failure the surviving lines do show keeps its own message.
+    let failed = 3;
+    let three_failed = ZERO_TESTS.replace("0 failed", &format!("{failed} failed"));
+    let mut log = Log::new();
+    let call = log.bash(1, piped);
+    log.ok(2, &call, &three_failed);
+    let got = verdict_of(&log.take(), "E7").expect_err("three failures");
+    assert_eq!(got, format!("\"form\": 0 passed, {failed} failed"));
 }
 
 /// T12: #40's verbatim fixture ran the full suite twice with no edit
@@ -1309,11 +1369,14 @@ fn e4_fails_a_tested_tree_that_is_not_the_committed_tree() {
 #[test]
 fn e7_reads_the_named_run_forms() {
     let forms = [
-        "cd repo && cargo test -p aigentic-runtime --test checks form 2>&1 | tail -30",
-        "cargo test -- form",
-        "cargo test form --nocapture",
+        (
+            "cd repo && cargo test -p aigentic-runtime --test checks form 2>&1 | tail -30",
+            "\"form\": output not in the log (piped)",
+        ),
+        ("cargo test -- form", "running 0 tests for"),
+        ("cargo test form --nocapture", "running 0 tests for"),
     ];
-    for command in forms {
+    for (command, prefix) in forms {
         let mut log = Log::new();
         let call = log.bash(1, command);
         log.ok(
@@ -1322,7 +1385,7 @@ fn e7_reads_the_named_run_forms() {
             "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
         );
         let got = verdict_of(&log.take(), "E7").expect_err(command);
-        assert!(got.starts_with("running 0 tests for"), "{command}: {got}");
+        assert!(got.starts_with(prefix), "{command}: {got}");
     }
 
     // `--list` runs nothing, so E7 has no name to check.
