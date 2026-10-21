@@ -155,6 +155,11 @@ pub enum EventKind {
     /// answered — a user for a person's answer, `Author::System` for a
     /// proposal the system closes (`withdrawn`).
     DecisionAnswered,
+    /// A background job's thread ended. Author `system`; appended to the
+    /// **front** thread, and its payload names the job's thread and how it
+    /// ended. The job's own work is in that thread's log; this event is the
+    /// front thread's record that the job returned.
+    JobFinished,
 }
 
 /// One line of a thread's append-only log. The log is the source of truth;
@@ -389,6 +394,19 @@ mod tests {
             runner(),
             json!({"reason": "turn: provider_error: HTTP 400", "cost_usd": 0.4}),
         ));
+        // A job's finish sits after every kind the wire-shape test reads by
+        // position.
+        events.push(event(
+            27,
+            EventKind::JobFinished,
+            Author::System,
+            json!({
+                "job_thread": Ulid::from_parts(1_700_000_000_000, 9).to_string(),
+                "outcome": "finished",
+                "summary": "read the twelve files and filed three tickets",
+                "cost_usd": 0.42,
+            }),
+        ));
         events
     }
 
@@ -516,6 +534,33 @@ mod tests {
         );
         let event = event(0, kind, Author::System, json!({"through_seq": 3}));
         let line = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&line).unwrap(), event);
+    }
+
+    /// A job's finish lands on the wire under the enum's snake_case rule,
+    /// derived from the variant, and rides one JSONL line like every other
+    /// kind.
+    #[test]
+    fn the_job_finished_kind_round_trips_under_the_snake_case_rule() {
+        let kind = EventKind::JobFinished;
+        let wire = serde_json::to_value(kind).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::Value::String(snake_case(&format!("{kind:?}")))
+        );
+        let event = event(
+            0,
+            kind,
+            Author::System,
+            json!({
+                "job_thread": child().to_string(),
+                "outcome": "finished",
+                "summary": "one screen",
+                "cost_usd": 0.42,
+            }),
+        );
+        let line = serde_json::to_string(&event).unwrap();
+        assert!(!line.contains('\n'), "an event must fit on one line");
         assert_eq!(serde_json::from_str::<Event>(&line).unwrap(), event);
     }
 

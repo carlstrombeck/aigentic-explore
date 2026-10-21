@@ -482,7 +482,10 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             // model through what it caused (a `project_switched`, a job's
             // summary), not through the record itself.
             | EventKind::DecisionProposed
-            | EventKind::DecisionAnswered => {}
+            | EventKind::DecisionAnswered
+            // The record of another thread's work contributes no context
+            // to this one, whose transcript is its own log.
+            | EventKind::JobFinished => {}
         }
     }
 
@@ -1527,6 +1530,29 @@ mod tests {
                 ("c3".into(), long),
             ]
         );
+    }
+
+    /// A finished job's record on the front thread contributes no context:
+    /// the transcript the model reads is that thread's own log, and the
+    /// summary reaches it only through what a later ticket draws with it.
+    #[test]
+    fn a_finished_job_contributes_no_context() {
+        let events = vec![user(0, "build it"), assistant(1, "on it", false), ended(2)];
+        let mut with = events.clone();
+        with.push(ev(
+            3,
+            EventKind::JobFinished,
+            Author::System,
+            json!({
+                "job_thread": Ulid::from_parts(1_700_000_000_000, 9).to_string(),
+                "outcome": "finished",
+                "summary": "one screen",
+                "cost_usd": 0.42,
+            }),
+        ));
+        let quiet = project_body(&events).unwrap();
+        let loud = project_body(&with).unwrap();
+        assert_eq!(quiet, loud);
     }
 
     /// T4 (issue #53): the build runner's events are the runner's own

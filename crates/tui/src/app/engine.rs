@@ -3269,8 +3269,9 @@ impl ClientRepl {
             EventKind::ContextEvicted
             | EventKind::ResultsStubbed
             | EventKind::DecisionProposed
-            | EventKind::DecisionAnswered => {
-                // The sweep and decision lines (issue #115): what the
+            | EventKind::DecisionAnswered
+            | EventKind::JobFinished => {
+                // The sweep, decision and finished-job lines: what the
                 // harness did on its own. Developer view only.
                 if let Some(line) = system_line(event) {
                     self.flush_partial(out);

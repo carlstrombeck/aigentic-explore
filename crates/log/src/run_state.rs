@@ -333,7 +333,10 @@ fn runner_kind(kind: EventKind) -> Option<RunnerKind> {
         // Decisions (issue #74) are not runner facts either: a lead
         // thread's run state reads none of them.
         | EventKind::DecisionProposed
-        | EventKind::DecisionAnswered => None,
+        | EventKind::DecisionAnswered
+        // Nor is a finished job: the front thread's record of work in
+        // another thread is not a move of its own run.
+        | EventKind::JobFinished => None,
     }
 }
 
@@ -1336,6 +1339,28 @@ mod tests {
             answer,
         ]);
         assert_eq!(run_state(&plain).unwrap(), run_state(&with).unwrap());
+    }
+
+    /// A front thread holding a finished job's record still folds as a run:
+    /// the finish changes no move, because work in another thread is not a
+    /// move of this one's.
+    #[test]
+    fn a_finished_job_is_not_a_runner_fact() {
+        let base = vec![run_started(), step_started(1, child())];
+        let mut with = base.clone();
+        with.push(ev(
+            0,
+            EventKind::JobFinished,
+            serde_json::json!({
+                "job_thread": other_child().to_string(),
+                "outcome": "finished",
+                "summary": "one screen",
+                "cost_usd": 0.42,
+            }),
+        ));
+        let plain = run_state(&numbered(base)).unwrap();
+        let held = run_state(&numbered(with)).unwrap();
+        assert_eq!(held.next_move(), plain.next_move());
     }
 
     /// T20: a `step_finished` before any `step_started` is an ordering
