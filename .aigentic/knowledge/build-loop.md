@@ -23,7 +23,9 @@ steps run on the `flash` profile; the spec check and the decider run on
 5. **`## Spec v2 (consolidated)`**: one merger thread. Its prompt carries the
    supervisor's binding decisions.
 6. **`## Implementation`**: one implementer thread, which commits and pushes.
-7. **`## Review`**: one judge thread. On `approve` it closes the issue.
+7. **`## Review`**: one judge thread. On `approve` the run closes the issue
+   itself; a close that fails shows on the live line
+   (`run finished: closed, but …`) and the person closes.
 8. **`## Fix`**: when the judge says `changes needed`, one lean fixer thread.
 9. **Close**: the supervisor reviews the fix, waits for green CI on the fix
    commit, and closes with a comment that states the release impact.
