@@ -59,7 +59,7 @@ add an event kind, not a side table.
 
 The Rust toolchain is pinned in `rust-toolchain.toml`, for every machine and for CI. Bump it on purpose, and fix what the new release flags in the same commit.
 
-All three must pass before a change is finished:
+All four must pass before a change is finished:
 
 ```bash
 cargo fmt
@@ -71,6 +71,10 @@ cargo clippy -- -D warnings
 
 ```bash
 cargo test
+```
+
+```bash
+scripts/comment-check.sh origin/main
 ```
 
 ## Tool behaviour
