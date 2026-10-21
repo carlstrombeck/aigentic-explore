@@ -25,3 +25,20 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: cargo test
         run: cargo test
+
+  # Needs no Rust toolchain, so it runs in seconds beside `check`. A full
+  # history is what makes the base commit reachable: at the default depth of 1
+  # the base is absent and the check refuses to run.
+  comments:
+    name: added comments
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: comment check (pull request)
+        if: github.event_name == 'pull_request'
+        run: scripts/comment-check.sh "${{ github.event.pull_request.base.sha }}"
+      - name: comment check (main)
+        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+        run: scripts/comment-check.sh "${{ github.event.before }}"
