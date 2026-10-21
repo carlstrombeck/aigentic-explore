@@ -318,6 +318,9 @@ pub struct FakeForge {
     answers: Mutex<Vec<Result<CiState, String>>>,
     /// How many `ci` reads the runner has made.
     ci_calls: AtomicUsize,
+    /// When each `ci` read was made, on the clock the CI wait sleeps on,
+    /// so a test can read back the waits it took between two reads.
+    read_at: Mutex<Vec<tokio::time::Instant>>,
 }
 
 impl FakeForge {
@@ -330,6 +333,7 @@ impl FakeForge {
             close_failures: Mutex::new(0),
             answers: Mutex::new(Vec::new()),
             ci_calls: AtomicUsize::new(0),
+            read_at: Mutex::new(Vec::new()),
         }
     }
 
@@ -347,6 +351,13 @@ impl FakeForge {
     /// How many `ci` reads have been made.
     pub fn ci_calls(&self) -> usize {
         self.ci_calls.load(Ordering::SeqCst)
+    }
+
+    /// When each `ci` read was made, oldest first, on the clock the CI
+    /// wait sleeps on: the gaps between two reads are what the wait spent
+    /// between them.
+    pub fn ci_reads_at(&self) -> Vec<tokio::time::Instant> {
+        self.read_at.lock().expect("ci read times mutex").clone()
     }
 
     /// A forge that starts with `comments` already on the issue.
@@ -424,6 +435,10 @@ impl Forge for FakeForge {
 
     fn ci(&self, _sha: &str) -> Result<CiState, ForgeError> {
         self.ci_calls.fetch_add(1, Ordering::SeqCst);
+        self.read_at
+            .lock()
+            .expect("ci read times mutex")
+            .push(tokio::time::Instant::now());
         let mut answers = self.answers.lock().expect("ci answers mutex");
         let answer = match answers.len() {
             0 => Ok(CiState::Passed),

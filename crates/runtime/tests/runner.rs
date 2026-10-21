@@ -6598,9 +6598,14 @@ async fn a_good_ci_read_starts_the_ladder_again() {
     );
 }
 
-/// Each fault waits the ladder's next entry, so a waiter that always used
-/// the first delay would come back too soon to pass.
-#[tokio::test]
+/// Every fault waits its own rung of the ladder, in order: three drops in
+/// a row must not be answered by the same short wait three times, which
+/// is the hammering the ladder exists to avoid.
+///
+/// The clock is paused, so a gap between two reads holds the wait and
+/// nothing else, and the assertion reads the ladder back rather than
+/// trusting a lower bound that fixture work can satisfy on its own.
+#[tokio::test(start_paused = true)]
 async fn a_ci_retry_waits_the_ladder_in_order() {
     use aigentic_runtime::runner::CiState;
     let retry = [
@@ -6610,11 +6615,12 @@ async fn a_ci_retry_waits_the_ladder_in_order() {
     ];
     let l = looped("approve");
     let fx = &l.fx;
-    fx.forge.script_ci_answers(vec![
-        Err(DROPPED_CONNECTION.to_string()),
-        Err(DROPPED_CONNECTION.to_string()),
-        Ok(CiState::Passed),
-    ]);
+    let mut answers: Vec<_> = retry
+        .iter()
+        .map(|_| Err(DROPPED_CONNECTION.to_string()))
+        .collect();
+    answers.push(Ok(CiState::Passed));
+    fx.forge.script_ci_answers(answers);
     let mut runner = fx.runner().with_ci_wait(aigentic_runtime::runner::CiWait {
         interval: std::time::Duration::from_millis(1),
         grace: std::time::Duration::from_millis(50),
@@ -6625,18 +6631,20 @@ async fn a_ci_retry_waits_the_ladder_in_order() {
     runner
         .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
         .unwrap();
-    let began = std::time::Instant::now();
-    let advanced = drive(fx, &mut runner).await;
-    let elapsed = began.elapsed();
     assert_eq!(
-        advanced,
+        drive(fx, &mut runner).await,
         Advanced::Finished {
             outcome: aigentic_log::RunOutcome::Closed
         }
     );
-    assert!(
-        elapsed >= retry[0] + retry[1],
-        "two faults waited {elapsed:?}, less than the first two rungs"
+    let read_at = fx.forge.ci_reads_at();
+    let waited: Vec<_> = read_at
+        .windows(2)
+        .map(|reads| reads[1] - reads[0])
+        .collect();
+    assert_eq!(
+        waited, retry,
+        "one fault at each rung, in the ladder's order"
     );
 }
 
