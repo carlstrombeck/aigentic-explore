@@ -91,6 +91,15 @@ pub enum RunnerError {
     /// The forge could not be read or posted to.
     #[error("forge: {0}")]
     Forge(#[from] ForgeError),
+    /// The network kept failing every try of a CI wait, so the run stops as
+    /// any forge failure does, with the last failure's own words.
+    #[error("gh failed {tries} times in a row while reading CI: {failure}")]
+    ForgeExhausted {
+        /// How many `ci` reads this run of failures made.
+        tries: usize,
+        /// The last failure, as `gh` reported it.
+        failure: ForgeError,
+    },
     /// The host refused to do something, or has nothing to do it with.
     #[error("host: {0}")]
     Host(String),
@@ -267,12 +276,16 @@ impl FailedCheck {
 /// How long the runner waits on CI after a `ci` step's push. Its fields
 /// are: how often
 /// it asks, how long a commit may show no run before that is a gate,
-/// and how long it waits in all.
+/// how long it waits in all, and how long it waits after each network
+/// fault before asking again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CiWait {
     pub interval: std::time::Duration,
     pub grace: std::time::Duration,
     pub timeout: std::time::Duration,
+    /// One wait per fault the network may drop in a row; past the last
+    /// one the run stops as a forge failure.
+    pub retry: [std::time::Duration; 3],
 }
 
 impl Default for CiWait {
@@ -281,6 +294,11 @@ impl Default for CiWait {
             interval: std::time::Duration::from_secs(20),
             grace: std::time::Duration::from_secs(180),
             timeout: std::time::Duration::from_secs(1800),
+            retry: [
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(15),
+                std::time::Duration::from_secs(45),
+            ],
         }
     }
 }
@@ -1289,9 +1307,31 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         };
         let wait = self.ci_wait;
         let began = std::time::Instant::now();
+        // Only while the network keeps failing: a read that answers,
+        // whatever it answers, starts the ladder again, so an occasional
+        // blip over a half-hour wait is patient rather than fatal.
+        let mut faults = 0usize;
         loop {
             let waited = began.elapsed();
-            match self.forge.ci(&sha)? {
+            let state = match self.forge.ci(&sha) {
+                Ok(state) => {
+                    faults = 0;
+                    state
+                }
+                Err(failure) if failure.is_network_fault() => {
+                    let Some(delay) = wait.retry.get(faults) else {
+                        return Err(RunnerError::ForgeExhausted {
+                            tries: faults + 1,
+                            failure,
+                        });
+                    };
+                    faults += 1;
+                    tokio::time::sleep(*delay).await;
+                    continue;
+                }
+                Err(failure) => return Err(failure.into()),
+            };
+            match state {
                 CiState::Passed => return Ok(None),
                 CiState::Failed(why) => {
                     return self
@@ -2405,8 +2445,25 @@ fn missing_reason(branch: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{StepReport, Verdict, budget_usd, verdict_route};
+    use super::{CiWait, StepReport, Verdict, budget_usd, verdict_route};
     use serde_json::json;
+
+    #[test]
+    fn the_ci_wait_retries_after_5_15_and_45_seconds() {
+        let wait = CiWait::default();
+        assert_eq!(
+            wait.retry,
+            [
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(15),
+                std::time::Duration::from_secs(45),
+            ],
+            "one fault each, then the wait gives up"
+        );
+        assert_eq!(wait.interval, std::time::Duration::from_secs(20));
+        assert_eq!(wait.grace, std::time::Duration::from_secs(180));
+        assert_eq!(wait.timeout, std::time::Duration::from_secs(1800));
+    }
 
     #[test]
     fn a_budget_is_a_number_or_starts_with_one() {

@@ -1068,6 +1068,23 @@ async fn drive<R: Repo>(fx: &Fixture, runner: &mut TestRunner<R>) -> Advanced {
     .await
 }
 
+/// Drive to the error the run stops on, doing the same git work `drive`
+/// does between moves: a run that ends in `Err` would otherwise panic
+/// inside `drive` before a test could read the failure.
+async fn drive_to_error<R: Repo>(fx: &Fixture, runner: &mut TestRunner<R>) -> RunnerError {
+    let mut committed = false;
+    loop {
+        if let Some(child) = fx.implementer_child() {
+            commit_what_the_brief_named(fx, child, &mut committed);
+        }
+        match runner.advance().await {
+            Ok(Advanced::Moved) => {}
+            Ok(other) => panic!("the run ended without an error: {other:?}"),
+            Err(error) => return error,
+        }
+    }
+}
+
 /// The same, with `between` called after each move: a run whose middle
 /// needs other git work (a wrong subject, an amend) drives itself this
 /// way, so a rebuilt run is caught up the same way the full one was.
@@ -6395,11 +6412,15 @@ async fn a_verdict_naming_no_route_still_escalates() {
     );
 }
 
+/// The stderr the incident's dropped connection left, word for word.
+const DROPPED_CONNECTION: &str = "dial tcp 140.82.121.6:443: i/o timeout";
+
 fn quick_ci() -> aigentic_runtime::runner::CiWait {
     aigentic_runtime::runner::CiWait {
         interval: std::time::Duration::from_millis(1),
         grace: std::time::Duration::from_millis(50),
         timeout: std::time::Duration::from_millis(200),
+        retry: [std::time::Duration::from_millis(1); 3],
     }
 }
 
@@ -6464,6 +6485,159 @@ async fn missing_or_slow_ci_is_a_gate() {
             Advanced::WaitingHuman { gate: gate.into() }
         );
     }
+}
+
+/// A CI read the network dropped is asked again, and the run reaches the
+/// judge and closes as if the fault never happened.
+#[tokio::test]
+async fn a_ci_read_the_network_dropped_is_retried_and_the_judge_runs() {
+    use aigentic_runtime::runner::CiState;
+    let l = looped("approve");
+    let fx = &l.fx;
+    fx.forge.script_ci_answers(vec![
+        Err(DROPPED_CONNECTION.to_string()),
+        Err(DROPPED_CONNECTION.to_string()),
+        Ok(CiState::Passed),
+    ]);
+    let mut runner = fx.runner().with_ci_wait(quick_ci());
+    drive(fx, &mut runner).await;
+    runner
+        .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+        .unwrap();
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the two faults cost the run nothing"
+    );
+    assert!(fx.child_exists(l.judge), "the judge ran");
+    assert_eq!(
+        fx.forge.ci_calls(),
+        3,
+        "the two faults and the read that answered"
+    );
+}
+
+/// A CI read `gh` refused stops the run at once: a refusal is not the
+/// network asking for another try.
+#[tokio::test]
+async fn a_ci_read_gh_refused_errors_at_once() {
+    let l = looped("approve");
+    let fx = &l.fx;
+    fx.forge
+        .script_ci_answers(vec![Err("gh: Not Found (HTTP 404)".into())]);
+    let mut runner = fx.runner().with_ci_wait(quick_ci());
+    drive(fx, &mut runner).await;
+    runner
+        .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+        .unwrap();
+    let error = drive_to_error(fx, &mut runner).await;
+    assert!(
+        matches!(error, RunnerError::Forge(_)),
+        "the forge's own failure, not an exhausted ladder: {error:?}"
+    );
+    assert!(error.to_string().contains("HTTP 404"), "{error}");
+    assert_eq!(fx.forge.ci_calls(), 1, "a refusal is asked once");
+}
+
+/// A wait whose every read loses the network stops, and its error names
+/// how many reads it made before giving up.
+#[tokio::test]
+async fn a_ci_read_that_keeps_losing_the_network_names_how_many_tries() {
+    let l = looped("approve");
+    let fx = &l.fx;
+    let faults = quick_ci().retry.len() + 1;
+    fx.forge.script_ci_answers(
+        (0..faults)
+            .map(|_| Err(DROPPED_CONNECTION.into()))
+            .collect(),
+    );
+    let mut runner = fx.runner().with_ci_wait(quick_ci());
+    drive(fx, &mut runner).await;
+    runner
+        .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+        .unwrap();
+    let error = drive_to_error(fx, &mut runner).await;
+    let RunnerError::ForgeExhausted { tries, .. } = &error else {
+        panic!("the ladder's failure names its tries: {error:?}");
+    };
+    assert_eq!(*tries, faults, "one fault for each wait the ladder holds");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("{tries} times in a row")),
+        "{error}"
+    );
+    assert!(error.to_string().contains(DROPPED_CONNECTION), "{error}");
+    assert_eq!(fx.forge.ci_calls(), *tries, "one read per named try");
+}
+
+/// A read that answers empties the ladder: an occasional blip spread over
+/// a long wait never adds up to the four faults that stop a run.
+#[tokio::test]
+async fn a_good_ci_read_starts_the_ladder_again() {
+    use aigentic_runtime::runner::CiState;
+    let l = looped("approve");
+    let fx = &l.fx;
+    let mut answers = vec![Err(DROPPED_CONNECTION.to_string()), Ok(CiState::Pending)];
+    answers.extend((0..quick_ci().retry.len()).map(|_| Err(DROPPED_CONNECTION.to_string())));
+    answers.push(Ok(CiState::Passed));
+    fx.forge.script_ci_answers(answers);
+    let mut runner = fx.runner().with_ci_wait(quick_ci());
+    drive(fx, &mut runner).await;
+    runner
+        .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+        .unwrap();
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the later faults were the first of their run"
+    );
+}
+
+/// Each fault waits the ladder's next entry, so a waiter that always used
+/// the first delay would come back too soon to pass.
+#[tokio::test]
+async fn a_ci_retry_waits_the_ladder_in_order() {
+    use aigentic_runtime::runner::CiState;
+    let retry = [
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(150),
+        std::time::Duration::from_millis(250),
+    ];
+    let l = looped("approve");
+    let fx = &l.fx;
+    fx.forge.script_ci_answers(vec![
+        Err(DROPPED_CONNECTION.to_string()),
+        Err(DROPPED_CONNECTION.to_string()),
+        Ok(CiState::Passed),
+    ]);
+    let mut runner = fx.runner().with_ci_wait(aigentic_runtime::runner::CiWait {
+        interval: std::time::Duration::from_millis(1),
+        grace: std::time::Duration::from_millis(50),
+        timeout: std::time::Duration::from_secs(5),
+        retry,
+    });
+    drive(fx, &mut runner).await;
+    runner
+        .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+        .unwrap();
+    let began = std::time::Instant::now();
+    let advanced = drive(fx, &mut runner).await;
+    let elapsed = began.elapsed();
+    assert_eq!(
+        advanced,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        }
+    );
+    assert!(
+        elapsed >= retry[0] + retry[1],
+        "two faults waited {elapsed:?}, less than the first two rungs"
+    );
 }
 
 /// Rebuild the runner after every lead event of a looped run (answered
