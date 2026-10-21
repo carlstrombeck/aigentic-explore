@@ -16,8 +16,8 @@ use aigentic_log::{
 };
 use aigentic_policy::Policy;
 use aigentic_runtime::runner::{
-    Advanced, FakeForge, FakeInstaller, Forge, GhForge, GitRepo, IssueView, Repo, RepoError,
-    Runner, RunnerError, RunnerHost, WriteGuard,
+    Advanced, FakeForge, FakeInstaller, Forge, ForgeError, GhForge, GitRepo, IssueView, Repo,
+    RepoError, Runner, RunnerError, RunnerHost, WriteGuard,
 };
 use aigentic_runtime::workflow::{
     LoadedWorkflow, RUNNER_GATES, SlotKind, WorkflowFile, WorkflowOrigin,
@@ -5322,6 +5322,39 @@ fn size_files() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// A one-step workflow whose step routes on `fix` to the end from two
+/// words: both lead to `done`, so a close shows which word the route held.
+const ROUTED_TOML: &str = r###"
+name = "routed-test"
+version = 1
+
+[budget]
+trivial = 3.0
+full = 10.0
+max_raise = 2.0
+
+[[slots]]
+name = "issue"
+kind = "string"
+filled_by = "runner"
+
+[[steps]]
+id = "judge"
+role = "judge"
+profile = "flash"
+template = "templates/judge.md"
+marker = "## Review"
+route_by = "fix"
+routes = { none = "done", approve = "done" }
+"###;
+
+fn routed_files() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("workflow.toml", ROUTED_TOML),
+        ("templates/judge.md", "judge issue {{issue}}\n"),
+    ]
+}
+
 /// The same one-step shape with a `verdict` branch that routes `approve`
 /// only, so the mapped `changes` word names no route.
 const VERDICT_ONLY_TOML: &str = r###"
@@ -5531,7 +5564,161 @@ async fn a_step_follows_next_and_a_checkpoint_continues_with_the_amendment() {
         !child_prompts(fx, l.judge).is_empty(),
         "the judge ran after the push"
     );
-    assert!(!fx.forge.is_closed(), "a push before `done` closes nothing");
+    assert!(
+        fx.forge.is_closed(),
+        "the judge's approve to `done` closes the issue"
+    );
+}
+
+/// The judge's approve routes to the end, so the runner closes the issue:
+/// nothing else in the loop does.
+#[tokio::test]
+async fn an_approve_routed_to_done_closes_the_issue() {
+    let l = looped("approve");
+    let fx = &l.fx;
+    let mut runner = fx.runner();
+
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "decide".into()
+        },
+        "the fixture's check leads to its gate"
+    );
+    runner
+        .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+        .unwrap();
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        }
+    );
+
+    assert!(
+        fx.forge.is_closed(),
+        "the judge's approve to the end closes the issue"
+    );
+    let events = fx.lead_events();
+    let taken = routes(&events);
+    let last = taken.last().expect("the run routed");
+    assert_eq!(
+        (
+            last.branch.as_str(),
+            last.proposed.as_str(),
+            last.taken.as_str()
+        ),
+        ("verdict", "approve", "done"),
+        "the route the close follows"
+    );
+    let finished = run_finished_all(&events);
+    assert_eq!(finished.len(), 1, "one finish");
+    assert_eq!(finished[0].note, None, "a close that worked leaves no note");
+    assert!(
+        fx.forge
+            .posted()
+            .iter()
+            .all(|comment| !comment.contains("## Closing")),
+        "this path posts no closing comment"
+    );
+}
+
+/// A route to the end whose reported word is not `approve` closes nothing:
+/// the close follows the word, not the destination.
+#[tokio::test]
+async fn a_done_route_an_approve_did_not_take_closes_nothing() {
+    let judge = Ulid::generate();
+    let fx = Fixture::with_workflow(
+        vec![(
+            judge,
+            vec![report("j1", reported("## Review", json!({"fix": "none"})))],
+        )],
+        &routed_files(),
+    );
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(&fx, &mut runner).await,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "the `none` branch leads to the end too"
+    );
+
+    assert!(
+        !fx.forge.is_closed(),
+        "a route of another word closes nothing"
+    );
+    let events = fx.lead_events();
+    let taken = routes(&events);
+    let last = taken.last().expect("the run routed");
+    assert_eq!(
+        (
+            last.branch.as_str(),
+            last.proposed.as_str(),
+            last.taken.as_str()
+        ),
+        ("fix", "none", "done")
+    );
+    assert_eq!(
+        run_finished(&events).note,
+        None,
+        "and nothing was attempted to note"
+    );
+}
+
+/// A close that fails does not make the run an error: it ends as it would
+/// have, and the finish names the reason the issue is still open.
+#[tokio::test]
+async fn a_close_that_fails_ends_the_run_closed_with_the_reason() {
+    let l = looped("approve");
+    let fx = &l.fx;
+    fx.forge.fail_close(1);
+    let mut runner = fx.runner();
+
+    drive(fx, &mut runner).await;
+    runner
+        .answer("decide", aigentic_log::CheckpointAnswer::Go, None, steve())
+        .unwrap();
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed
+        },
+        "a failed close still ends the run closed"
+    );
+
+    // The note carries the fake's own failure, not a message of its own.
+    let expected = format!(
+        "the issue was not closed: {}",
+        ForgeError::Command {
+            args: "issue close".to_string(),
+            message: "the forge is down".to_string(),
+        }
+    );
+    let events = fx.lead_events();
+    let finished = run_finished_all(&events);
+    assert_eq!(finished.len(), 1, "one finish");
+    assert_eq!(finished[0].note.as_deref(), Some(expected.as_str()));
+    assert_eq!(
+        events.last().map(|event| event.kind),
+        Some(EventKind::RunFinished),
+        "the finish is the run's last event"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != EventKind::RunErrored),
+        "a failed close writes no error"
+    );
+    assert_eq!(
+        pushed_events(&events).len(),
+        1,
+        "the handover was not run to close anything"
+    );
+    assert!(
+        !fx.forge.is_closed(),
+        "the fake fails one close, so the runner asked exactly once"
+    );
 }
 
 /// The decider loop: `decide` reads `check`, and `check` reports
