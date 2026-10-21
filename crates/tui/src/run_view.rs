@@ -70,6 +70,19 @@ pub(crate) fn reason_line(reason: &str) -> String {
     progress::clip(reason.lines().next().unwrap_or(""), progress::REASON_CHARS)
 }
 
+/// A finish as one line: the outcome, and, when a closing act it
+/// attempted failed, why the issue is still open.
+///
+/// The note is cut like a stop's reason, so a forge that answers with a
+/// page cannot widen the run cell.
+pub(crate) fn finished_line(payload: &RunFinishedPayload) -> String {
+    let outcome = outcome_line(&payload.outcome);
+    match &payload.note {
+        None => format!("run finished: {outcome}"),
+        Some(note) => format!("run finished: {outcome}, but {}", reason_line(note)),
+    }
+}
+
 /// The outcome as one lowercase word.
 pub(crate) fn outcome_line(outcome: &RunOutcome) -> String {
     match outcome {
@@ -180,7 +193,7 @@ pub(crate) fn render(event: &Event) -> Option<String> {
         }
         EventKind::RunFinished => {
             let payload: RunFinishedPayload = serde_json::from_value(event.payload.clone()).ok()?;
-            Some(format!("run finished: {}", outcome_line(&payload.outcome)))
+            Some(finished_line(&payload))
         }
         EventKind::RunErrored => {
             let payload: RunErroredPayload = serde_json::from_value(event.payload.clone()).ok()?;
@@ -494,6 +507,51 @@ mod tests {
             "parent_event": null,
         }))
         .expect("the fixture event reads")
+    }
+
+    /// A `run_finished` event as the runner writes it, with the note
+    /// left out of the payload when the closing act worked.
+    fn finished(note: Option<&str>) -> Event {
+        let mut payload = json!({"outcome": "closed", "cost_usd": 1.0});
+        if let Some(note) = note {
+            payload["note"] = json!(note);
+        }
+        serde_json::from_value(json!({
+            "id": Ulid::generate(),
+            "thread_id": Ulid::generate(),
+            "seq": 0,
+            "created_at": "2026-09-23T10:00:00Z",
+            "kind": EventKind::RunFinished,
+            "author": {"kind": "agent", "id": "runner"},
+            "payload": payload,
+            "parent_event": null,
+        }))
+        .expect("the fixture event reads")
+    }
+
+    /// A finish names why its close failed on the same one line, and one
+    /// without a note reads exactly as a finish always has.
+    #[test]
+    fn a_finished_run_render_names_a_note_or_not() {
+        const PREFIX: &str = "run finished: ";
+        let plain = render(&finished(None)).expect("a finish has a line");
+        assert_eq!(
+            plain,
+            format!("{PREFIX}{}", outcome_line(&RunOutcome::Closed)),
+            "no note, no addition"
+        );
+
+        let note = format!("the issue was not closed: {}\nand more", "x".repeat(400));
+        let line = render(&finished(Some(&note))).expect("a finish has a line");
+        assert_eq!(
+            line,
+            format!(
+                "{PREFIX}{}, but {}",
+                outcome_line(&RunOutcome::Closed),
+                reason_line(&note)
+            )
+        );
+        assert!(!line.contains('\n'), "and only that line: {line}");
     }
 
     /// The reason's first line is all a line carries: the rest of the
