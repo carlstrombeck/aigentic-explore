@@ -1654,6 +1654,7 @@ mod tests {
                 outcome: RunOutcome::Closed,
                 cost_usd: 0.9,
                 release_impact: Some(ReleaseImpact::NoImpact),
+                note: None,
             }),
         );
         let step_reported = ev(

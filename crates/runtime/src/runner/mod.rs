@@ -1519,6 +1519,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 outcome,
                 cost_usd,
                 release_impact,
+                note: None,
             },
         )?;
         self.lock = None;

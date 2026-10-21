@@ -773,12 +773,18 @@ mod tests {
     }
 
     fn run_finished(outcome: RunOutcome) -> Event {
+        run_finished_noting(outcome, None)
+    }
+
+    /// The same finish with the note a failed close leaves on it.
+    fn run_finished_noting(outcome: RunOutcome, note: Option<&str>) -> Event {
         at(
             EventKind::RunFinished,
             RunFinishedPayload {
                 outcome,
                 cost_usd: 0.4,
                 release_impact: Some(ReleaseImpact::NoImpact),
+                note: note.map(str::to_owned),
             },
         )
     }
@@ -1025,6 +1031,26 @@ mod tests {
         .unwrap();
         assert_eq!(st.outcome, Some(RunOutcome::Closed));
         assert_eq!(st.release_impact, Some(ReleaseImpact::NoImpact));
+        assert_eq!(
+            st.next_move(),
+            NextMove::Done {
+                outcome: RunOutcome::Closed,
+            }
+        );
+    }
+
+    /// A finish's note names a close that failed, and a note is not a
+    /// stop: the status path still reads the run as done.
+    #[test]
+    fn a_finish_with_a_note_is_not_an_error() {
+        const NOTE: &str = "the issue was not closed: the forge is down";
+        let st = run_state(&numbered(vec![
+            run_started(),
+            run_finished_noting(RunOutcome::Closed, Some(NOTE)),
+        ]))
+        .unwrap();
+        assert_eq!(st.errored, None, "a note is not an error");
+        assert_eq!(st.outcome, Some(RunOutcome::Closed));
         assert_eq!(
             st.next_move(),
             NextMove::Done {

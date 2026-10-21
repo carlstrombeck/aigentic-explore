@@ -1822,6 +1822,7 @@ async fn three_leads() -> (Fixture, Ulid, Ulid, Ulid) {
                 outcome: RunOutcome::Closed,
                 cost_usd: 0.0,
                 release_impact: None,
+                note: None,
             })
             .unwrap(),
         ),

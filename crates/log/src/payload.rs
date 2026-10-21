@@ -687,7 +687,8 @@ pub enum LedgerStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunOutcome {
-    /// The issue was closed.
+    /// The run reached the workflow's end. The issue is closed unless
+    /// the finish's note says a close it attempted failed.
     Closed,
     /// The run stopped at a recoverable point and left a handoff.
     Stopped,
@@ -898,6 +899,10 @@ pub struct RunFinishedPayload {
     pub cost_usd: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_impact: Option<ReleaseImpact>,
+    /// Why a closing act failed, for the person reading the live line;
+    /// `None` when nothing was attempted or it worked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Payload of a `run_errored` event: the error's text as the runner
@@ -2276,6 +2281,7 @@ mod tests {
             outcome: RunOutcome::Closed,
             cost_usd: 1.25,
             release_impact: Some(ReleaseImpact::NoImpact),
+            note: None,
         };
         let value = serde_json::to_value(&p).unwrap();
         // `none` is the word the judge writes, not the variant's own name.
