@@ -838,7 +838,10 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                     .unwrap_or_else(|| "the brief asked for a human".into());
                 self.escalate("route", vec![step, attempt.to_string(), why])
             }
-            "done" => self.finish(RunOutcome::Closed),
+            "done" => {
+                let note = self.close_after_an_approve()?;
+                self.finish(RunOutcome::Closed, note)
+            }
             other => match self.step(other) {
                 Ok(step) => {
                     let id = step.id.clone();
@@ -948,7 +951,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
     /// a missing `next` is a gate, never a silent stop.
     fn follow_next(&mut self, step: &Step, attempt: u32) -> Result<Advanced, RunnerError> {
         match step.next.as_deref() {
-            Some("done") => self.finish(RunOutcome::Closed),
+            Some("done") => self.finish(RunOutcome::Closed, None),
             Some(next) => {
                 self.append(
                     EventKind::RouteTaken,
@@ -1269,7 +1272,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             self.forge.comment(issue, &text)?;
         }
         self.forge.close(issue)?;
-        self.finish_with(RunOutcome::Closed, impact)
+        self.finish_with(RunOutcome::Closed, impact, None)
     }
 
     /// Wait on CI for the commit the last push left at the remote. `None`
@@ -1500,17 +1503,45 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
 
     // -- pieces -------------------------------------------------------------
 
-    /// Write `run_finished` and end the run.
-    fn finish(&mut self, outcome: RunOutcome) -> Result<Advanced, RunnerError> {
-        self.finish_with(outcome, None)
+    /// Close the issue when the route just taken was an `approve` to the
+    /// end, and say why the issue is still open when the close failed.
+    ///
+    /// It reads the route's `proposed`, the reported word, rather than the
+    /// step's `route_by`, so a step may route on a slot named anything.
+    /// A close that fails does not fail the run: the work is done, and the
+    /// person is owed the reason it is not closed.
+    fn close_after_an_approve(&self) -> Result<Option<String>, RunnerError> {
+        let state = self.state()?;
+        if !state
+            .routes
+            .last()
+            .is_some_and(|route| route.proposed == "approve")
+        {
+            return Ok(None);
+        }
+        Ok(match self.forge.close(state.issue) {
+            Ok(()) => None,
+            Err(err) => Some(format!("the issue was not closed: {err}")),
+        })
     }
 
-    /// Write `run_finished` with the closing comment's release impact, and
-    /// end the run.
+    /// Write `run_finished` and end the run, with a note on why the issue
+    /// is still open when a close failed.
+    fn finish(
+        &mut self,
+        outcome: RunOutcome,
+        note: Option<String>,
+    ) -> Result<Advanced, RunnerError> {
+        self.finish_with(outcome, None, note)
+    }
+
+    /// Write `run_finished` with the closing comment's release impact and a
+    /// note on a close that failed, and end the run.
     fn finish_with(
         &mut self,
         outcome: RunOutcome,
         release_impact: Option<ReleaseImpact>,
+        note: Option<String>,
     ) -> Result<Advanced, RunnerError> {
         let cost_usd = self.cost();
         self.append(
@@ -1519,7 +1550,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 outcome,
                 cost_usd,
                 release_impact,
-                note: None,
+                note,
             },
         )?;
         self.lock = None;
@@ -1560,7 +1591,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         amendment: Option<String>,
     ) -> Result<Advanced, RunnerError> {
         if answer == CheckpointAnswer::Stop {
-            return self.finish(RunOutcome::Stopped);
+            return self.finish(RunOutcome::Stopped, None);
         }
         if gate == BUDGET_GATE && answer == CheckpointAnswer::Raise {
             // A replay reaches this arm when an earlier runner wrote the
