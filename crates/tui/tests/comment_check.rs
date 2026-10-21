@@ -167,6 +167,15 @@ fn issue_numbers_and_references_fail_with_their_line() {
         ),
     );
 
+    let (out, head) = added_to_lib(&["// see #7 for the reasoning"]);
+    assert_one_hit(
+        &out,
+        &format!(
+            "src/lib.rs:{}: {ISSUE_NUMBER}: // see #7 for the reasoning",
+            line_of(&head, "#7")
+        ),
+    );
+
     let (out, head) = added_to_lib(&["// see the issue # for the reasoning"]);
     assert_one_hit(
         &out,
@@ -337,8 +346,58 @@ fn a_renamed_file_with_old_comments_passes() {
 
     repo.git_ok(&["mv", "src/old.rs", "src/new.rs"]);
     repo.commit("rename");
+    // Rename detection is on by default, so a fixture that leaves the setting
+    // alone proves nothing about the flag the script passes.
+    repo.git_ok(&["config", "diff.renames", "false"]);
 
     assert_clean(&repo.run(&["HEAD~1"]));
+}
+
+#[test]
+fn an_external_diff_helper_never_hides_the_added_line() {
+    let repo = Repo::new();
+    repo.write("src/lib.rs", &["fn a() {}"]);
+    repo.commit("base");
+    // An external helper replaces git's own diff, so a fixture without one
+    // cannot see whether the script refuses it.
+    repo.git_ok(&["config", "diff.external", "/usr/bin/true"]);
+    let added = ["fn a() {}", "// issue #12: keep the ordering"];
+    repo.write("src/lib.rs", &added);
+    repo.commit("head");
+
+    assert_one_hit(
+        &repo.run(&["HEAD~1"]),
+        &format!(
+            "src/lib.rs:{}: {ISSUE_NUMBER}: // issue #12: keep the ordering",
+            line_of(&added, "#12")
+        ),
+    );
+}
+
+#[test]
+fn a_textconv_driver_never_hides_the_added_line() {
+    let repo = Repo::new();
+    repo.write(".gitattributes", &["*.rs diff=custom"]);
+    repo.write("src/lib.rs", &["fn a() {}"]);
+    repo.commit("base");
+    // The driver rewrites the number the rules match, so a fixture without one
+    // cannot see whether the script reads the file or the driver's rendering.
+    repo.git_ok(&[
+        "config",
+        "diff.custom.textconv",
+        "/usr/bin/sed -e s/#[0-9][0-9]*/XX/",
+    ]);
+    let added = ["fn a() {}", "// issue #12: keep the ordering"];
+    repo.write("src/lib.rs", &added);
+    repo.commit("head");
+
+    assert_one_hit(
+        &repo.run(&["HEAD~1"]),
+        &format!(
+            "src/lib.rs:{}: {ISSUE_NUMBER}: // issue #12: keep the ordering",
+            line_of(&added, "#12")
+        ),
+    );
 }
 
 #[test]
