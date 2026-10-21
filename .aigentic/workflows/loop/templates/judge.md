@@ -26,4 +26,4 @@ End by calling `finish_step` once, with:
 - `release_impact` with one clause of reason;
 - `body`: the verdict first (the runner puts `## Review` above it), the evidence (tables of attempts, dumps), and on `changes` a numbered list where each item gives `file:line` and says whether it was read or proven by running.
 
-On `approve`, also close the issue: `gh issue close {{issue}}`. The runner posts your `body` on the issue. Do not post it yourself.
+On `approve` the run closes the issue itself. The runner posts your `body` on the issue. Do not post it yourself.
