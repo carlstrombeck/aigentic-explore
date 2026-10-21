@@ -918,6 +918,31 @@ pub struct RunErroredPayload {
     pub cost_usd: f64,
 }
 
+/// How a background job's thread ended: it did its task, it failed, or it
+/// was stopped (by a person, or by a budget) rather than completing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobOutcome {
+    Finished,
+    Failed,
+    Stopped,
+}
+
+/// Payload of a `job_finished` event, appended to the front thread: the
+/// job's own thread, how it ended, the one-screen return the front thread
+/// shows, and what the job cost.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobFinishedPayload {
+    /// The job's own thread id, the child whose `thread_started` names the
+    /// front thread as its parent.
+    pub job_thread: Ulid,
+    pub outcome: JobOutcome,
+    /// The return the front thread shows. This type neither truncates nor
+    /// requires it; the writer keeps it to one screen.
+    pub summary: String,
+    pub cost_usd: f64,
+}
+
 /// One planned test: its id, what it checks, and how its expected value
 /// is derived (§4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2317,6 +2342,48 @@ mod tests {
             serde_json::to_value(RunOutcome::Escalated).unwrap(),
             "escalated"
         );
+    }
+
+    /// A job's finish names the job's thread, how it ended, the summary the
+    /// front thread shows and the cost; each outcome's wire word is the one
+    /// the contract names, and all four fields survive a round trip.
+    #[test]
+    fn a_finished_job_round_trips_for_each_outcome() {
+        let job = Ulid::from_parts(1_700_000_000_000, 9);
+        let summary = "read twelve files and filed three tickets";
+        let p = JobFinishedPayload {
+            job_thread: job,
+            outcome: JobOutcome::Finished,
+            summary: summary.into(),
+            cost_usd: 0.42,
+        };
+        for (outcome, word) in [
+            (JobOutcome::Finished, "finished"),
+            (JobOutcome::Failed, "failed"),
+            (JobOutcome::Stopped, "stopped"),
+        ] {
+            let value = serde_json::to_value(outcome).unwrap();
+            assert_eq!(value, word);
+
+            let p = JobFinishedPayload {
+                outcome,
+                ..p.clone()
+            };
+            let value = serde_json::to_value(&p).unwrap();
+            assert_eq!(
+                value,
+                json!({
+                    "job_thread": job.to_string(),
+                    "outcome": word,
+                    "summary": summary,
+                    "cost_usd": 0.42,
+                })
+            );
+            assert_eq!(
+                serde_json::from_value::<JobFinishedPayload>(value).unwrap(),
+                p
+            );
+        }
     }
 
     /// Amendment item 4: `fix` is the judge's own field, its no-change
