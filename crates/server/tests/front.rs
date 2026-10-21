@@ -399,6 +399,7 @@ fn append_started(log: &mut ThreadLog, project: Option<&str>, root: &Path, by: &
             parent_thread: None,
             step: None,
             front,
+            job: false,
         })
         .unwrap(),
         parent_event: None,
@@ -444,6 +445,7 @@ fn append_child_started(
             parent_thread: Some(lead),
             step: Some(step.to_owned()),
             front: false,
+            job: false,
         })
         .unwrap(),
         parent_event: None,

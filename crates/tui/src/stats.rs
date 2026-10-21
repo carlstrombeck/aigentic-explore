@@ -3562,6 +3562,7 @@ api_key_env = "TENSORX_API_KEY"
                 parent_thread,
                 step: parent_thread.map(|_| "implement".into()),
                 front: false,
+                job: false,
             })
             .unwrap(),
             "created_at": at,
@@ -5740,6 +5741,7 @@ api_key_env = "TENSORX_API_KEY"
                 parent_thread: None,
                 step: None,
                 front: false,
+                job: false,
             })
             .unwrap(),
             "created_at": at,

@@ -380,6 +380,7 @@ mod tests {
             parent_thread: None,
             step: None,
             front: false,
+            job: false,
         };
         ev(
             seq,

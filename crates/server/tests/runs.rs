@@ -1802,6 +1802,7 @@ async fn three_leads() -> (Fixture, Ulid, Ulid, Ulid) {
                 step: None,
                 // never a front thread (issue #84)
                 front: false,
+                job: false,
             })
             .unwrap(),
         ),
@@ -2909,6 +2910,7 @@ async fn t15b_a_corrupt_lead_log_refuses_a_new_run() {
                 step: None,
                 // never a front thread (issue #84)
                 front: false,
+                job: false,
             })
             .unwrap(),
         ),

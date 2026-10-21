@@ -1127,6 +1127,7 @@ impl ThreadTable {
                 parent_thread: None,
                 step: None,
                 front,
+                job: false,
             })
             .expect("serialisable"),
             parent_event: None,

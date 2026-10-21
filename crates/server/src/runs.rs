@@ -453,6 +453,7 @@ impl RunnerHost for ServerHost {
                 step: Some(step.to_owned()),
                 // A step's child is never a front thread (issue #84).
                 front: false,
+                job: false,
             })
             .expect("thread_started serialises"),
             parent_event: None,

@@ -87,6 +87,11 @@ pub struct ThreadStartedPayload {
     /// The person's front thread (#84): plain `aigentic` reopens the newest one they made.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub front: bool,
+    /// A background job's thread: its `parent_thread` is the front thread
+    /// and its `step` is `None`, which is how it is told apart from a build
+    /// step's child. A line written before the field reads `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub job: bool,
 }
 
 /// Token usage for one model call, as persisted. The token fields mirror
@@ -1321,6 +1326,7 @@ mod tests {
             parent_thread: None,
             step: None,
             front: false,
+            job: false,
         };
         let value = serde_json::to_value(&started).unwrap();
         assert_eq!(
@@ -2508,6 +2514,40 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ThreadStartedPayload>(value).unwrap(),
             front
+        );
+    }
+
+    /// A background job's thread is told apart from a build step's child by
+    /// this flag. A line written before the field reads as `false` and
+    /// writes back byte for byte, so an old log still replays; `true`
+    /// round-trips.
+    #[test]
+    fn a_job_thread_round_trips_and_an_old_line_reads_as_false() {
+        let old = json!({
+            "project": "vendela",
+            "root": "/srv/vendela",
+            "created_by": {"kind": "user", "id": "steve"}
+        });
+        let read: ThreadStartedPayload = serde_json::from_value(old.clone()).unwrap();
+        assert!(!read.job, "a line without the key is not a job");
+        // And it writes back byte for byte: `false` is never serialised.
+        assert_eq!(serde_json::to_value(&read).unwrap(), old);
+        assert!(
+            !serde_json::to_value(&read)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("job"),
+            "the flag is absent when false"
+        );
+
+        let mut job = read.clone();
+        job.job = true;
+        let value = serde_json::to_value(&job).unwrap();
+        assert_eq!(value["job"], json!(true));
+        assert_eq!(
+            serde_json::from_value::<ThreadStartedPayload>(value).unwrap(),
+            job
         );
     }
 

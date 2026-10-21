@@ -312,6 +312,7 @@ impl RunnerHost for FakeHost {
                 parent_thread: Some(self.lead),
                 step: Some(step.to_owned()),
                 front: false,
+                job: false,
             })
             .expect("thread_started serialises"),
             parent_event: None,

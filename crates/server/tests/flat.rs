@@ -534,6 +534,7 @@ fn append_started(log: &mut ThreadLog, project: Option<&str>, root: &Path, by: &
             step: None,
             // never a front thread (issue #84)
             front: false,
+            job: false,
         })
         .unwrap(),
         parent_event: None,

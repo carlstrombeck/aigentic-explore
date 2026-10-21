@@ -570,6 +570,7 @@ fn hand_written(base: &Path, project: &str, root: &Path, author: Author) -> Ulid
         step: None,
         // never a front thread (issue #84)
         front: false,
+        job: false,
     };
     log.append(NewEvent {
         kind: EventKind::ThreadStarted,

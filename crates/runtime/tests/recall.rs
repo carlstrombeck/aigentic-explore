@@ -104,6 +104,7 @@ fn started(project: Option<&str>) -> NewEvent {
         parent_thread: None,
         step: None,
         front: false,
+        job: false,
     };
     event(
         EventKind::ThreadStarted,
