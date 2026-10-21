@@ -6,7 +6,7 @@
 
 use std::io::Write as _;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ulid::Ulid;
@@ -50,6 +50,54 @@ pub enum ForgeError {
     /// `gh` could not be run at all, or its temp file could not be written.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl ForgeError {
+    /// Whether this failure is the network dropping the call rather
+    /// than `gh` saying no: a timeout, a refused or reset connection, a
+    /// DNS failure, or a 5xx or 429 from the API. Only what `gh` wrote
+    /// on stderr can be one; a body that arrived but would not parse,
+    /// or a `gh` that would not spawn, is not.
+    pub fn is_network_fault(&self) -> bool {
+        match self {
+            Self::Command { message, .. } => names_a_network_fault(message),
+            Self::Json(_) | Self::Io(_) => false,
+        }
+    }
+}
+
+/// Whether `text`, the stderr `gh` left, says the network dropped the
+/// call. The marks are matched anywhere in the text, because `gh` writes
+/// a warning line above the error it died on, and the status rule is the
+/// one [`ProviderError::is_transient`](aigentic_core::ProviderError::is_transient)
+/// applies: a 429 or a 5xx is worth another try, a 4xx is a refusal.
+fn names_a_network_fault(text: &str) -> bool {
+    const CUT: [&str; 12] = [
+        "i/o timeout",
+        "connection timed out",
+        "timeout exceeded",
+        "context deadline exceeded",
+        "tls handshake timeout",
+        "connection refused",
+        "connection reset",
+        "unexpected eof",
+        "no such host",
+        "temporary failure in name resolution",
+        "server misbehaving",
+        "network is unreachable",
+    ];
+    let text = text.to_ascii_lowercase();
+    if CUT.iter().any(|mark| text.contains(mark)) {
+        return true;
+    }
+    text.match_indices("http ").any(|(at, _)| {
+        matches!(
+            text[at + "http ".len()..]
+                .get(..3)
+                .and_then(|code| code.parse::<u16>().ok()),
+            Some(429 | 500..=599)
+        )
+    })
 }
 
 /// Read the issue and post comments on it.
@@ -265,8 +313,11 @@ pub struct FakeForge {
     /// How many more `close` calls fail before one goes through.
     close_failures: Mutex<usize>,
     /// What `ci` answers, front first; the last answer repeats. Empty
-    /// answers `Passed`.
-    ci: Mutex<Vec<CiState>>,
+    /// answers `Passed`, and an `Err` carries the stderr of a `gh` that
+    /// failed.
+    answers: Mutex<Vec<Result<CiState, String>>>,
+    /// How many `ci` reads the runner has made.
+    ci_calls: AtomicUsize,
 }
 
 impl FakeForge {
@@ -277,14 +328,25 @@ impl FakeForge {
             comments: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
             close_failures: Mutex::new(0),
-            ci: Mutex::new(Vec::new()),
+            answers: Mutex::new(Vec::new()),
+            ci_calls: AtomicUsize::new(0),
         }
     }
 
-    /// Script what `ci` answers: each call takes the next state, and the
+    /// Script what `ci` answers: each call takes the next answer, and the
     /// last one repeats.
+    pub fn script_ci_answers(&self, answers: Vec<Result<CiState, String>>) {
+        *self.answers.lock().expect("ci answers mutex") = answers;
+    }
+
+    /// Script the CI states `ci` answers, each one a pass of the read.
     pub fn script_ci(&self, states: Vec<CiState>) {
-        *self.ci.lock().expect("ci mutex") = states;
+        self.script_ci_answers(states.into_iter().map(Ok).collect());
+    }
+
+    /// How many `ci` reads have been made.
+    pub fn ci_calls(&self) -> usize {
+        self.ci_calls.load(Ordering::SeqCst)
     }
 
     /// A forge that starts with `comments` already on the issue.
@@ -361,11 +423,16 @@ impl Forge for FakeForge {
     }
 
     fn ci(&self, _sha: &str) -> Result<CiState, ForgeError> {
-        let mut states = self.ci.lock().expect("ci mutex");
-        Ok(match states.len() {
-            0 => CiState::Passed,
-            1 => states[0].clone(),
-            _ => states.remove(0),
+        self.ci_calls.fetch_add(1, Ordering::SeqCst);
+        let mut answers = self.answers.lock().expect("ci answers mutex");
+        let answer = match answers.len() {
+            0 => Ok(CiState::Passed),
+            1 => answers[0].clone(),
+            _ => answers.remove(0),
+        };
+        answer.map_err(|message| ForgeError::Command {
+            args: "run list".to_string(),
+            message,
         })
     }
 }
@@ -374,8 +441,52 @@ impl Forge for FakeForge {
 mod tests {
     use super::*;
 
+    /// The stderr the incident's dropped connection left, word for word.
+    const DROPPED_CONNECTION: &str = "dial tcp 140.82.121.6:443: i/o timeout";
+
     fn run(status: &str, conclusion: &str) -> (String, String, String) {
         ("ci".into(), status.into(), conclusion.into())
+    }
+
+    fn gh_failed(message: &str) -> ForgeError {
+        ForgeError::Command {
+            args: "run list".into(),
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn a_dropped_connection_is_a_network_fault() {
+        for stderr in [
+            DROPPED_CONNECTION,
+            "dial tcp: lookup api.github.com on 10.0.0.1:53: no such host",
+            "dial tcp 140.82.121.6:443: connect: connection refused",
+            "read tcp: connection reset by peer",
+            "gh: HTTP 503: Service Unavailable",
+            "gh: HTTP 429: API rate limit exceeded",
+            "warning: a proxy is set\ngh: dial tcp 140.82.121.6:443: i/o timeout",
+        ] {
+            assert!(gh_failed(stderr).is_network_fault(), "{stderr}");
+        }
+    }
+
+    #[test]
+    fn what_gh_refused_is_not_a_network_fault() {
+        for stderr in [
+            "gh: Not Found (HTTP 404)",
+            "gh: Bad credentials (HTTP 401)",
+            "gh: Validation Failed (HTTP 422)",
+            "HTTP 200",
+            "unknown flag: --commit",
+        ] {
+            assert!(!gh_failed(stderr).is_network_fault(), "{stderr}");
+            let unreadable = serde_json::from_str::<serde_json::Value>(stderr).unwrap_err();
+            assert!(!ForgeError::Json(unreadable).is_network_fault(), "{stderr}");
+            assert!(
+                !ForgeError::Io(std::io::Error::other(stderr)).is_network_fault(),
+                "{stderr}"
+            );
+        }
     }
 
     #[test]
