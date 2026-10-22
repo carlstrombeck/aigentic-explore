@@ -126,6 +126,14 @@ fn issue_view() -> IssueView {
     }
 }
 
+/// The subjects the merge fixture reports, in the order it names them.
+const MERGE_SUBJECTS: [&str; 3] = ["log: one", "log: two", "log: three"];
+/// The shas the same report carries: never rendered, never checked.
+const MERGE_SHAS: [&str; 3] = ["1111111", "2222222", "3333333"];
+/// The subjects the brief names and the implementer's fixture commits: one
+/// pair, so a test can derive both sides from it.
+const NAMED_SUBJECTS: [&str; 2] = ["runtime: one", "runtime: two"];
+
 /// The brief's report: what a brief step reports for a `trivial` issue.
 fn brief_report() -> Value {
     json!({
@@ -138,7 +146,7 @@ fn brief_report() -> Value {
             "must_not_undo": "nothing",
             "pointers": "crates/runtime/src/runner/mod.rs",
             "design": "a log-driven loop",
-            "commits": ["runtime: one", "runtime: two"],
+            "commits": NAMED_SUBJECTS,
         },
         "planned_tests": [
             {"id": "T1", "what": "the happy path", "derivation": "from the spec"},
@@ -1019,7 +1027,7 @@ fn commit_what_the_brief_named(fx: &Fixture, implementer: Ulid, done: &mut bool)
     // Only from the state before any of them: a rebuild from a point after
     // the report finds the commits already in the tree.
     if reported && fx.head() == fx.initial_head() {
-        for subject in ["runtime: one", "runtime: two"] {
+        for subject in NAMED_SUBJECTS {
             fx.commit_named(subject);
         }
         *done = true;
@@ -9415,4 +9423,308 @@ async fn the_runs_gate_still_parks_a_raised_step() {
     let state = run_state(&fx.lead_events()).unwrap();
     assert!(state.cost_usd >= line, "the run is past its line");
     assert_eq!(state.budget_usd, clearing_raise(), "the step raise left it");
+}
+
+// ---------------------------------------------------------------------------
+// A report's typed commits reach the `commits` slot the next step renders
+// ---------------------------------------------------------------------------
+
+/// `finish_step`'s typed `commits` field: one `{sha, subject}` object per
+/// subject, in the order given.
+fn typed(subjects: &[&str], shas: &[&str]) -> Value {
+    Value::Array(
+        subjects
+            .iter()
+            .zip(shas)
+            .map(|(subject, sha)| json!({"sha": sha, "subject": subject}))
+            .collect(),
+    )
+}
+
+/// The merge fixture's commits, as its report states them.
+fn typed_commits() -> Value {
+    typed(&MERGE_SUBJECTS, &MERGE_SHAS)
+}
+
+/// A two-step workflow, merge then implement, where `commits` is the one
+/// slot the second step's template renders.
+fn commits_files() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "workflow.toml",
+            r###"
+name = "commits-test"
+version = 1
+
+[budget]
+trivial = 3.0
+full = 10.0
+max_raise = 2.0
+
+[[slots]]
+name = "issue"
+kind = "string"
+filled_by = "runner"
+
+[[slots]]
+name = "commits"
+kind = "string"
+filled_by = "merge"
+
+[[steps]]
+id = "merge"
+role = "sizer"
+profile = "flash"
+template = "templates/merge.md"
+marker = "## Merge"
+next = "implement"
+
+[[steps]]
+id = "implement"
+role = "judge"
+profile = "flash"
+template = "templates/implement.md"
+marker = "## Implement"
+next = "done"
+"###,
+        ),
+        ("templates/merge.md", "Merge #{{issue}}."),
+        ("templates/implement.md", "## Commits\n\n{{commits}}\n"),
+    ]
+}
+
+/// The merge step's report: `slots` as given, plus the typed field when
+/// the test states one.
+fn merged(slots: Value, typed: Option<Value>) -> Value {
+    let mut args = reported("## Merge", slots);
+    if let Some(commits) = typed {
+        args["commits"] = commits;
+    }
+    args
+}
+
+/// A report that states its commits in the typed field fills the `commits`
+/// slot, one subject per line in the report's order, and no sha reaches the
+/// prompt.
+#[tokio::test]
+async fn typed_commits_render_one_subject_per_line() {
+    let merge = Ulid::generate();
+    let implement = Ulid::generate();
+    let fx = Fixture::with_workflow(
+        vec![
+            (
+                merge,
+                vec![report("m1", merged(json!({}), Some(typed_commits())))],
+            ),
+            (
+                implement,
+                vec![report("i1", reported("## Implement", json!({})))],
+            ),
+        ],
+        &commits_files(),
+    );
+    trace(&fx).await;
+
+    let prompts = child_prompts(&fx, implement);
+    assert_eq!(prompts.len(), 1, "one prompt for the implement step");
+    assert!(
+        prompts[0].contains(&MERGE_SUBJECTS.join("\n")),
+        "the subjects render one per line, in the report's order: {}",
+        prompts[0]
+    );
+    for sha in MERGE_SHAS {
+        assert!(
+            !prompts[0].contains(sha),
+            "a sha never reaches a prompt: {}",
+            prompts[0]
+        );
+    }
+}
+
+/// The two spellings of a merge's commits — its own slot, or the typed
+/// field — render the same prompt.
+#[tokio::test]
+async fn a_typed_list_and_a_slot_render_the_same_prompt() {
+    let slot_merge = Ulid::generate();
+    let slot_implement = Ulid::generate();
+    let typed_merge = Ulid::generate();
+    let typed_implement = Ulid::generate();
+    let from_slot = Fixture::with_workflow(
+        vec![
+            (
+                slot_merge,
+                vec![report(
+                    "m1",
+                    merged(json!({"commits": MERGE_SUBJECTS}), None),
+                )],
+            ),
+            (
+                slot_implement,
+                vec![report("i1", reported("## Implement", json!({})))],
+            ),
+        ],
+        &commits_files(),
+    );
+    let from_typed = Fixture::with_workflow(
+        vec![
+            (
+                typed_merge,
+                vec![report("m1", merged(json!({}), Some(typed_commits())))],
+            ),
+            (
+                typed_implement,
+                vec![report("i1", reported("## Implement", json!({})))],
+            ),
+        ],
+        &commits_files(),
+    );
+    trace(&from_slot).await;
+    trace(&from_typed).await;
+
+    let slot_prompts = child_prompts(&from_slot, slot_implement);
+    let typed_prompts = child_prompts(&from_typed, typed_implement);
+    assert_eq!(slot_prompts.len(), 1, "one prompt from the slot's report");
+    assert_eq!(typed_prompts.len(), 1, "one prompt from the typed report");
+    assert_eq!(
+        slot_prompts[0], typed_prompts[0],
+        "a list in the slot and the same list typed in render the same prompt"
+    );
+    assert!(
+        slot_prompts[0].contains(&MERGE_SUBJECTS.join("\n")),
+        "and it carries the subjects, not two empties: {}",
+        slot_prompts[0]
+    );
+}
+
+/// Within one report the `commits` slot wins, so a typed field beside a slot
+/// that named its own commits adds nothing.
+#[tokio::test]
+async fn a_slot_naming_commits_wins_over_the_typed_field() {
+    let merge = Ulid::generate();
+    let implement = Ulid::generate();
+    let fx = Fixture::with_workflow(
+        vec![
+            (
+                merge,
+                vec![report(
+                    "m1",
+                    merged(
+                        json!({"commits": [MERGE_SUBJECTS[0]]}),
+                        Some(typed_commits()),
+                    ),
+                )],
+            ),
+            (
+                implement,
+                vec![report("i1", reported("## Implement", json!({})))],
+            ),
+        ],
+        &commits_files(),
+    );
+    trace(&fx).await;
+
+    let prompts = child_prompts(&fx, implement);
+    assert_eq!(prompts.len(), 1, "one prompt for the implement step");
+    assert!(
+        prompts[0].contains(MERGE_SUBJECTS[0]),
+        "the slot's own subject renders: {}",
+        prompts[0]
+    );
+    assert!(
+        !prompts[0].contains(MERGE_SUBJECTS[1]),
+        "the typed field does not add to a slot that named its own commits: {}",
+        prompts[0]
+    );
+}
+
+/// A `commits` list whose items carry no subject still fails the render, and
+/// names the slot, before the step's child exists.
+#[tokio::test]
+async fn a_commits_slot_without_subjects_still_fails_the_render() {
+    let merge = Ulid::generate();
+    let implement = Ulid::generate();
+    let fx = Fixture::with_workflow(
+        vec![
+            (
+                merge,
+                vec![report(
+                    "m1",
+                    merged(json!({"commits": [{"sha": MERGE_SHAS[0]}]}), None),
+                )],
+            ),
+            (
+                implement,
+                vec![report("i1", reported("## Implement", json!({})))],
+            ),
+        ],
+        &commits_files(),
+    );
+    let run = trace(&fx).await;
+    match run.terminal {
+        Advanced::WaitingHuman { gate, .. } => assert_eq!(gate, "render_failed"),
+        other => panic!("an unreadable commits slot waits for a human, got {other:?}"),
+    }
+    let events = fx.lead_events();
+    let shown = gate_shown(&events);
+    assert_eq!(shown.first().map(String::as_str), Some("implement"));
+    assert!(
+        shown.get(2).is_some_and(|error| error.contains("commits")),
+        "the gate names the slot it could not render: {shown:?}"
+    );
+    assert!(
+        !fx.child_exists(implement),
+        "no child exists for a step whose template cannot render"
+    );
+}
+
+/// On the bundled workflow, a brief that names its commits only in the typed
+/// field reaches the implementer's prompt and E2 reads the same subjects, so
+/// the run checks, pushes and closes.
+#[tokio::test]
+async fn typed_commits_name_e2_s_subjects() {
+    let brief_child = Ulid::generate();
+    let implementer_child = Ulid::generate();
+    let mut brief = brief_report();
+    brief["slots"]
+        .as_object_mut()
+        .expect("the brief's report has a slots map")
+        .remove("commits");
+    brief["commits"] = typed(&NAMED_SUBJECTS, &MERGE_SHAS);
+    let fx = &Fixture::new(vec![
+        (brief_child, vec![report("r1", brief)]),
+        (implementer_child, vec![report("r2", implementer_report())]),
+    ]);
+    let mut committed = false;
+    let run = trace_between(fx, |_| {
+        commit_what_the_brief_named(fx, implementer_child, &mut committed)
+    })
+    .await;
+
+    assert_eq!(
+        run.terminal,
+        Advanced::Finished {
+            outcome: aigentic_log::RunOutcome::Closed,
+        },
+        "typed commits carry the brief's named subjects through the run"
+    );
+    let checks = checks_run(run.lead());
+    assert_eq!(checks.len(), 1, "one checks_run for the writing step");
+    assert_eq!(checks[0].step, "implement-alone");
+    assert_eq!(
+        checks[0]
+            .checks
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["E1", "E2", "E3"],
+        "the step's checks, in the workflow's order"
+    );
+    assert!(
+        checks[0]
+            .checks
+            .iter()
+            .all(|check| check.result == aigentic_log::CheckResult::Pass),
+        "the typed commits name E2's subjects: {:?}",
+        checks[0].checks
+    );
 }

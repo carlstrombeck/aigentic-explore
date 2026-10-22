@@ -152,11 +152,6 @@ fn commit_subjects(value: &Value) -> Option<Vec<String>> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// The slot map (commit 3 moves this into `runner/slots.rs` and adds the
-// template line)
-// ---------------------------------------------------------------------------
-
 impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
     /// The slot map one step's template is rendered with: every earlier
     /// step's report, then the runner's own slots, which win.
@@ -279,6 +274,22 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 continue;
             };
             if let Some((mut report, _)) = self.report_of(&id, record.attempt)? {
+                if let Some(commits) = report.commits.as_ref() {
+                    let mut slots = report.slots.take().unwrap_or_default();
+                    // A step's commits reach the steps after it through the
+                    // `commits` slot; a report may state them in the typed
+                    // field instead. The slot's own word wins when a report
+                    // states both.
+                    slots.entry("commits".to_owned()).or_insert_with(|| {
+                        Value::Array(
+                            commits
+                                .iter()
+                                .map(|commit| Value::String(commit.subject.clone()))
+                                .collect(),
+                        )
+                    });
+                    report.slots = Some(slots);
+                }
                 report.slots = report
                     .slots
                     .map(|slots| normalized(slots, &self.workflow.workflow.slots));
