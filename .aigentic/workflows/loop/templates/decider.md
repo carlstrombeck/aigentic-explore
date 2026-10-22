@@ -19,6 +19,6 @@ You are the decider for #{{issue}}: {{title}}. You edit no file. Never read, pri
 End by calling `finish_step` once, with `status: done` and `decide` holding:
 
 - `proposal`: `go` when the spec is sound enough for the merger to run and no real choice is left open, `amend` otherwise;
-- `items`: one per problem found — `kind: "fact"` with the `file:line` that contradicts the spec, or `kind: "choice"` with the options and which way the purpose points. `item` is the number of the `## Spec check` item or spec section it is about, when there is one.
+- `items`: one per problem found — `kind: "fact"` with the `file:line` that contradicts the spec, or `kind: "choice"` with `text` the one-line question, `options` one row per label it can be answered with (`{"label": "a", "text": "what picking it does", "reason": "why"}`), and `recommended` the label the purpose points to. A choice no set of rows settles takes no `options`. `item` is the number of the `## Spec check` item or spec section it is about, when there is one.
 
 `body` holds the ordinary short report: the person reads it when the gate waits. Do not post yourself.
