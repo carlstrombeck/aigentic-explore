@@ -6,6 +6,7 @@
 
 use aigentic_api::JobRow;
 use aigentic_runtime::aigentic_core::{RiskClass, ToolCall};
+use aigentic_runtime::aigentic_log::{DecideItem, DecideOption};
 use aigentic_runtime::aigentic_policy::{prefix_of, riskiest_segment};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ulid::Ulid;
@@ -48,6 +49,11 @@ pub enum Pick {
     RaiseRun,
     /// Leave the followed run waiting: the prompt goes, nothing is sent.
     LeaveWaiting,
+    /// One option row of a decide gate's choice question; `label` is the
+    /// decider's bare `a`/`b`, so the clause composed from it names the
+    /// option and not the row's drawn text. Only a gate's question builds
+    /// it.
+    Choice { label: String },
     /// Switch the thread to the proposal's project (issue #82).
     SwitchYes,
     /// Turn the proposal down: the thread stays here.
@@ -128,6 +134,9 @@ pub enum Keyed {
     /// The composer should take the prompt's text: a deny's reason
     /// (Esc does the same) or a question's free text.
     Text,
+    /// A choice question's Esc: put the gate's own picker back, having
+    /// sent nothing.
+    Flat,
 }
 
 /// An `ask_human` call's questions: the one being answered and the
@@ -163,6 +172,12 @@ pub struct Menu {
     pub picked: Vec<bool>,
     /// The questions, while the menu is a question's.
     pub questions: Option<Questions>,
+    /// A dim line drawn under the title and above the body: what the
+    /// questions came to.
+    pub lead: Option<String>,
+    /// The picker a question's Esc returns to; `None` on every menu that
+    /// is not a gate asking its choices.
+    pub flat: Option<Box<Menu>>,
 }
 
 /// The header in plain words, per risk class; an MCP tool by name.
@@ -195,6 +210,68 @@ pub fn main_arg(call: &ToolCall) -> String {
         .and_then(|v| v.as_str())
         .map(str::to_owned)
         .unwrap_or_else(|| call.args.to_string())
+}
+
+/// The suffix a choice row carries when the decider recommends it.
+const RECOMMENDED: &str = " (recommended)";
+
+/// A decide gate's choices as widget questions: one per item, in the
+/// order the decider reported them, and among an item's options the
+/// recommended one first, marked, the rest in the order they were
+/// written. An item with no options yields a question with none, which
+/// the `Other` row answers in the composer.
+fn choice_questions(choices: &[DecideItem]) -> Vec<aigentic_api::AskedQuestion> {
+    choices
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let mut options: Vec<&DecideOption> = item.options.iter().collect();
+            if let Some(label) = item.recommended.as_deref()
+                && let Some(at) = options.iter().position(|o| o.label == label)
+            {
+                let first = options.remove(at);
+                options.insert(0, first);
+            }
+            aigentic_api::AskedQuestion {
+                question: item.text.clone(),
+                header: Some(item_heading(item, i + 1)),
+                options: options
+                    .into_iter()
+                    .map(|o| aigentic_api::AskedOption {
+                        label: format!(
+                            "{}. {}{}",
+                            o.label,
+                            o.text,
+                            if item.recommended.as_deref() == Some(o.label.as_str()) {
+                                RECOMMENDED
+                            } else {
+                                ""
+                            }
+                        ),
+                        description: o.reason.clone(),
+                    })
+                    .collect(),
+                multi: false,
+            }
+        })
+        .collect()
+}
+
+/// The heading naming an item: its own number when the decider gave one,
+/// its 1-based position otherwise, so the clause a person reads at the
+/// gate is the one `decide.md` spells.
+fn item_heading(item: &DecideItem, position: usize) -> String {
+    match item.item {
+        Some(n) => format!("item {n}"),
+        None => format!("item {position}"),
+    }
+}
+
+/// The decider's own label of a choice row, `a`/`b`, out of the drawn
+/// label `choice_questions` writes as `{label}. {text}`: only the clause
+/// names the bare label.
+fn bare_label(label: &str) -> &str {
+    label.split_once(". ").map_or(label, |(bare, _)| bare)
 }
 
 impl Menu {
@@ -275,6 +352,8 @@ impl Menu {
             multi: false,
             picked: Vec::new(),
             questions: None,
+            lead: None,
+            flat: None,
         }
     }
 
@@ -285,11 +364,17 @@ impl Menu {
     /// stray Enter never stops or continues a run. A gate that offers
     /// `raise` and says what a raise takes gets a raise row last, where it
     /// moves none of the numbers already answering the gate.
+    ///
+    /// A decide gate's `choices` replace those rows with one question per
+    /// item, the decider's recommendation first and on the cursor, so the
+    /// gate is answered by Enter. The picker is kept for Esc; with no
+    /// choices the menu is that picker, row for row.
     pub fn checkpoint(
         gate: &str,
         shown: &[String],
         options: &[String],
         raise_usd: Option<f64>,
+        choices: &[DecideItem],
     ) -> Self {
         let offered = |word: &str| options.iter().any(|option| option == word);
         let row = |label: &str, pick: Pick| Row {
@@ -322,7 +407,7 @@ impl Menu {
             .position(|row| row.pick == Pick::LeaveWaiting)
             .unwrap_or(0);
         let note = offered("amend").then(|| "or type: amend <the changes>".to_owned());
-        Self {
+        let flat = Self {
             kind: Kind::Checkpoint,
             title: format!("checkpoint {gate}"),
             body: shown.join("\n"),
@@ -332,7 +417,25 @@ impl Menu {
             multi: false,
             picked: Vec::new(),
             questions: None,
+            lead: None,
+            flat: None,
+        };
+        if choices.is_empty() {
+            return flat;
         }
+        let mut menu = flat.clone();
+        menu.questions = Some(Questions {
+            all: choice_questions(choices),
+            at: 0,
+            answers: Vec::new(),
+        });
+        menu.lead = Some(format!(
+            "{} choices to answer; full text above",
+            choices.len()
+        ));
+        menu.flat = Some(Box::new(flat));
+        menu.show_choice();
+        menu
     }
 
     /// The switch proposal (issue #82; ADR 0002): a proposal is answered
@@ -374,6 +477,8 @@ impl Menu {
             multi: false,
             picked: Vec::new(),
             questions: None,
+            lead: None,
+            flat: None,
         }
     }
 
@@ -403,6 +508,8 @@ impl Menu {
             multi: false,
             picked: Vec::new(),
             questions: None,
+            lead: None,
+            flat: None,
         }
     }
 
@@ -431,6 +538,8 @@ impl Menu {
             multi: false,
             picked: Vec::new(),
             questions: None,
+            lead: None,
+            flat: None,
         }
     }
 
@@ -468,6 +577,8 @@ impl Menu {
                 at: 0,
                 answers: Vec::new(),
             }),
+            lead: None,
+            flat: None,
         };
         let first = menu
             .questions
@@ -528,6 +639,99 @@ impl Menu {
         }
     }
 
+    /// Render the current question of a decide gate: the item's heading
+    /// and words as the title, the row for each of its options in the
+    /// order `choice_questions` gave them, the cursor on the first (the
+    /// recommendation), and always an `Other` row for an answer in the
+    /// person's own words.
+    fn show_choice(&mut self) {
+        let Some(question) = self
+            .questions
+            .as_ref()
+            .and_then(|q| q.all.get(q.at))
+            .cloned()
+        else {
+            return;
+        };
+        let head = self
+            .flat
+            .as_deref()
+            .map(|flat| flat.title.clone())
+            .unwrap_or_default();
+        let heading = question.header.clone().unwrap_or_default();
+        self.title = format!("{head} · {heading}: {}", question.question);
+        self.multi = false;
+        self.selected = 0;
+        self.rows = question
+            .options
+            .iter()
+            .map(|o| Row {
+                label: o.label.clone(),
+                desc: o.description.clone(),
+                pick: Pick::Choice {
+                    label: bare_label(&o.label).to_owned(),
+                },
+            })
+            .collect();
+        self.rows.push(Row {
+            label: "Other: type your own".into(),
+            desc: None,
+            pick: Pick::Other,
+        });
+        self.picked = vec![false; self.rows.len()];
+        self.note = self.rows.iter().find_map(|row| match &row.pick {
+            Pick::Choice { label } if row.label.ends_with(RECOMMENDED) => {
+                Some(format!("the decider points to {label}"))
+            }
+            _ => None,
+        });
+    }
+
+    /// The current question's heading, `item 3`, as `choice_questions`
+    /// wrote it.
+    fn heading(&self) -> Option<String> {
+        let questions = self.questions.as_ref()?;
+        questions.all.get(questions.at)?.header.clone()
+    }
+
+    /// Record `contribution` as the current question's answer: the next
+    /// question comes up, or the whole amendment is `Some` on the last.
+    /// Answering a question again replaces its clause, so a refused send
+    /// cannot compose the same item twice.
+    fn answer_item(&mut self, contribution: String) -> Option<String> {
+        {
+            let questions = self.questions.as_mut()?;
+            if questions.answers.len() == questions.at {
+                questions.answers.push(contribution);
+            } else {
+                questions.answers[questions.at] = contribution;
+            }
+            if questions.at + 1 >= questions.all.len() {
+                return Some(questions.answers.join("; "));
+            }
+            questions.at += 1;
+        }
+        self.show_choice();
+        None
+    }
+
+    /// The current question answered with one of its option rows: `None`
+    /// and nothing changed when no row carries that label, the next
+    /// question's menu when one follows, else the whole amendment.
+    pub fn answer_option(&mut self, label: &str) -> Option<String> {
+        let offered = self.rows.iter().any(|row| {
+            row.pick
+                == Pick::Choice {
+                    label: label.into(),
+                }
+        });
+        if !offered {
+            return None;
+        }
+        let heading = self.heading()?;
+        self.answer_item(format!("{heading} option {label}"))
+    }
+
     /// A free-text answer to the current question, headed like any
     /// other.
     pub fn free_text(&self, text: &str) -> String {
@@ -576,6 +780,16 @@ impl Menu {
             }
             // Esc opens the reason input on the deny row, at once.
             KeyCode::Esc if self.kind == Kind::Permission => Keyed::Text,
+            // Esc at a choice question goes back to the gate's own
+            // picker, at once: a draft stays in the composer, only the
+            // answers so far go.
+            KeyCode::Esc
+                if self.kind == Kind::Checkpoint
+                    && self.questions.is_some()
+                    && self.flat.is_some() =>
+            {
+                Keyed::Flat
+            }
             // Esc on a checkpoint leaves the run waiting, at once.
             KeyCode::Esc if self.kind == Kind::Checkpoint => self.pick_of(&Pick::LeaveWaiting),
             // Esc on a switch proposal is `No, stay here`, at once.
@@ -756,6 +970,15 @@ impl Menu {
             },
             // The changes are typed next: the composer takes them.
             Pick::AmendRun => Keyed::Text,
+            // An option of a choice question: what the person saw is the
+            // echo, the pick carries the label the clause names.
+            Pick::Choice { label } => Keyed::Decide {
+                pick: Pick::Choice {
+                    label: label.clone(),
+                },
+                reason: None,
+                echo: format!("↳ {}", row.label),
+            },
             Pick::LeaveWaiting => Keyed::Decide {
                 pick: Pick::LeaveWaiting,
                 reason: None,
@@ -772,13 +995,23 @@ impl Menu {
         }
     }
 
+    /// The gate's own picker: the rows Esc returns to while a question is
+    /// up, else this menu.
+    fn gate_picker(&self) -> &Menu {
+        self.flat.as_deref().unwrap_or(self)
+    }
+
     /// A typed line at a checkpoint: a row's number, `go`, `stop`,
     /// `wait`, or `amend <text>`, each only when the gate offers it.
-    /// Anything else is not the prompt's.
+    /// Anything else is not the prompt's. The words are the gate's, read
+    /// from its picker and so still there while a question is up; the
+    /// numbers are the rows on screen.
     fn checkpoint_line(&self, text: &str) -> Option<Keyed> {
         let (word, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
         let rest = rest.trim();
-        let offers = |pick: &Pick| self.rows.iter().any(|row| &row.pick == pick);
+        let picker = self.gate_picker();
+        let offers = |pick: &Pick| picker.rows.iter().any(|row| &row.pick == pick);
+        let pick_of = |pick: &Pick| picker.pick_of(pick);
         let word = answer_word(word);
         match (word.as_str(), rest.is_empty()) {
             (digits, true) if digits.parse::<usize>().is_ok() => {
@@ -786,11 +1019,11 @@ impl Menu {
                 (n >= 1 && n <= self.rows.len()).then(|| self.pick(n - 1))
             }
             ("go" | "continue", true) if offers(&Pick::ContinueRun) => {
-                Some(self.pick_of(&Pick::ContinueRun))
+                Some(pick_of(&Pick::ContinueRun))
             }
-            ("stop", true) => Some(self.pick_of(&Pick::StopRun)),
-            ("retry", true) if offers(&Pick::RetryRun) => Some(self.pick_of(&Pick::RetryRun)),
-            ("wait" | "leave", true) => Some(self.pick_of(&Pick::LeaveWaiting)),
+            ("stop", true) => Some(pick_of(&Pick::StopRun)),
+            ("retry", true) if offers(&Pick::RetryRun) => Some(pick_of(&Pick::RetryRun)),
+            ("wait" | "leave", true) => Some(pick_of(&Pick::LeaveWaiting)),
             ("amend", false) if offers(&Pick::AmendRun) => Some(Keyed::Decide {
                 pick: Pick::AmendRun,
                 reason: Some(rest.to_owned()),
@@ -958,6 +1191,7 @@ impl Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aigentic_runtime::aigentic_log::DecideItemKind;
     use serde_json::json;
 
     fn bash(command: &str) -> ToolCall {
@@ -1817,7 +2051,7 @@ mod tests {
             .iter()
             .map(|word| word.to_string())
             .collect();
-        let menu = Menu::checkpoint("decide", &[], &options, None);
+        let menu = Menu::checkpoint("decide", &[], &options, None, &[]);
         for (typed, pick) in [
             ("go.", Pick::ContinueRun),
             ("Go.", Pick::ContinueRun),
@@ -1846,7 +2080,7 @@ mod tests {
             .iter()
             .map(|word| word.to_string())
             .collect();
-        let menu = Menu::checkpoint("decide", &[], &options, None);
+        let menu = Menu::checkpoint("decide", &[], &options, None, &[]);
         let picked = menu
             .checkpoint_line("amend: use the third option")
             .expect("an amendment");
@@ -1862,7 +2096,257 @@ mod tests {
         assert_eq!(menu.checkpoint_line("go now"), None);
         // A gate that offers `stop` alone offers no amendment, whatever
         // the punctuation.
-        let stop_only = Menu::checkpoint("decide", &[], &["stop".to_string()], None);
+        let stop_only = Menu::checkpoint("decide", &[], &["stop".to_string()], None, &[]);
         assert_eq!(stop_only.checkpoint_line("amend: x"), None);
+    }
+
+    /// A gate's choices: item 3 has two options, the second recommended,
+    /// and item 5 one option with no recommendation.
+    fn choice_items() -> Vec<DecideItem> {
+        vec![
+            DecideItem {
+                item: Some(3),
+                kind: DecideItemKind::Choice,
+                text: "which temp dir".to_owned(),
+                options: vec![
+                    DecideOption {
+                        label: "b".to_owned(),
+                        text: "keep the repo's own".to_owned(),
+                        reason: Some("the run reads it".to_owned()),
+                    },
+                    DecideOption {
+                        label: "a".to_owned(),
+                        text: "use the system temp".to_owned(),
+                        reason: Some("the system cleans it".to_owned()),
+                    },
+                ],
+                recommended: Some("a".to_owned()),
+            },
+            DecideItem {
+                item: Some(5),
+                kind: DecideItemKind::Choice,
+                text: "which name".to_owned(),
+                options: vec![DecideOption {
+                    label: "c".to_owned(),
+                    text: "name it after the issue".to_owned(),
+                    reason: None,
+                }],
+                recommended: None,
+            },
+        ]
+    }
+
+    /// A choice row's label as the gate draws it: the decider's own label
+    /// and words, the recommendation marked.
+    fn choice_label(option: &DecideOption, recommended: Option<&str>) -> String {
+        let mark = if recommended == Some(option.label.as_str()) {
+            " (recommended)"
+        } else {
+            ""
+        };
+        format!("{}. {}{mark}", option.label, option.text)
+    }
+
+    /// A gate with no choices is the picker it always was: no questions,
+    /// no lead, the same rows, nothing to return to.
+    #[test]
+    fn a_gate_without_choices_is_todays_picker() {
+        let options: Vec<String> = ["go", "amend", "stop"]
+            .iter()
+            .map(|word| word.to_string())
+            .collect();
+        let menu = Menu::checkpoint("decide", &["shown".to_owned()], &options, None, &[]);
+        assert!(menu.questions.is_none());
+        assert!(menu.flat.is_none());
+        assert!(menu.lead.is_none());
+        let labels: Vec<&str> = menu.rows.iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Continue",
+                "Continue with changes",
+                "Leave it waiting",
+                "Stop the run"
+            ]
+        );
+        let mut expected = vec![format!("[checkpoint] {}", menu.title), "  shown".to_owned()];
+        for (i, label) in labels.iter().enumerate() {
+            expected.push(format!("  {}. {label}", i + 1));
+        }
+        expected.extend(menu.note.iter().map(|note| format!("  {note}")));
+        assert_eq!(menu.plain(), expected);
+    }
+
+    /// The recommendation is the row the cursor is on, at the top, and
+    /// marked; the item's own number and words head the question.
+    #[test]
+    fn a_choice_question_puts_the_recommendation_first() {
+        let items = choice_items();
+        let menu = Menu::checkpoint(
+            "decide",
+            &["shown".to_owned()],
+            &["go", "amend", "stop"].map(str::to_owned),
+            None,
+            &items,
+        );
+        let first = &items[0];
+        let recommended = first.recommended.as_deref().expect("the fixture names one");
+        let mut expected: Vec<String> = Vec::new();
+        expected.push(choice_label(
+            first
+                .options
+                .iter()
+                .find(|o| o.label == recommended)
+                .expect("the recommendation is an option"),
+            first.recommended.as_deref(),
+        ));
+        expected.extend(
+            first
+                .options
+                .iter()
+                .filter(|o| o.label != recommended)
+                .map(|o| choice_label(o, first.recommended.as_deref())),
+        );
+        expected.push("Other: type your own".to_owned());
+        let labels: Vec<String> = menu.rows.iter().map(|row| row.label.clone()).collect();
+        assert_eq!(labels, expected);
+        assert_eq!(menu.selected, 0, "the cursor is on the recommendation");
+        assert_eq!(
+            menu.rows[0].pick,
+            Pick::Choice {
+                label: recommended.to_owned()
+            }
+        );
+        let note = format!("the decider points to {recommended}");
+        assert_eq!(menu.note.as_deref(), Some(note.as_str()));
+        let heading = format!("item {}", first.item.expect("numbered in the fixture"));
+        assert_eq!(
+            menu.title,
+            format!("checkpoint decide · {heading}: {}", first.text)
+        );
+    }
+
+    /// An item the decider gave no number gets its position, in the
+    /// heading and in the clause: the line still names one item.
+    #[test]
+    fn a_numbered_item_without_a_number_uses_its_position() {
+        let items = vec![
+            DecideItem {
+                item: Some(3),
+                kind: DecideItemKind::Choice,
+                text: "which temp dir".to_owned(),
+                options: vec![DecideOption {
+                    label: "a".to_owned(),
+                    text: "the system temp".to_owned(),
+                    reason: None,
+                }],
+                recommended: Some("a".to_owned()),
+            },
+            DecideItem {
+                item: None,
+                kind: DecideItemKind::Choice,
+                text: "which name".to_owned(),
+                options: vec![DecideOption {
+                    label: "d".to_owned(),
+                    text: "name it after the issue".to_owned(),
+                    reason: None,
+                }],
+                recommended: None,
+            },
+        ];
+        let first_item = items[0].item.expect("numbered in the fixture");
+        let first_label = items[0].options[0].label.as_str();
+        let mut menu = Menu::checkpoint("decide", &[], &["amend".to_string()], None, &items);
+        assert_eq!(
+            menu.answer_option(first_label),
+            None,
+            "the second question is next"
+        );
+        assert_eq!(
+            menu.title,
+            format!("checkpoint decide · item 2: {}", items[1].text)
+        );
+        let first = format!("item {} option {}", first_item, first_label);
+        let last = format!("item 2 option {}", items[1].options[0].label);
+        assert_eq!(
+            menu.answer_option(&items[1].options[0].label),
+            Some(format!("{first}; {last}")),
+            "the last answer composes the whole amendment"
+        );
+    }
+
+    /// A pipe prints a gate's first question whole and the proposal it
+    /// asks about, once.
+    #[test]
+    fn plain_mode_lists_the_first_question_and_the_whole_body() {
+        let items = choice_items();
+        let shown = ["plan ready".to_owned(), "second line".to_owned()];
+        let menu = Menu::checkpoint("decide", &shown, &["amend".to_string()], None, &items);
+        let lines = menu.plain();
+        assert_eq!(lines[0], format!("[checkpoint] {}", menu.title));
+        assert!(lines[0].contains("item 3"), "{lines:?}");
+        let body: Vec<String> = shown.iter().map(|l| format!("  {l}")).collect();
+        assert_eq!(&lines[1..1 + body.len()], &body[..]);
+        let first = &items[0];
+        let recommended = first.recommended.as_deref().expect("the fixture names one");
+        let ordered: Vec<&DecideOption> = first
+            .options
+            .iter()
+            .filter(|o| o.label == recommended)
+            .chain(first.options.iter().filter(|o| o.label != recommended))
+            .collect();
+        let mut rows: Vec<String> = ordered
+            .iter()
+            .enumerate()
+            .map(|(i, o)| {
+                let why = o
+                    .reason
+                    .as_ref()
+                    .map(|r| format!(" · {r}"))
+                    .unwrap_or_default();
+                format!(
+                    "  {}. {}{why}",
+                    i + 1,
+                    choice_label(o, first.recommended.as_deref())
+                )
+            })
+            .collect();
+        rows.push(format!("  {}. Other: type your own", rows.len() + 1));
+        assert_eq!(
+            &lines[1 + body.len()..1 + body.len() + rows.len()],
+            &rows[..],
+            "{lines:?}"
+        );
+    }
+
+    /// The gate's words and its whole amendment are still there while a
+    /// question is up: the escape hatches never wait on the answers.
+    #[test]
+    fn stop_and_wait_still_work_while_a_question_is_up() {
+        let items = choice_items();
+        let menu = Menu::checkpoint(
+            "decide",
+            &[],
+            &["go", "amend", "stop"].map(str::to_owned),
+            None,
+            &items,
+        );
+        assert!(menu.questions.is_some());
+        let picker = menu.flat.as_deref().expect("the picker is kept");
+        for (typed, pick) in [
+            ("stop", Pick::StopRun),
+            ("wait", Pick::LeaveWaiting),
+            ("go", Pick::ContinueRun),
+        ] {
+            assert_eq!(menu.line(typed), Some(picker.pick_of(&pick)), "{typed:?}");
+        }
+        match menu.line("amend keep it") {
+            Some(Keyed::Decide {
+                pick: Pick::AmendRun,
+                reason: Some(text),
+                ..
+            }) => assert_eq!(text, "keep it"),
+            other => panic!("{other:?} is not the whole amendment"),
+        }
     }
 }

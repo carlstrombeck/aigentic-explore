@@ -456,6 +456,9 @@ fn block_lines(menu: &Menu, width: usize, full_above: bool) -> Vec<Line<'static>
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut lines = vec![Line::from(Span::styled(format!(" {}", menu.title), head))];
+    if let Some(lead) = &menu.lead {
+        lines.extend(hang(lead, 3, width, dim));
+    }
     lines.extend(body_lines(menu, width, full_above));
     let inner = width.saturating_sub(6).max(1);
     for (i, row) in menu.rows.iter().enumerate() {
@@ -2075,6 +2078,7 @@ mod tests {
             &["plan ready".to_owned()],
             &["stop".to_owned()],
             None,
+            &[],
         );
         let drawn = text(&block_lines(&menu, 40, false));
         // The first row carries the selection marker; the labels are the
@@ -2092,6 +2096,105 @@ mod tests {
             );
         }
         assert_eq!(menu.rows.len(), 2, "two picks, no more");
+    }
+
+    /// A gate's choices: item 3 has two options, the second recommended,
+    /// and item 5 one option with no recommendation.
+    fn choice_items() -> Vec<aigentic_runtime::aigentic_log::DecideItem> {
+        use aigentic_runtime::aigentic_log::{DecideItem, DecideItemKind, DecideOption};
+        vec![
+            DecideItem {
+                item: Some(3),
+                kind: DecideItemKind::Choice,
+                text: "which temp dir".to_owned(),
+                options: vec![
+                    DecideOption {
+                        label: "b".to_owned(),
+                        text: "keep the repo's own".to_owned(),
+                        reason: Some("the run reads it".to_owned()),
+                    },
+                    DecideOption {
+                        label: "a".to_owned(),
+                        text: "use the system temp".to_owned(),
+                        reason: Some("the system cleans it".to_owned()),
+                    },
+                ],
+                recommended: Some("a".to_owned()),
+            },
+            DecideItem {
+                item: Some(5),
+                kind: DecideItemKind::Choice,
+                text: "which name".to_owned(),
+                options: vec![DecideOption {
+                    label: "c".to_owned(),
+                    text: "name it after the issue".to_owned(),
+                    reason: None,
+                }],
+                recommended: None,
+            },
+        ]
+    }
+
+    /// The lead counts the gate's choices above the proposal it caps, and
+    /// a gate without choices draws exactly the block it always drew.
+    #[test]
+    fn the_lead_line_counts_the_choices() {
+        let items = choice_items();
+        let options = ["go", "amend", "stop"].map(str::to_owned);
+        let menu = Menu::checkpoint("decide", &["plan ready".to_owned()], &options, None, &items);
+        let lines = block_lines(&menu, 40, false);
+        let lead = format!("{} choices to answer; full text above", items.len());
+        assert_eq!(text(&lines)[1], format!("   {lead}"));
+        let lead_span = lines[1]
+            .spans
+            .iter()
+            .find(|s| s.content.contains(&lead))
+            .expect("the lead's own span");
+        assert!(
+            lead_span.style.add_modifier.contains(Modifier::DIM),
+            "the lead is dim: {:?}",
+            lines[1]
+        );
+        let plain = Menu::checkpoint("decide", &["plan ready".to_owned()], &options, None, &[]);
+        assert!(plain.lead.is_none());
+        let today = block_lines(&plain, 40, false);
+        assert_eq!(
+            text(&today)[..2],
+            [format!(" {}", plain.title), "   plan ready".to_owned()]
+        );
+        assert_eq!(today.len(), 2 + plain.rows.len() + 1, "rows and note");
+    }
+
+    /// The proposal the gate caps is committed to the scrollback once,
+    /// whatever question is up: the questions change the title, never the
+    /// body the transcript holds.
+    #[test]
+    fn the_gate_body_and_its_scrollback_line_do_not_change_with_the_questions() {
+        let shown: Vec<String> = (1..=25).map(|i| format!("line{i}")).collect();
+        let options = ["go", "amend", "stop"].map(str::to_owned);
+        let items = choice_items();
+        let mut menu = Menu::checkpoint("decide", &shown, &options, None, &items);
+        let today = Menu::checkpoint("decide", &shown, &options, None, &[]);
+        assert_eq!(menu.body, today.body);
+        let mut out = out_at(40);
+        assert!(out.body_in_full(Some("gate:g".into()), &menu));
+        assert_eq!(out.transcript.len(), 1, "one cell");
+        let Cell::Note(note) = &out.transcript[0] else {
+            panic!("the body is committed as a note: {:?}", out.transcript)
+        };
+        let (head, body) = note.split_once('\n').expect("a title and a body");
+        assert_eq!(head, menu.title);
+        assert_eq!(body, shown.join("\n"), "the proposal, byte for byte");
+        let label = items[0]
+            .recommended
+            .as_deref()
+            .expect("the fixture names one");
+        assert_eq!(menu.answer_option(label), None, "the next question is up");
+        assert!(
+            out.body_in_full(Some("gate:g".into()), &menu),
+            "still the gate's body"
+        );
+        assert_eq!(out.transcript.len(), 1, "nothing committed again");
     }
 
     /// #68's review: the grace is the drawn prompt's, so it restarts

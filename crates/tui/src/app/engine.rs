@@ -937,6 +937,9 @@ impl ClientRepl {
                         | Pick::StopRun
                         | Pick::RaiseRun
                         | Pick::LeaveWaiting
+                        // A choice question's option rows are the
+                        // checkpoint's, answered by `apply_checkpoint`.
+                        | Pick::Choice { .. }
                         | Pick::SwitchYes
                         | Pick::SwitchNo
                         | Pick::SwitchElsewhere
@@ -1649,7 +1652,8 @@ impl ClientRepl {
                     // dollar the person types, never a figure the guard
                     // reads as below the line it already passed.
                     let raise_usd = p.raise_usd.map(f64::ceil);
-                    let menu = Menu::checkpoint(&p.gate, &p.shown, &p.options, raise_usd);
+                    let menu =
+                        Menu::checkpoint(&p.gate, &p.shown, &p.options, raise_usd, &p.choices);
                     out.prompt(&menu);
                     self.checkpoint = Some(OpenGate {
                         lead,
@@ -1875,6 +1879,25 @@ impl ClientRepl {
                     .await;
             }
             Pick::RaiseRun => self.start_raising(out),
+            Pick::Choice { label } => {
+                let next = self
+                    .checkpoint
+                    .as_mut()
+                    .and_then(|open| open.menu.answer_option(&label));
+                match next {
+                    // The next question is up; the whole amendment waits
+                    // until every question has its clause.
+                    None => {
+                        if let Some(open) = self.checkpoint.as_ref() {
+                            out.prompt(&open.menu);
+                        }
+                    }
+                    Some(text) => {
+                        self.send_answer(aigentic_api::CheckpointAnswer::Amend, Some(text), out)
+                            .await;
+                    }
+                }
+            }
             Pick::LeaveWaiting => {
                 if let Some(open) = self.checkpoint.as_mut() {
                     open.shown = false;
@@ -1885,8 +1908,9 @@ impl ClientRepl {
                     "[left {gate} waiting: /answer answers it, /build <n> shows it again]"
                 ));
             }
-            // Neither a switch's picks nor anything else reaches here:
-            // a checkpoint menu offers only the six above.
+            // Neither a switch's picks nor anything else reaches here: a
+            // checkpoint menu offers only the six above, and its choice
+            // questions' option rows are answered above.
             Pick::Answer
             | Pick::Other
             | Pick::Allow { .. }
@@ -1900,6 +1924,25 @@ impl ClientRepl {
             | Pick::Job { .. }
             | Pick::CloseJob => {}
         }
+    }
+
+    /// Esc at a choice question: the gate's own picker comes back, with
+    /// the answers so far, and nothing is sent.
+    fn flatten_gate(&mut self, out: &mut dyn Printer) {
+        let Some(open) = self.checkpoint.as_mut() else {
+            return;
+        };
+        open.menu = *open
+            .menu
+            .flat
+            .take()
+            .expect("a question menu keeps its picker");
+        open.menu.questions = None;
+        open.menu.lead = None;
+        open.amending = false;
+        open.raising = false;
+        open.shown = true;
+        out.prompt(&open.menu);
     }
 
     /// `Continue with changes` picked without its text: the prompt goes
@@ -2136,6 +2179,7 @@ impl ClientRepl {
                 Keyed::Passed => MenuKey::Passed,
                 Keyed::Used => MenuKey::Used,
                 Keyed::Text => MenuKey::Passed,
+                Keyed::Flat => MenuKey::Passed,
                 keyed @ (Keyed::Decide { .. } | Keyed::Answer { .. }) => {
                     self.apply_confirm(keyed, out).await;
                     MenuKey::Used
@@ -2160,6 +2204,11 @@ impl ClientRepl {
                     self.start_amending(out);
                     MenuKey::Used
                 }
+                // Esc at a question: the gate's own picker, nothing sent.
+                Keyed::Flat => {
+                    self.flatten_gate(out);
+                    MenuKey::Used
+                }
                 keyed @ (Keyed::Decide { .. } | Keyed::Answer { .. }) => {
                     self.apply_checkpoint(keyed, out).await;
                     MenuKey::Used
@@ -2180,6 +2229,7 @@ impl ClientRepl {
                 Keyed::Passed => MenuKey::Passed,
                 Keyed::Used => MenuKey::Used,
                 Keyed::Text => MenuKey::Passed,
+                Keyed::Flat => MenuKey::Passed,
                 keyed @ (Keyed::Decide { .. } | Keyed::Answer { .. }) => {
                     self.apply_jobs(keyed, out).await;
                     MenuKey::Used
@@ -2193,6 +2243,7 @@ impl ClientRepl {
             Keyed::Passed => MenuKey::Passed,
             Keyed::Text => MenuKey::Text,
             Keyed::Used => MenuKey::Used,
+            Keyed::Flat => MenuKey::Passed,
             keyed @ (Keyed::Decide { .. } | Keyed::Answer { .. }) => {
                 self.apply(keyed, out).await;
                 MenuKey::Used
@@ -2227,6 +2278,9 @@ impl ClientRepl {
                     | Pick::StopRun
                     | Pick::RaiseRun
                     | Pick::LeaveWaiting
+                    // A choice question's option rows are the
+                    // checkpoint's, answered by `apply_checkpoint`.
+                    | Pick::Choice { .. }
                     | Pick::SwitchElsewhere
                     // The `/new` question is answered by `apply_confirm`,
                     // never by a daemon prompt's kind here (#108).
@@ -2241,7 +2295,7 @@ impl ClientRepl {
                 out.line(&echo);
                 self.answer_menu(&text, out).await;
             }
-            Keyed::Passed | Keyed::Used | Keyed::Text => {}
+            Keyed::Passed | Keyed::Used | Keyed::Text | Keyed::Flat => {}
         }
     }
 
@@ -9002,6 +9056,7 @@ mod tests {
             &["plan ready".to_owned()],
             &["stop".to_owned()],
             None,
+            &[],
         )
         .plain();
         assert_eq!(
@@ -9960,6 +10015,138 @@ mod tests {
             ] => assert_eq!(text, "split item 7"),
             other => panic!("the typed amendment is sent: {other:?}"),
         }
+        daemon.stop();
+    }
+
+    /// A gate's choices: item 3 has two options, the second recommended,
+    /// and item 5 one option with none.
+    fn choice_items() -> Vec<aigentic_runtime::aigentic_log::DecideItem> {
+        use aigentic_runtime::aigentic_log::{DecideItem, DecideItemKind, DecideOption};
+        vec![
+            DecideItem {
+                item: Some(3),
+                kind: DecideItemKind::Choice,
+                text: "which temp dir".to_owned(),
+                options: vec![
+                    DecideOption {
+                        label: "b".to_owned(),
+                        text: "keep the repo's own".to_owned(),
+                        reason: Some("the run reads it".to_owned()),
+                    },
+                    DecideOption {
+                        label: "a".to_owned(),
+                        text: "use the system temp".to_owned(),
+                        reason: Some("the system cleans it".to_owned()),
+                    },
+                ],
+                recommended: Some("a".to_owned()),
+            },
+            DecideItem {
+                item: Some(5),
+                kind: DecideItemKind::Choice,
+                text: "which name".to_owned(),
+                options: vec![DecideOption {
+                    label: "c".to_owned(),
+                    text: "name it after the issue".to_owned(),
+                    reason: None,
+                }],
+                recommended: None,
+            },
+        ]
+    }
+
+    /// A `checkpoint_asked` payload for `GATE` carrying `items` as the
+    /// decider's choices.
+    fn checkpoint_with_choices(
+        items: &[aigentic_runtime::aigentic_log::DecideItem],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "gate": GATE,
+            "shown": ["plan ready"],
+            "options": ["go", "amend", "stop"],
+            "choices": serde_json::to_value(items).expect("the items serialize"),
+        })
+    }
+
+    /// The clause the row Enter picks for `item` sends: its heading and the
+    /// label of the row the cursor starts on.
+    fn first_clause(item: &aigentic_runtime::aigentic_log::DecideItem, position: usize) -> String {
+        let heading = match item.item {
+            Some(n) => format!("item {n}"),
+            None => format!("item {position}"),
+        };
+        let label = item
+            .recommended
+            .clone()
+            .unwrap_or_else(|| item.options[0].label.clone());
+        format!("{heading} option {label}")
+    }
+
+    /// The acceptance criterion: one Enter per question, the recommended
+    /// row first on each, and the gate is answered once with both clauses.
+    #[tokio::test]
+    async fn enter_enters_answers_every_question_and_composes_one_amend() {
+        let items = choice_items();
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_with_choices(&items),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        assert!(
+            repl.menu().expect("the prompt is up").questions.is_some(),
+            "the gate asks its choices"
+        );
+        let before = daemon.requests().len();
+        for _ in &items {
+            repl.menu_key(&key_for_enter(), true, true, &mut out).await;
+        }
+        let clauses: Vec<String> = items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| first_clause(item, i + 1))
+            .collect();
+        match &daemon.requests()[before..] {
+            [
+                Request::AnswerCheckpoint {
+                    answer: aigentic_api::CheckpointAnswer::Amend,
+                    amendment: Some(text),
+                    ..
+                },
+            ] => assert_eq!(text, &clauses.join("; ")),
+            other => panic!("one amendment, not one per question: {other:?}"),
+        }
+        assert!(repl.menu().is_none(), "the gate is answered and gone");
+        daemon.stop();
+    }
+
+    /// Esc at a question, before anything is answered: the gate's own
+    /// picker comes back and the run is left waiting, as Esc there does.
+    #[tokio::test]
+    async fn esc_returns_to_the_picker_and_sends_nothing() {
+        let items = choice_items();
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_with_choices(&items),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let before = daemon.requests().len();
+        repl.menu_key(&key_for_esc(), true, true, &mut out).await;
+        let menu = repl.menu().expect("the picker is back");
+        assert!(menu.questions.is_none(), "the questions are gone");
+        assert!(menu.flat.is_none(), "and there is nothing behind it");
+        let options = ["go", "amend", "stop"].map(str::to_owned);
+        let today = Menu::checkpoint(GATE, &["plan ready".to_owned()], &options, None, &[]);
+        let expected: Vec<String> = today.rows.iter().map(|r| r.label.clone()).collect();
+        assert_eq!(row_labels(&repl), expected);
+        assert_eq!(daemon.requests().len(), before, "nothing was sent");
         daemon.stop();
     }
 
@@ -11438,6 +11625,7 @@ mod tests {
             &["ls".to_owned()],
             &["stop".to_owned()],
             None,
+            &[],
         ));
 
         let mut out = Recording::default();
