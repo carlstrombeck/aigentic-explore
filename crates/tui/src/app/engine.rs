@@ -446,6 +446,9 @@ pub struct OpenGate {
     /// `Continue with changes` was picked: the next plain line is the
     /// amendment.
     amending: bool,
+    /// A choice question's `Other` row was picked: the next plain line is
+    /// that item's answer.
+    texting: bool,
     /// `Raise the budget` was picked: the next plain line is the figure.
     raising: bool,
     /// What a raise would prefill, rounded up to a whole dollar at the
@@ -862,9 +865,35 @@ impl ClientRepl {
         // so `/build` and `/help` keep working with the prompt up. Only
         // while it is the prompt on screen, though: with the chat's
         // prompt up, a typed `1` is the chat's answer (#68's review).
-        // A figure or an amendment typed for the gate: whichever the
-        // pick armed, that is what the line answers. It returns before
-        // the menu sees the line, so a figure is never read as a row.
+        //
+        // A choice question's `Other` row was picked: this line is that
+        // item's answer, composed with the ones already given.
+        if self.prompted.is_none()
+            && !line.trim_start().starts_with('/')
+            && !line.trim().is_empty()
+            && self.checkpoint.as_ref().is_some_and(|open| open.texting)
+        {
+            let next = self.checkpoint.as_mut().and_then(|open| {
+                open.texting = false;
+                open.menu.answer_text(line.trim())
+            });
+            match next {
+                None => {
+                    if let Some(open) = self.checkpoint.as_mut() {
+                        open.shown = true;
+                        out.prompt(&open.menu);
+                    }
+                }
+                Some(text) => {
+                    self.send_answer(aigentic_api::CheckpointAnswer::Amend, Some(text), out)
+                        .await;
+                }
+            }
+            return;
+        }
+        // A figure or an amendment typed for the gate: whichever the pick
+        // armed, that is what the line answers. It returns before the menu
+        // sees the line, so a figure is never read as a row.
         let answering = self.answering();
         if self.prompted.is_none()
             && !line.trim_start().starts_with('/')
@@ -1661,6 +1690,7 @@ impl ClientRepl {
                         menu,
                         shown: true,
                         amending: false,
+                        texting: false,
                         raising: false,
                         raise_usd,
                         refused: None,
@@ -1902,6 +1932,7 @@ impl ClientRepl {
                 if let Some(open) = self.checkpoint.as_mut() {
                     open.shown = false;
                     open.amending = false;
+                    open.texting = false;
                     open.raising = false;
                 }
                 out.line(&format!(
@@ -1940,6 +1971,7 @@ impl ClientRepl {
         open.menu.questions = None;
         open.menu.lead = None;
         open.amending = false;
+        open.texting = false;
         open.raising = false;
         open.shown = true;
         out.prompt(&open.menu);
@@ -1951,9 +1983,26 @@ impl ClientRepl {
         if let Some(open) = self.checkpoint.as_mut() {
             open.shown = false;
             open.amending = true;
+            open.texting = false;
             open.raising = false;
             out.line(&format!(
                 "[type the changes for {} and press Enter; /answer stop stops the run]",
+                open.gate
+            ));
+        }
+    }
+
+    /// A choice question's `Other` row picked: the prompt goes and the next
+    /// plain line is that item's answer, composed with the answers already
+    /// given.
+    fn start_texting(&mut self, out: &mut dyn Printer) {
+        if let Some(open) = self.checkpoint.as_mut() {
+            open.shown = false;
+            open.texting = true;
+            open.amending = false;
+            open.raising = false;
+            out.line(&format!(
+                "[type the answer for {} and press Enter; /answer stop stops the run]",
                 open.gate
             ));
         }
@@ -1974,6 +2023,7 @@ impl ClientRepl {
         open.shown = false;
         open.raising = true;
         open.amending = false;
+        open.texting = false;
         out.line(&format!(
             "[raise to what? Enter sends {usd:.2}, Esc leaves the gate waiting]"
         ));
@@ -2199,9 +2249,18 @@ impl ClientRepl {
             return match keyed {
                 Keyed::Passed => MenuKey::Passed,
                 Keyed::Used => MenuKey::Used,
-                // `Continue with changes`: the composer takes the text.
+                // `Continue with changes` takes the whole amendment; a
+                // choice question's `Other` row takes that item's answer.
                 Keyed::Text => {
-                    self.start_amending(out);
+                    let asking = self
+                        .checkpoint
+                        .as_ref()
+                        .is_some_and(|open| open.menu.questions.is_some());
+                    if asking {
+                        self.start_texting(out);
+                    } else {
+                        self.start_amending(out);
+                    }
                     MenuKey::Used
                 }
                 // Esc at a question: the gate's own picker, nothing sent.
@@ -10147,6 +10206,99 @@ mod tests {
         let expected: Vec<String> = today.rows.iter().map(|r| r.label.clone()).collect();
         assert_eq!(row_labels(&repl), expected);
         assert_eq!(daemon.requests().len(), before, "nothing was sent");
+        daemon.stop();
+    }
+
+    /// An `Other` row answers its own item in the person's words; the rest
+    /// of the gate is answered by rows, and the clauses join in order.
+    #[tokio::test]
+    async fn type_my_own_answers_that_item_only() {
+        let items = choice_items();
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_with_choices(&items),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        let rows = row_labels(&repl);
+        let other = rows
+            .iter()
+            .position(|label| label == "Other: type your own")
+            .expect("the row is drawn at a question");
+        let before = daemon.requests().len();
+        repl.menu_key(
+            &key_for(char::from_digit(other as u32 + 1, 10).unwrap()),
+            true,
+            true,
+            &mut out,
+        )
+        .await;
+        assert_eq!(daemon.requests().len(), before, "the row is not an answer");
+        repl.handle_line("keep the temp dir", &mut out).await;
+        assert!(
+            repl.menu()
+                .expect("the next question is up")
+                .questions
+                .is_some(),
+            "the gate asks what is left"
+        );
+        repl.menu_key(&key_for_enter(), true, true, &mut out).await;
+        let expected = format!("item 3: keep the temp dir; {}", first_clause(&items[1], 2));
+        match &daemon.requests()[before..] {
+            [
+                Request::AnswerCheckpoint {
+                    answer: aigentic_api::CheckpointAnswer::Amend,
+                    amendment: Some(text),
+                    ..
+                },
+            ] => assert_eq!(text, &expected),
+            other => panic!("one amendment, both clauses: {other:?}"),
+        }
+        daemon.stop();
+    }
+
+    /// An item with no options asks for its answer in the composer, and
+    /// that answer is the whole amendment.
+    #[tokio::test]
+    async fn a_choice_without_options_takes_typed_text() {
+        use aigentic_runtime::aigentic_log::{DecideItem, DecideItemKind};
+        let items = vec![DecideItem {
+            item: Some(7),
+            kind: DecideItemKind::Choice,
+            text: "split it?".to_owned(),
+            options: Vec::new(),
+            recommended: None,
+        }];
+        let lead_id = Ulid::generate();
+        let backlog = vec![run_event(
+            lead_id,
+            1,
+            EventKind::CheckpointAsked,
+            checkpoint_with_choices(&items),
+        )];
+        let (mut repl, mut out, daemon) = repl_for(lead_id, backlog).await;
+        repl.handle_line("/build 58", &mut out).await;
+        assert_eq!(row_labels(&repl), ["Other: type your own"], "one row");
+        let before = daemon.requests().len();
+        repl.menu_key(&key_for_enter(), true, true, &mut out).await;
+        repl.handle_line("split item 7", &mut out).await;
+        let heading = match items[0].item {
+            Some(n) => format!("item {n}"),
+            None => panic!("the fixture numbers its item"),
+        };
+        match &daemon.requests()[before..] {
+            [
+                Request::AnswerCheckpoint {
+                    answer: aigentic_api::CheckpointAnswer::Amend,
+                    amendment: Some(text),
+                    ..
+                },
+            ] => assert_eq!(text, &format!("{heading}: split item 7")),
+            other => panic!("the typed answer is the amendment: {other:?}"),
+        }
         daemon.stop();
     }
 

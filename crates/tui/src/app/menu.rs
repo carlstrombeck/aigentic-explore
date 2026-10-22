@@ -732,6 +732,20 @@ impl Menu {
         self.answer_item(format!("{heading} option {label}"))
     }
 
+    /// A free-text answer to the current question, headed like any other
+    /// and composed with the answers already given; `None` when no
+    /// question is up.
+    pub fn answer_text(&mut self, text: &str) -> Option<String> {
+        let contribution = {
+            let question = self.questions.as_ref().and_then(|q| q.all.get(q.at))?;
+            match &question.header {
+                Some(header) => format!("{header}: {text}"),
+                None => text.to_owned(),
+            }
+        };
+        self.answer_item(contribution)
+    }
+
     /// A free-text answer to the current question, headed like any
     /// other.
     pub fn free_text(&self, text: &str) -> String {
