@@ -247,7 +247,7 @@ fn answerer(
 
 // --------------------------------------------------------------- tests
 
-/// T4: the proposal is in the log before the wait fires, with the work it
+/// The proposal is in the log before the wait fires, with the work it
 /// asked for, and the waiting entry names the same call.
 #[tokio::test]
 async fn start_job_parks_the_turn_with_a_job_proposal() {
@@ -299,7 +299,7 @@ async fn start_job_parks_the_turn_with_a_job_proposal() {
     assert_eq!(p.stage, DecisionStage::Ask);
 }
 
-/// T5: a `yes` approves the job and moves nothing — no `project_switched`,
+/// A `yes` approves the job and moves nothing — no `project_switched`,
 /// the thread still in `here` — and a handed-over context is refused.
 #[tokio::test]
 async fn a_yes_answers_the_proposal_and_switches_nothing() {
@@ -339,7 +339,7 @@ async fn a_yes_answers_the_proposal_and_switches_nothing() {
     );
 }
 
-/// T6: a `no` leaves the thread where it was and says so.
+/// A `no` leaves the thread where it was and says so.
 #[tokio::test]
 async fn a_no_leaves_the_thread_where_it_is() {
     let dir = tempfile::tempdir().unwrap();
@@ -362,7 +362,7 @@ async fn a_no_leaves_the_thread_where_it_is() {
     assert_eq!(runtime.current_project(), Some(HERE.to_string()));
 }
 
-/// T7: a correction names the project the job belongs to, and moves
+/// A correction names the project the job belongs to, and moves
 /// nothing.
 #[tokio::test]
 async fn a_correction_names_the_project_it_belongs_to() {
@@ -389,7 +389,7 @@ async fn a_correction_names_the_project_it_belongs_to() {
     assert_eq!(runtime.current_project(), Some(HERE.to_string()));
 }
 
-/// T8: an interrupt while parked withdraws the proposal, by System, with
+/// An interrupt while parked withdraws the proposal, by System, with
 /// the interrupted note.
 #[tokio::test]
 async fn an_interrupt_withdraws_a_job_proposal() {
@@ -425,7 +425,7 @@ async fn an_interrupt_withdraws_a_job_proposal() {
     assert_eq!(result.content, not_answered_text(TURN_INTERRUPTED));
 }
 
-/// T9: with no `Decisions` the proposal is written and closed at once —
+/// With no `Decisions` the proposal is written and closed at once —
 /// a bare runtime has nobody to ask.
 #[tokio::test]
 async fn a_job_proposal_with_no_one_to_answer_is_written_and_withdrawn() {
@@ -448,7 +448,7 @@ async fn a_job_proposal_with_no_one_to_answer_is_written_and_withdrawn() {
     assert_eq!(result.content, not_answered_text(NO_ONE_TO_ANSWER));
 }
 
-/// T10: a thread in no project has nowhere to run a job, and is refused
+/// A thread in no project has nowhere to run a job, and is refused
 /// without writing anything.
 #[tokio::test]
 async fn a_thread_in_no_project_is_refused() {
@@ -464,7 +464,7 @@ async fn a_thread_in_no_project_is_refused() {
     assert_eq!(result.content, NOT_IN_PROJECT);
 }
 
-/// T11: a step thread proposes from the front thread only, and is refused.
+/// A step thread proposes from the front thread only, and is refused.
 #[tokio::test]
 async fn a_step_thread_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -482,7 +482,7 @@ async fn a_step_thread_is_refused() {
     assert_eq!(result.content, STEP_REFUSED);
 }
 
-/// T12: a blank task or brief is refused before anything is written, and
+/// A blank task or brief is refused before anything is written, and
 /// nothing waits afterwards.
 #[tokio::test]
 async fn an_empty_task_or_brief_is_refused() {
@@ -526,7 +526,7 @@ async fn an_empty_task_or_brief_is_refused() {
     );
 }
 
-/// T13: an unknown argument is refused as `invalid arguments: …`, with no
+/// An unknown argument is refused as `invalid arguments: …`, with no
 /// event.
 #[tokio::test]
 async fn an_unknown_argument_is_refused() {
@@ -558,7 +558,7 @@ async fn an_unknown_argument_is_refused() {
     );
 }
 
-/// T14: a proposal stands alone — the calls after it in its batch do not
+/// A proposal stands alone — the calls after it in its batch do not
 /// run, and say why.
 #[tokio::test]
 async fn calls_after_a_job_proposal_do_not_run() {
@@ -592,7 +592,7 @@ async fn calls_after_a_job_proposal_do_not_run() {
     assert_eq!(proposals(&events).len(), 1, "the proposal stands");
 }
 
-/// T15: `start_job` is answerable and never offered, so what a model
+/// `start_job` is answerable and never offered, so what a model
 /// receives is unchanged.
 #[tokio::test]
 async fn start_job_is_answerable_but_not_offered() {
@@ -609,7 +609,7 @@ async fn start_job_is_answerable_but_not_offered() {
     assert!(is_harness_tool(START_JOB));
 }
 
-/// T16: the spec asks for a task and a brief, and takes nothing else.
+/// The spec asks for a task and a brief, and takes nothing else.
 #[tokio::test]
 async fn the_start_job_spec_asks_for_a_task_and_a_brief() {
     let spec = start_job_spec();

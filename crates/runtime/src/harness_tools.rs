@@ -52,7 +52,7 @@ pub const FINISH_STEP: &str = "finish_step";
 /// Offered only in an ordinary thread; a step thread never sees the
 /// spec, and the switch itself is refused there.
 pub const SUGGEST_PROJECT: &str = "suggest_project";
-/// The background-job proposal (issue #189): the model asks for work too big
+/// The background-job proposal: the model asks for work too big
 /// for this conversation, a person approves it, and the job runs in its own
 /// thread. Not offered in any thread's spec here; `is_harness_tool` answers
 /// it so a call can be refused honestly.
@@ -72,7 +72,7 @@ pub const NO_BRIEF_IN_REACH: &str = "no project this thread understands has a br
 /// is.
 pub const SUGGEST_PROJECT_DESCRIPTION: &str = "Propose moving this thread to another project, when the person's message belongs there. Call it first, alone; the person answers.";
 
-/// What `start_job`'s description says (issue #189): the job gets its own
+/// What `start_job`'s description says: the job gets its own
 /// thread and context, works from the brief, and runs once the person
 /// approves it.
 pub const START_JOB_DESCRIPTION: &str = "Propose a background job for work too big for this conversation, and wait for the person's answer. The job gets its own thread and its own context, works from the brief you write, and runs on its own once the person approves it. Set read_only when the job must change nothing.";
@@ -1195,7 +1195,7 @@ impl Runtime {
                     }
                 }
             },
-            // The job proposal (issue #189). Nothing offers the tool yet,
+            // The job proposal. Nothing offers the tool yet,
             // so a call is answered rather than left unknown: a step
             // thread, a thread in no project and an empty task or brief
             // are refused before anything is written.
