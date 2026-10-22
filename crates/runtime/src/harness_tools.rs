@@ -845,7 +845,18 @@ pub fn harness_specs_with(
                                 "properties": {
                                     "item": {"type": "integer", "description": "The number of the `## Spec check` item or spec section this is about, when it has one."},
                                     "kind": {"type": "string", "enum": ["fact", "choice"], "description": "`fact` is a correction of what the spec says about the code; `choice` is a decision the purpose does not settle."},
-                                    "text": {"type": "string"}
+                                    "text": {"type": "string"},
+                                    "options": {"type": "array", "items": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {
+                                            "label": {"type": "string", "description": "`a`, `b`, … in the order the person reads them."},
+                                            "text": {"type": "string", "description": "One line: what picking it does."},
+                                            "reason": {"type": "string", "description": "One line: why."}
+                                        },
+                                        "required": ["label", "text"]
+                                    }, "description": "A choice's rows. Omit it when the choice is a sentence the person answers in their own words."},
+                                    "recommended": {"type": "string", "description": "The label the purpose points to, when one option is the reading the spec's purpose gives."}
                                 },
                                 "required": ["kind", "text"]
                             }}
@@ -982,6 +993,38 @@ pub enum Settled {
     /// A `yes` with no context to switch to: the note is
     /// `switch_failed(NO_CONTEXT)`.
     NoContext(String),
+}
+
+/// The refusal of a choice whose options carry the same label twice.
+pub const CHOICE_LABELS_REPEATED: &str = "a choice's options must have distinct labels";
+/// The refusal of a `recommended` that names none of its item's own labels.
+pub const CHOICE_RECOMMENDED_UNNAMED: &str =
+    "a choice's `recommended` must be one of its own options' labels";
+
+/// The refusal a decision's choice items earn, or `None` when each one is
+/// answerable: the earliest offending item decides, so the message is
+/// deterministic. Facts are never checked, and neither is an option-less
+/// choice, whose answer the person types.
+fn decide_refusal(decide: Option<&Decide>) -> Option<&'static str> {
+    let choices = decide?
+        .items
+        .iter()
+        .filter(|item| item.kind == aigentic_log::DecideItemKind::Choice);
+    for item in choices {
+        let mut labels: Vec<&str> = item.options.iter().map(|o| o.label.as_str()).collect();
+        let count = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        if labels.len() != count {
+            return Some(CHOICE_LABELS_REPEATED);
+        }
+        if let Some(recommended) = item.recommended.as_deref()
+            && !item.options.iter().any(|o| o.label == recommended)
+        {
+            return Some(CHOICE_RECOMMENDED_UNNAMED);
+        }
+    }
+    None
 }
 
 impl Runtime {
@@ -1143,18 +1186,21 @@ impl Runtime {
                     Ok(args) if args.body.as_deref().is_none_or(|b| b.trim().is_empty()) => {
                         err(BODY_REQUIRED.into())
                     }
-                    Ok(args) if args.status == Some(ReportStatus::Partial) => {
-                        if args.handoff.is_none() {
+                    // A choice's rows are what the gate offers, and a report
+                    // the gate cannot render a row of is refused here, where
+                    // the turn can still correct it, rather than at the gate.
+                    Ok(args) => match decide_refusal(args.decide.as_ref()) {
+                        Some(refusal) => err(refusal.into()),
+                        None if args.status == Some(ReportStatus::Partial)
+                            && args.handoff.is_none() =>
+                        {
                             err("a partial report must carry handoff { done, next, dirty }".into())
-                        } else {
+                        }
+                        None => {
                             self.append_step_reported(args, observe)?;
                             ok(reported)
                         }
-                    }
-                    Ok(args) => {
-                        self.append_step_reported(args, observe)?;
-                        ok(reported)
-                    }
+                    },
                 }
             }
             RECALL => match recall_form(&call.args) {

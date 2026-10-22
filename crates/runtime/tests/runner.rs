@@ -11,9 +11,9 @@ use aigentic_core::{
     AgentId, Author, ContentBlock, Event, EventKind, ProviderError, ProviderEvent, UserId,
 };
 use aigentic_log::{
-    BUDGET_GATE, BudgetRaisedPayload, CheckpointAnswer, NextMove, PermissionRequestedPayload,
-    RunStartedPayload, STEP_STOP, StepReport, StepStatus, ThreadLog, ThreadStartedPayload,
-    run_state,
+    BUDGET_GATE, BudgetRaisedPayload, CheckpointAnswer, DecideItemKind, NextMove,
+    PermissionRequestedPayload, RunStartedPayload, STEP_STOP, StepReport, StepStatus, ThreadLog,
+    ThreadStartedPayload, run_state,
 };
 use aigentic_policy::Policy;
 use aigentic_runtime::runner::{
@@ -6082,6 +6082,145 @@ async fn the_gate_reads_the_deciders_last_attempt() {
         "the abandoned attempt's proposal is not shown ({abandoned_header:?}): {shown:?}"
     );
     assert!(answers(&fx.lead_events()).is_empty(), "nothing answered it");
+}
+
+/// The decide gate carries the decider's choice items as data: the same
+/// items, in the same order, with their rows and recommendation, so a
+/// client can offer them without reading them out of `text`. Facts stay
+/// out of it.
+#[tokio::test]
+async fn the_decide_gate_carries_the_deciders_choices() {
+    let l = decided(proposing(
+        "amend",
+        json!([
+            {"item": 1, "kind": "fact", "text": "the spec is right: 1 file"},
+            {
+                "kind": "choice",
+                "text": "which gate opens first",
+                "options": [
+                    {
+                        "label": "a",
+                        "text": "open the decide gate first",
+                        "reason": "the purpose asks for it",
+                    },
+                    {"label": "b", "text": "open the spec gate first"},
+                ],
+                "recommended": "a",
+            },
+            {"item": 2, "kind": "fact", "text": "the plan text is wrong"},
+        ]),
+    ));
+    let fx = &l.fx;
+    let mut runner = fx.runner();
+    assert_eq!(
+        drive(fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "decide".into()
+        }
+    );
+    let events = fx.lead_events();
+    assert_eq!(gate(&events).as_deref(), Some("decide"));
+    let asked = checkpoints(&events).pop().expect("the gate asked");
+    let reported = child_report(fx, l.check);
+    let choices: Vec<_> = reported
+        .decide
+        .expect("the decider proposed")
+        .items
+        .into_iter()
+        .filter(|item| item.kind == DecideItemKind::Choice)
+        .collect();
+    assert_eq!(asked.choices, choices);
+    assert!(
+        asked
+            .choices
+            .iter()
+            .all(|item| item.kind == DecideItemKind::Choice),
+        "a fact never reaches the choices"
+    );
+}
+
+/// A choice's rows change what the ask carries, not what the prompt shows:
+/// the same report with and without them renders the same lines, so a
+/// person reads the same gate.
+#[tokio::test]
+async fn a_choices_options_leave_the_gate_shown_unchanged() {
+    let with_rows = decided(proposing(
+        "amend",
+        json!([{
+            "kind": "choice",
+            "text": "which gate opens first",
+            "options": [
+                {
+                    "label": "a",
+                    "text": "open the decide gate first",
+                    "reason": "the purpose asks for it",
+                },
+                {"label": "b", "text": "open the spec gate first"},
+            ],
+            "recommended": "a",
+        }]),
+    ));
+    let mut runner = with_rows.fx.runner();
+    assert_eq!(
+        drive(&with_rows.fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "decide".into()
+        }
+    );
+    let shown_with_rows = gate_shown(&with_rows.fx.lead_events());
+
+    let bare = decided(proposing(
+        "amend",
+        json!([{"kind": "choice", "text": "which gate opens first"}]),
+    ));
+    let mut runner = bare.fx.runner();
+    assert_eq!(
+        drive(&bare.fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "decide".into()
+        }
+    );
+    assert_eq!(shown_with_rows, gate_shown(&bare.fx.lead_events()));
+}
+
+/// An ask with no decider behind it writes no `choices` key at all: a
+/// plain checkpoint, and a decide gate whose decider said nothing about
+/// the spec, carry exactly the payload they carried before.
+#[tokio::test]
+async fn a_gate_no_decider_proposed_carries_no_choices() {
+    let plain = looped("approve");
+    let mut runner = plain.fx.runner();
+    assert_eq!(
+        drive(&plain.fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "decide".into()
+        }
+    );
+    let asked = checkpoints(&plain.fx.lead_events())
+        .pop()
+        .expect("the plain checkpoint asked");
+    let asked = serde_json::to_value(asked).unwrap();
+    assert!(
+        asked.get("choices").is_none(),
+        "a gate with no decider writes no choices: {asked}"
+    );
+
+    let silent = decided(reported("## Check", json!({})));
+    let mut runner = silent.fx.runner();
+    assert_eq!(
+        drive(&silent.fx, &mut runner).await,
+        Advanced::WaitingHuman {
+            gate: "decide".into()
+        }
+    );
+    let asked = checkpoints(&silent.fx.lead_events())
+        .pop()
+        .expect("the decide gate asked");
+    let asked = serde_json::to_value(asked).unwrap();
+    assert!(
+        asked.get("choices").is_none(),
+        "a decider with no proposal writes no choices: {asked}"
+    );
 }
 
 /// A decider whose turn ended without a report leaves the gate to the

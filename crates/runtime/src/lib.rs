@@ -7,6 +7,10 @@
 //! result carries the record; [`seams`] still holds the turn queue
 //! pass-through for phase 5.
 
+// `json!` spends recursion per nesting level and the `finish_step` schema
+// nests an object five deep; the default 128 is not enough for it.
+#![recursion_limit = "256"]
+
 // Re-exported so a client can build a `Runtime` while depending on this
 // crate alone, per the dependency rule.
 pub use aigentic_core;

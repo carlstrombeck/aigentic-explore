@@ -11,11 +11,14 @@ use aigentic_core::{
     ToolError, ToolOutput, UserId,
 };
 use aigentic_log::{
-    CommitRef, DecideItemKind, DecideProposal, Handoff, PermissionRequestedPayload, PolicyRecord,
-    ReportStatus, StepReport, ThreadLog, ToolResultPayload,
+    CommitRef, Decide, DecideItem, DecideItemKind, DecideOption, DecideProposal, Handoff,
+    PermissionRequestedPayload, PolicyRecord, ReportStatus, StepReport, ThreadLog,
+    ToolResultPayload,
 };
 use aigentic_policy::{Decision, Policy, Rule};
-use aigentic_runtime::harness_tools::BODY_REQUIRED;
+use aigentic_runtime::harness_tools::{
+    BODY_REQUIRED, CHOICE_LABELS_REPEATED, CHOICE_RECOMMENDED_UNNAMED, harness_specs,
+};
 use aigentic_runtime::workflow::{WorkflowFile, WorkflowRoots};
 use aigentic_runtime::{Answer, Approver, ProjectContext, Runtime, RuntimeError, STEP_REPORTED};
 use aigentic_tools::ToolRegistry;
@@ -515,6 +518,168 @@ async fn a_deciders_proposal_and_items_round_trip() {
     );
     assert!(results(&maybe)[0].result.is_error, "the call was refused");
     assert_eq!(results(&maybe)[0].result.content, expected);
+}
+
+/// A `finish_step` call carrying `items` as its decision's items.
+fn choosing(items: serde_json::Value) -> serde_json::Value {
+    json!({
+        "status": "done",
+        "body": "read the check",
+        "decide": {"proposal": "amend", "items": items},
+    })
+}
+
+/// Every key a decision serialises is a key the schema offers, at each of
+/// the three objects a decider fills in: an item written from the schema
+/// alone can carry its rows and its recommendation, and no `required` list
+/// names a key the object does not have.
+#[test]
+fn the_finish_step_schema_offers_every_key_a_decision_writes() {
+    let spec = harness_specs(false, true, false)
+        .into_iter()
+        .find(|s| s.name == "finish_step")
+        .expect("a step thread is offered finish_step");
+    let schema = serde_json::to_value(&spec.schema).unwrap();
+    let decide = &schema["properties"]["decide"];
+    let item = &decide["properties"]["items"]["items"];
+    let option = &item["properties"]["options"]["items"];
+
+    let row = DecideOption {
+        label: "a".into(),
+        text: "open the decide gate first".into(),
+        reason: Some("the purpose asks for it".into()),
+    };
+    let written_item = DecideItem {
+        item: Some(3),
+        kind: DecideItemKind::Choice,
+        text: "which gate opens first".into(),
+        options: vec![row],
+        recommended: Some("a".into()),
+    };
+    let written = Decide {
+        proposal: DecideProposal::Amend,
+        items: vec![written_item],
+    };
+
+    let shapes = [
+        (decide, serde_json::to_value(&written).unwrap()),
+        (item, serde_json::to_value(&written.items[0]).unwrap()),
+        (
+            option,
+            serde_json::to_value(&written.items[0].options[0]).unwrap(),
+        ),
+    ];
+    for (at, shape) in shapes {
+        let properties = at["properties"].as_object().expect("a properties map");
+        for key in shape.as_object().expect("an object").keys() {
+            assert!(
+                properties.contains_key(key),
+                "{key} is written but not offered by {at}"
+            );
+        }
+        for key in at["required"].as_array().into_iter().flatten() {
+            let key = key.as_str().expect("a string");
+            assert!(
+                properties.contains_key(key),
+                "{key} is required but not offered by {at}"
+            );
+        }
+    }
+}
+
+/// A choice whose rows carry a label twice, or whose recommendation names
+/// no row, is refused with the reason and writes nothing, so the turn can
+/// send a corrected call; an empty label is a label like any other.
+#[tokio::test]
+async fn a_choice_with_options_that_do_not_line_up_is_refused() {
+    let rows = json!([
+        {"label": "a", "text": "open the decide gate first", "reason": "the purpose asks"},
+        {"label": "b", "text": "open the spec gate first"},
+    ]);
+    let mut r = rig(
+        vec![
+            vec![
+                finish(
+                    "c1",
+                    choosing(json!([{
+                        "kind": "choice",
+                        "text": "which gate opens first",
+                        "options": rows,
+                        "recommended": "c",
+                    }])),
+                ),
+                finish(
+                    "c2",
+                    choosing(json!([{
+                        "kind": "choice",
+                        "text": "which gate opens first",
+                        "options": [
+                            {"label": "a", "text": "open the decide gate first"},
+                            {"label": "a", "text": "open the spec gate first"},
+                        ],
+                    }])),
+                ),
+                finish(
+                    "c3",
+                    choosing(json!([{
+                        "kind": "choice",
+                        "text": "which gate opens first",
+                        "options": [
+                            {"label": "", "text": "open the decide gate first"},
+                            {"label": "", "text": "open the spec gate first"},
+                        ],
+                    }])),
+                ),
+                finish(
+                    "c4",
+                    choosing(json!([{
+                        "kind": "choice",
+                        "text": "which gate opens first",
+                        "options": rows,
+                        "recommended": "",
+                    }])),
+                ),
+                done("tool_use"),
+            ],
+            vec![
+                finish(
+                    "c5",
+                    choosing(json!([{
+                        "kind": "choice",
+                        "text": "which gate opens first",
+                        "options": rows,
+                        "recommended": "a",
+                    }])),
+                ),
+                done("tool_use"),
+            ],
+        ],
+        Some(&["git push"]),
+    );
+    r.runtime
+        .run_turn(steve(), vec![ContentBlock::Text("go".into())], &mut |_| {})
+        .await
+        .unwrap();
+    let results = results(&r);
+    assert_eq!(results.len(), 5);
+    let expected = [
+        CHOICE_RECOMMENDED_UNNAMED,
+        CHOICE_LABELS_REPEATED,
+        CHOICE_LABELS_REPEATED,
+        CHOICE_RECOMMENDED_UNNAMED,
+    ];
+    for (refused, reason) in results[..4].iter().zip(expected) {
+        assert!(refused.result.is_error, "the call was refused");
+        assert_eq!(refused.result.content, reason);
+    }
+    assert!(!results[4].result.is_error, "the corrected call lands");
+    assert_eq!(count(&r, EventKind::StepReported), 1);
+    let decided = report(&r, 0)
+        .decide
+        .expect("the corrected decision reached the report");
+    assert_eq!(decided.items[0].options.len(), 2);
+    assert_eq!(decided.items[0].recommended.as_deref(), Some("a"));
+    assert_eq!(end_reason(&r), STEP_REPORTED);
 }
 
 /// T13: one report per turn — the same batch's second call is refused

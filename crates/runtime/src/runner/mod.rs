@@ -26,10 +26,10 @@ use aigentic_core::{AgentId, Author, ContentBlock, Event, EventKind};
 use aigentic_log::{
     BUDGET_GATE, BudgetRaisedPayload, CheckOutcome, CheckResult, CheckpointAnswer,
     CheckpointAnsweredPayload, CheckpointAskedPayload, ChecksOutcome, ChecksRunPayload, CommitRef,
-    DecideItemKind, DecideProposal, LogError, NewEvent, NextMove, PushedPayload, ReleaseImpact,
-    ReportStatus, RouteTakenPayload, RunErroredPayload, RunFinishedPayload, RunOutcome,
-    RunStartedPayload, RunState, STEP_STOP, StepFinishedPayload, StepReport, StepStartedPayload,
-    StepStatus, ThreadLog, TurnEndedPayload, Verdict, run_state,
+    DecideItem, DecideItemKind, DecideProposal, LogError, NewEvent, NextMove, PushedPayload,
+    ReleaseImpact, ReportStatus, RouteTakenPayload, RunErroredPayload, RunFinishedPayload,
+    RunOutcome, RunStartedPayload, RunState, STEP_STOP, StepFinishedPayload, StepReport,
+    StepStartedPayload, StepStatus, ThreadLog, TurnEndedPayload, Verdict, run_state,
 };
 use serde_json::Value;
 use ulid::Ulid;
@@ -713,6 +713,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 shown,
                 vec!["raise".into(), "stop".into()],
                 None,
+                Vec::new(),
             ),
             Park::AlreadyAsked => Ok(Advanced::WaitingHuman {
                 gate: BUDGET_GATE.into(),
@@ -1025,6 +1026,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 spent_shown(&self.state()?, Some((usd, ceiling))),
                 vec!["raise".into(), "stop".into()],
                 None,
+                Vec::new(),
             ),
             None => Ok(Advanced::Moved),
         }
@@ -1064,6 +1066,10 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
     /// Open a checkpoint step: show its rendered template and wait for
     /// `go`, `amend` or `stop`. Writing the ask is the whole move, so a
     /// crash before it repeats it and a crash after it waits.
+    ///
+    /// A step with a decider carries that decider's choice items into the
+    /// ask, read from its latest report at the moment the gate opens, so a
+    /// crash before the ask writes the same payload again.
     fn open_checkpoint(&mut self, step: &Step) -> Result<Advanced, RunnerError> {
         let shown = match self.attempt_message(step, 1, None, true) {
             Ok(text) => text,
@@ -1075,11 +1081,26 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             }
             Err(other) => return Err(other),
         };
+        let choices = match step.decided_by.as_deref() {
+            Some(decider) => self
+                .last_report(decider)?
+                .and_then(|report| report.decide)
+                .map(|decide| {
+                    decide
+                        .items
+                        .into_iter()
+                        .filter(|item| item.kind == DecideItemKind::Choice)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
         self.escalate_with(
             &step.id.clone(),
             vec![shown],
             vec!["go".into(), "amend".into(), "stop".into()],
             None,
+            choices,
         )
     }
 
@@ -1211,6 +1232,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                     shown,
                     vec!["retry".to_owned(), "stop".to_owned()],
                     None,
+                    Vec::new(),
                 )
             }
         }
@@ -1853,19 +1875,21 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
     /// Write `checkpoint_asked` and hand the run to the human. This is the
     /// one act safe to repeat after a crash.
     fn escalate(&mut self, gate: &str, shown: Vec<String>) -> Result<Advanced, RunnerError> {
-        self.escalate_with(gate, shown, vec!["stop".into()], None)
+        self.escalate_with(gate, shown, vec!["stop".into()], None, Vec::new())
     }
 
     /// `escalate`, offering `options` instead of `stop` alone. An ask that
     /// offers a raise carries the figure the picker prefills: `raise_usd`
     /// when the caller names one, else the budget gate's clearing figure,
-    /// and none at any other gate.
+    /// and none at any other gate. `choices` are the decider's choice items,
+    /// empty at every gate that reads no decider.
     fn escalate_with(
         &mut self,
         gate: &str,
         shown: Vec<String>,
         options: Vec<String>,
         raise_usd: Option<f64>,
+        choices: Vec<DecideItem>,
     ) -> Result<Advanced, RunnerError> {
         let raise_usd = match raise_usd {
             Some(usd) => Some(usd),
@@ -1879,7 +1903,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 shown,
                 options,
                 raise_usd,
-                choices: Vec::new(),
+                choices,
             },
         )?;
         self.lock = None;
@@ -2087,6 +2111,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                             shown,
                             vec!["retry".to_owned(), "stop".to_owned()],
                             None,
+                            Vec::new(),
                         )?;
                     }
                     _ => {
@@ -2414,6 +2439,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             shown,
             vec!["raise".into(), "stop".into()],
             Some(prefill),
+            Vec::new(),
         )
     }
 }
