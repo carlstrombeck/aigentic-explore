@@ -834,7 +834,8 @@ pub struct RouteTakenPayload {
 }
 
 /// Payload of a `checkpoint_asked` event: the gate, what the human was
-/// shown, and the options offered.
+/// shown, the options offered, and the decider's choices where the gate
+/// has a decider.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointAskedPayload {
     pub gate: String,
@@ -845,6 +846,11 @@ pub struct CheckpointAskedPayload {
     /// existed, and from every gate that needs no figure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raise_usd: Option<f64>,
+    /// The decider's `kind: choice` items, as it reported them. Absent
+    /// from every gate with no decider and from a decider's gate when it
+    /// reported no choice, so those asks write the keys they always wrote.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<DecideItem>,
 }
 
 /// One finding's mark at the reveal stage. `Missed` marks a purpose
@@ -1057,6 +1063,29 @@ pub struct DecideItem {
     pub item: Option<u32>,
     pub kind: DecideItemKind,
     pub text: String,
+    /// The rows a `choice` can be answered with, in the order the person
+    /// reads them. Empty when the choice is a sentence the person answers
+    /// in their own words, and on every item written before the field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<DecideOption>,
+    /// The label of the option the purpose points to, when one is. Refused
+    /// unless it names one of this item's own labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended: Option<String>,
+}
+
+/// One row a choice can be answered with: its label, what picking it does,
+/// and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecideOption {
+    /// `a`, `b`, … in the order the person reads them.
+    pub label: String,
+    /// One line on what picking it does.
+    pub text: String,
+    /// One line on why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Whether a decider's item is a correction of fact or an open choice.
@@ -2158,6 +2187,7 @@ mod tests {
             shown: vec!["## Plan".into(), "## Plan amendment".into()],
             options: vec!["go".into(), "amend".into(), "stop".into()],
             raise_usd: None,
+            choices: Vec::new(),
         };
         let value = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -2186,6 +2216,7 @@ mod tests {
             shown: vec!["spent 3.00 of the run's 3.00 budget".into()],
             options: vec!["raise".into(), "stop".into()],
             raise_usd: Some(figure),
+            choices: Vec::new(),
         };
         let value = serde_json::to_value(&with).unwrap();
         assert_eq!(
@@ -2216,6 +2247,121 @@ mod tests {
             serde_json::from_value::<CheckpointAskedPayload>(value).unwrap(),
             without,
             "and reads back as the same ask"
+        );
+    }
+
+    /// A choice's rows are additive on the item: each row writes its label
+    /// and text, a row with a reason writes it, and the item names the row
+    /// the purpose points to.
+    #[test]
+    fn a_choice_item_carries_its_options_and_the_label_it_recommends() {
+        let item = DecideItem {
+            item: Some(3),
+            kind: DecideItemKind::Choice,
+            text: "which gate opens first".into(),
+            options: vec![
+                DecideOption {
+                    label: "a".into(),
+                    text: "the plan gate waits for the person".into(),
+                    reason: None,
+                },
+                DecideOption {
+                    label: "b".into(),
+                    text: "the size gate waits first".into(),
+                    reason: Some("the plan reads the size route's result".into()),
+                },
+            ],
+            recommended: Some("a".into()),
+        };
+        let value = serde_json::to_value(&item).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("an item is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["item", "kind", "options", "recommended", "text"]);
+        assert_eq!(
+            value["options"][0],
+            json!({
+                "label": "a",
+                "text": "the plan gate waits for the person"
+            }),
+            "a row with no reason writes no key for it"
+        );
+        assert_eq!(
+            value["options"][1]["reason"],
+            json!("the plan reads the size route's result"),
+            "a row with a reason writes it"
+        );
+        assert_eq!(value["recommended"], json!("a"));
+        assert_eq!(serde_json::from_value::<DecideItem>(value).unwrap(), item);
+    }
+
+    /// A choice item written before the rows existed reads as a choice with
+    /// no rows and no recommendation, and re-serialises to the line it was.
+    #[test]
+    fn an_old_choice_item_gains_no_new_fields() {
+        let line = json!({"item": 3, "kind": "choice", "text": "which gate opens first"});
+        let item: DecideItem = serde_json::from_value(line.clone()).unwrap();
+        assert_eq!(item.options, Vec::new());
+        assert_eq!(item.recommended, None);
+        assert_eq!(serde_json::to_value(&item).unwrap(), line);
+    }
+
+    /// The decider's choices are additive on the ask: an ask that carries
+    /// one writes the rows out, and one that carries none writes exactly
+    /// the keys the raise-figure fixture pins.
+    #[test]
+    fn an_ask_carries_the_deciders_choices_only_when_it_has_them() {
+        let choice = DecideItem {
+            item: Some(2),
+            kind: DecideItemKind::Choice,
+            text: "which gate opens first".into(),
+            options: vec![DecideOption {
+                label: "a".into(),
+                text: "the plan gate waits for the person".into(),
+                reason: None,
+            }],
+            recommended: Some("a".into()),
+        };
+        let with = CheckpointAskedPayload {
+            gate: "budget".into(),
+            shown: vec!["spent 3.00 of the run's 3.00 budget".into()],
+            options: vec!["raise".into(), "stop".into()],
+            raise_usd: None,
+            choices: vec![choice.clone()],
+        };
+        let value = serde_json::to_value(&with).unwrap();
+        assert_eq!(
+            value["choices"],
+            json!([serde_json::to_value(&choice).unwrap()])
+        );
+        assert_eq!(
+            serde_json::from_value::<CheckpointAskedPayload>(value).unwrap(),
+            with,
+            "the ask reads back with its choices"
+        );
+
+        let without = CheckpointAskedPayload {
+            choices: Vec::new(),
+            ..with
+        };
+        let value = serde_json::to_value(&without).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "gate": "budget",
+                "shown": ["spent 3.00 of the run's 3.00 budget"],
+                "options": ["raise", "stop"]
+            }),
+            "an ask with no choice writes no key for them"
+        );
+        assert!(value.get("choices").is_none());
+        assert_eq!(
+            serde_json::from_value::<CheckpointAskedPayload>(value).unwrap(),
+            without
         );
     }
 
@@ -2553,6 +2699,8 @@ mod tests {
                     item: None,
                     kind: DecideItemKind::Fact,
                     text: "the check's item 4 holds".into(),
+                    options: Vec::new(),
+                    recommended: None,
                 }],
             }),
         };

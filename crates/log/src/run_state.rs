@@ -784,6 +784,7 @@ mod tests {
                 shown: vec!["## Plan".into()],
                 options: vec!["go".into(), "stop".into()],
                 raise_usd: None,
+                choices: Vec::new(),
             },
         )
     }

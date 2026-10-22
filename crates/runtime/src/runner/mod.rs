@@ -1879,6 +1879,7 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
                 shown,
                 options,
                 raise_usd,
+                choices: Vec::new(),
             },
         )?;
         self.lock = None;
