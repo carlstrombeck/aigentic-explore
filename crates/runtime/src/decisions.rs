@@ -34,9 +34,12 @@ pub enum Pending {
         question: String,
         questions: Vec<crate::harness_tools::HumanQuestion>,
     },
-    /// The `suggest_project` tool: the model proposes moving this thread
-    /// to another project, and the turn parks until the person whose
-    /// message prompted it answers. Only `Yes` switches (issue #7).
+    /// A proposal a person decides: `suggest_project` asks to move this
+    /// thread to another project, `start_job` asks to approve background
+    /// work, and the turn parks until the person answers. Only a `Yes` to
+    /// the first switches anything; for a job, `project` is the project
+    /// the job would run in and `reason` says why it is not this
+    /// conversation's work.
     Switch {
         call_id: String,
         project: String,
@@ -71,9 +74,10 @@ pub enum Answered {
         text: String,
         by: Author,
     },
-    /// A person's answer to a `suggest_project` proposal. `ctx` carries
-    /// the target's `ProjectContext` and the ack a `Yes` is answered
-    /// with; it is empty for every other answer.
+    /// A person's answer to a proposal of either kind. `ctx` carries the
+    /// target's `ProjectContext` and the ack a `Yes` is answered with; it
+    /// is empty for every other answer, and a job proposal acks it with an
+    /// error because a job takes no context.
     Switch {
         answer: SwitchAnswer,
         by: Author,
@@ -81,10 +85,11 @@ pub enum Answered {
     },
 }
 
-/// What a person did with a `suggest_project` proposal (issue #7).
+/// What a person did with a proposal: either kind, since `suggest_project`
+/// and `start_job` park and answer the same way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SwitchAnswer {
-    /// Switch the thread to the project the model proposed.
+    /// Agree to the project the model proposed, or approve the job.
     Yes,
     /// Stay put; the model is told, and the turn continues.
     No,

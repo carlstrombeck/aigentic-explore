@@ -8,9 +8,9 @@ use aigentic_core::{
 };
 use aigentic_log::{
     AssistantMessagePayload, CommitRef, Decide, DecisionAnswer, DecisionKind,
-    DecisionProposedPayload, DecisionStage, Finding, FixSize, Handoff, Invoker, LedgerEntry,
-    PinnedPayload, PlannedTest, ReleaseImpact, ReportStatus, Route, SkillLoadedPayload, StepReport,
-    ToolResultPayload, Verdict,
+    DecisionProposedPayload, DecisionStage, Finding, FixSize, Handoff, Invoker, JobProposed,
+    LedgerEntry, PinnedPayload, PlannedTest, ReleaseImpact, ReportStatus, Route,
+    SkillLoadedPayload, StepReport, ToolResultPayload, Verdict,
 };
 use aigentic_skills::Invocation;
 use serde::Deserialize;
@@ -52,6 +52,11 @@ pub const FINISH_STEP: &str = "finish_step";
 /// Offered only in an ordinary thread; a step thread never sees the
 /// spec, and the switch itself is refused there.
 pub const SUGGEST_PROJECT: &str = "suggest_project";
+/// The background-job proposal (issue #189): the model asks for work too big
+/// for this conversation, a person approves it, and the job runs in its own
+/// thread. Not offered in any thread's spec here; `is_harness_tool` answers
+/// it so a call can be refused honestly.
+pub const START_JOB: &str = "start_job";
 /// Opening a sibling's brief (issue #123): the one-line in the projects
 /// block is always there, the body on demand. Offered only when some
 /// project in reach other than this thread's own carries a brief.
@@ -66,6 +71,11 @@ pub const NO_BRIEF_IN_REACH: &str = "no project this thread understands has a br
 /// and alone, the person decides, and a no leaves the thread where it
 /// is.
 pub const SUGGEST_PROJECT_DESCRIPTION: &str = "Propose moving this thread to another project, when the person's message belongs there. Call it first, alone; the person answers.";
+
+/// What `start_job`'s description says (issue #189): the job gets its own
+/// thread and context, works from the brief, and runs once the person
+/// approves it.
+pub const START_JOB_DESCRIPTION: &str = "Propose a background job for work too big for this conversation, and wait for the person's answer. The job gets its own thread and its own context, works from the brief you write, and runs on its own once the person approves it. Set read_only when the job must change nothing.";
 
 /// What `recall`'s description says (issue #75): the three forms, one per
 /// call, and what comes back for old text. The stubs and the truncation
@@ -89,6 +99,22 @@ pub struct SuggestProjectArgs {
     pub project: String,
     /// One line on why the message belongs there.
     pub reason: String,
+}
+
+/// A `start_job` call's arguments. `task` and `brief` are required, and an
+/// unknown key is `invalid arguments: …` like every other harness call.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartJobArgs {
+    /// The job in one line: what it should come back having done.
+    pub task: String,
+    /// What the job's own thread reads first: the task, the files to touch,
+    /// and how to know it is done.
+    pub brief: String,
+    /// The job reads and runs read-only commands, and gets no tool that
+    /// changes a file.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// A `read_brief` call's arguments (issue #123).
@@ -140,6 +166,57 @@ pub fn corrected_text(where_it_belongs: &str) -> String {
     format!("declined; the person says it belongs to: {where_it_belongs}")
 }
 
+/// A job proposal as a person reads it in the log: the task's first line,
+/// with the whole task and brief left in the proposal's `job`.
+pub fn job_proposal_text(task: &str) -> String {
+    format!("start a job: {}", first_line(task))
+}
+
+/// The tool result when a person approved a job. It states the decision and
+/// stops; what an approval starts belongs to the code that starts it.
+pub fn job_approved_text(task: &str) -> String {
+    format!("approved: a background job for {}", first_line(task))
+}
+
+/// The tool result when a person declined a job.
+pub fn job_declined_text(task: &str) -> String {
+    format!(
+        "declined: no background job for {}; carry on in this thread",
+        first_line(task)
+    )
+}
+
+/// The refusal of a `start_job` call whose task says nothing.
+pub const TASK_REQUIRED: &str =
+    "a job needs a task: one line on what it should come back having done";
+
+/// The refusal of a `start_job` call whose brief says nothing.
+pub const BRIEF_REQUIRED: &str = "a job needs a brief: what its own thread reads first";
+
+/// The refusal of a `start_job` call in a thread that is in no project: a
+/// job needs a project to run in, and the runtime does not guess one.
+pub const NOT_IN_PROJECT: &str = "a job runs in a project, and this thread is in none";
+
+/// The refusal of a `start_job` call in a step thread.
+pub const STEP_REFUSED: &str = "start_job is proposed from the front thread, not a step thread";
+
+/// The ack a `yes` to a job proposal is answered with when it hands a
+/// context over: a job proposal takes no project, so no context is used.
+pub const JOB_NO_TARGET: &str = "a job proposal takes no project";
+
+/// The result every other call in a batch gets when the reply also proposes
+/// a job: the work the model wanted to delegate must not run here.
+pub const NOT_RUN_JOB_SIBLING: &str =
+    "not run: start_job must be the only call; ask again after the person answers";
+
+/// The policy record's rule text for that refusal, as the interrupt path
+/// names its own.
+pub const NOT_RUN_JOB_SOLO: &str = "start_job must be the only call";
+
+/// The reason a job proposal carries: why the work does not belong in this
+/// conversation.
+pub const JOB_REASON: &str = "work too big for this conversation";
+
 /// The tool result when nobody answered: an interrupted turn, a bare
 /// runtime with no one to ask, or a `Yes` the switch itself refused.
 pub fn not_answered_text(note: &str) -> String {
@@ -184,6 +261,12 @@ pub const NOT_RUN_LENGTH: &str = "not run: the reply hit the model's output limi
 /// The policy record's rule text for that refusal, as the interrupt path
 /// names its own.
 pub const NOT_RUN_OVER_LIMIT: &str = "the reply hit the model's output limit";
+
+/// A text's first line, without its trailing carriage return or spaces: a
+/// proposal is a person's one line, and the whole text belongs in the log.
+fn first_line(text: &str) -> &str {
+    text.split('\n').next().unwrap_or("").trim_end()
+}
 
 /// A `suggest_project` call's arguments, parsed. An unknown key, or a
 /// missing one, is `invalid arguments: …`.
@@ -807,6 +890,26 @@ pub fn harness_specs_with(
     specs
 }
 
+/// The `start_job` spec: the arguments a job proposal carries, and nothing
+/// else. It is public because the code that offers the tool is where it
+/// enters a model's view, and this is the whole of what it needs.
+pub fn start_job_spec() -> ToolSpec {
+    ToolSpec {
+        name: START_JOB.into(),
+        description: START_JOB_DESCRIPTION.into(),
+        schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task": {"type": "string", "description": "The job in one line: what it should come back having done."},
+                "brief": {"type": "string", "description": "What the job's own thread reads first: the task, the files to touch, and how to know it is done. The job starts with no other context from this conversation."},
+                "read_only": {"type": "boolean", "description": "The job reads and runs read-only commands, and gets no tool that changes a file."}
+            },
+            "required": ["task", "brief"]
+        }),
+    }
+}
+
 /// The harness tools' names, for a skill's `requires` check: they are
 /// always available, whatever the registry holds.
 pub fn harness_names() -> Vec<String> {
@@ -821,9 +924,10 @@ pub fn harness_names() -> Vec<String> {
     ]
 }
 
-/// Whether the runtime answers this tool itself. `finish_step` is in the
-/// list so the arm can refuse it honestly in an ordinary thread; it is
-/// not in `harness_names`, which says what is always available.
+/// Whether the runtime answers this tool itself. `finish_step` and
+/// `start_job` are in the list so their arms can refuse them honestly in a
+/// thread that may not use them; neither is in `harness_names`, which says
+/// what is always available.
 pub fn is_harness_tool(name: &str) -> bool {
     matches!(
         name,
@@ -834,6 +938,7 @@ pub fn is_harness_tool(name: &str) -> bool {
             | UPDATE_TASKS
             | FINISH_STEP
             | SUGGEST_PROJECT
+            | START_JOB
     )
 }
 
@@ -1090,6 +1195,18 @@ impl Runtime {
                     }
                 }
             },
+            // The job proposal (issue #189). Nothing offers the tool yet,
+            // so a call is answered rather than left unknown: a step
+            // thread, a thread in no project and an empty task or brief
+            // are refused before anything is written.
+            START_JOB => match serde_json::from_value::<StartJobArgs>(call.args.clone()) {
+                Ok(args) => {
+                    let (result, who) = self.start_job(call, args, cancel, observe).await?;
+                    by = who;
+                    result
+                }
+                Err(e) => err(format!("invalid arguments: {e}")),
+            },
             other => err(format!("unknown harness tool: {other}")),
         };
         Ok((result, by))
@@ -1164,6 +1281,153 @@ impl Runtime {
                         }
                     },
                 }
+            }
+        }
+    }
+
+    /// Ask for a background job. The `decision_proposed` event is written
+    /// before the wait is registered, so a client that sees the waiting
+    /// signal already finds it in the log. Nothing here moves this thread:
+    /// an approval is recorded and answered, and the work it approves is
+    /// started by the code that reads the answer.
+    async fn start_job(
+        &mut self,
+        call: &ToolCall,
+        args: StartJobArgs,
+        cancel: &crate::CancelToken,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<(ToolResult, Author), RuntimeError> {
+        let id = call.id.clone();
+        // A step thread has an overlay of its own and no front thread to
+        // report to, so it never proposes a job.
+        if self.step().is_some() {
+            return Ok((refused(&id, STEP_REFUSED), Author::System));
+        }
+        let Some(project) = self.current_project() else {
+            return Ok((refused(&id, NOT_IN_PROJECT), Author::System));
+        };
+        if args.task.trim().is_empty() {
+            return Ok((refused(&id, TASK_REQUIRED), Author::System));
+        }
+        if args.brief.trim().is_empty() {
+            return Ok((refused(&id, BRIEF_REQUIRED), Author::System));
+        }
+
+        let payload = DecisionProposedPayload {
+            kind: DecisionKind::Job,
+            proposal: job_proposal_text(&args.task),
+            target: Some(project.clone()),
+            reason: JOB_REASON.to_owned(),
+            call_id: Some(id.clone()),
+            job: Some(JobProposed {
+                task: args.task.clone(),
+                brief: args.brief.clone(),
+                read_only: args.read_only,
+            }),
+            stage: DecisionStage::Ask,
+        };
+        let proposal = self.append(
+            EventKind::DecisionProposed,
+            Author::Agent(self.agent.clone()),
+            serde_json::to_value(payload).expect("serialisable"),
+            None,
+            observe,
+        )?;
+        let Some(decisions) = self.decisions.clone() else {
+            // A bare runtime has nobody to ask, so the proposal is written
+            // and withdrawn at once: the fold still pairs its answer.
+            let note = NO_ONE_TO_ANSWER.to_owned();
+            self.withdraw_switch(proposal.id, note.clone(), observe)?;
+            return Ok((refused(&id, &not_answered_text(&note)), Author::System));
+        };
+
+        let pending = crate::Pending::Switch {
+            call_id: id.clone(),
+            project,
+            reason: JOB_REASON.to_owned(),
+        };
+        let rx = decisions.register(pending.clone());
+        observe(Signal::Waiting(&pending));
+        tokio::select! {
+            biased;
+            _by = cancel.cancelled() => {
+                decisions.withdraw(&id);
+                let note = TURN_INTERRUPTED.to_owned();
+                self.withdraw_switch(proposal.id, note.clone(), observe)?;
+                Ok((refused(&id, &not_answered_text(&note)), Author::System))
+            }
+            decided = rx => match decided {
+                Ok(crate::Answered::Switch { answer, by: who, ctx }) => {
+                    self.apply_job(&id, &args, proposal.id, answer, who, ctx, observe).await
+                }
+                // The table dropped the sender without an answer: no path
+                // does, but the thread must not be left waiting, so it
+                // reads as withdrawn.
+                _ => {
+                    let note = NO_ONE_TO_ANSWER.to_owned();
+                    self.withdraw_switch(proposal.id, note.clone(), observe)?;
+                    Ok((refused(&id, &not_answered_text(&note)), Author::System))
+                }
+            },
+        }
+    }
+
+    /// Record a person's answer to a job proposal and say what it was. No
+    /// answer moves the thread: nothing here switches a project, so a
+    /// context handed over with a `yes` is acked and dropped.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_job(
+        &mut self,
+        id: &str,
+        args: &StartJobArgs,
+        proposal: ulid::Ulid,
+        answer: crate::SwitchAnswer,
+        who: Author,
+        ctx: crate::SwitchCtx,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<(ToolResult, Author), RuntimeError> {
+        match answer {
+            crate::SwitchAnswer::Yes => {
+                // Nothing moves, so a context is not used: the session that
+                // handed it over is told why.
+                if let Some((_, ack)) = ctx.take() {
+                    let _ = ack.send(Err(JOB_NO_TARGET.to_owned()));
+                }
+                self.append_decision_answered(
+                    DecisionAnswer::Yes,
+                    None,
+                    None,
+                    who.clone(),
+                    proposal,
+                    observe,
+                )?;
+                Ok((said(id, job_approved_text(&args.task)), who))
+            }
+            crate::SwitchAnswer::No => {
+                self.append_decision_answered(
+                    DecisionAnswer::No,
+                    None,
+                    None,
+                    who.clone(),
+                    proposal,
+                    observe,
+                )?;
+                Ok((said(id, job_declined_text(&args.task)), who))
+            }
+            crate::SwitchAnswer::Corrected(where_it_belongs) => {
+                self.append_decision_answered(
+                    DecisionAnswer::Corrected,
+                    Some(where_it_belongs.clone()),
+                    None,
+                    who.clone(),
+                    proposal,
+                    observe,
+                )?;
+                Ok((said(id, corrected_text(&where_it_belongs)), who))
+            }
+            crate::SwitchAnswer::Withdrawn(note) => {
+                self.withdraw_switch(proposal, note.clone(), observe)?;
+                Ok((refused(id, &not_answered_text(&note)), Author::System))
             }
         }
     }

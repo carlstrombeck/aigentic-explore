@@ -17,9 +17,9 @@ use aigentic_log::{Invoker, NewEvent, PolicyRecord};
 
 use crate::decisions::{CancelToken, Inbox, Queued};
 use crate::harness_tools::{
-    ASK_HUMAN, FINISH_STEP, HARNESS_CLASS, NOT_RUN_LENGTH, NOT_RUN_OVER_LIMIT, NOT_RUN_SIBLING,
-    NOT_RUN_SOLO, READ_BRIEF, SUGGEST_PROJECT, harness_specs_with, is_harness_tool,
-    stale_tasks_reminder,
+    ASK_HUMAN, FINISH_STEP, HARNESS_CLASS, NOT_RUN_JOB_SIBLING, NOT_RUN_JOB_SOLO, NOT_RUN_LENGTH,
+    NOT_RUN_OVER_LIMIT, NOT_RUN_SIBLING, NOT_RUN_SOLO, READ_BRIEF, START_JOB, SUGGEST_PROJECT,
+    harness_specs_with, is_harness_tool, stale_tasks_reminder,
 };
 use crate::runtime::{ASKED_HUMAN, INTERRUPTED, LENGTH_STOP, MAX_TOKENS_STOP, STEP_REPORTED};
 use crate::seams::{Verdict, author_name, denial_text};
@@ -590,8 +590,10 @@ impl Runtime {
                         &mut spent.wall_waited,
                     )
                     .await?;
-                answered |=
-                    (call.name == ASK_HUMAN || call.name == SUGGEST_PROJECT) && !result.is_error;
+                answered |= (call.name == ASK_HUMAN
+                    || call.name == SUGGEST_PROJECT
+                    || call.name == START_JOB)
+                    && !result.is_error;
                 reported |= call.name == FINISH_STEP && !result.is_error;
                 let payload = serde_json::to_value(ToolResultPayload::new(result, record))
                     .expect("serialisable");
@@ -604,23 +606,29 @@ impl Runtime {
                     Some(assistant.id),
                     observe,
                 )?;
-                if call.name == SUGGEST_PROJECT {
+                if call.name == SUGGEST_PROJECT || call.name == START_JOB {
                     // A proposal stands alone (issue #7): a call after it
                     // in the same batch was written before the person had
                     // answered, and nothing may run in a project they have
-                    // not answered for yet. The results are written the
-                    // way the interrupt path writes its own. Calls before
-                    // it have already run; the instructions say to call it
+                    // not answered for yet, nor any work the model just
+                    // asked to delegate. The results are written the way
+                    // the interrupt path writes its own. Calls before it
+                    // have already run; the instructions say to call it
                     // first.
+                    let (not_run, rule) = if call.name == START_JOB {
+                        (NOT_RUN_JOB_SIBLING, NOT_RUN_JOB_SOLO)
+                    } else {
+                        (NOT_RUN_SIBLING, NOT_RUN_SOLO)
+                    };
                     for rest in calls.by_ref() {
                         let result = ToolResult {
                             id: rest.id.clone(),
-                            content: NOT_RUN_SIBLING.to_owned(),
+                            content: not_run.to_owned(),
                             is_error: true,
                         };
                         let payload = serde_json::to_value(ToolResultPayload::new(
                             result,
-                            PolicyRecord::rule(NOT_RUN_SOLO, "deny"),
+                            PolicyRecord::rule(rule, "deny"),
                         ))
                         .expect("serialisable");
                         self.append(
@@ -833,7 +841,10 @@ impl Runtime {
                 let (result, by) = if is_harness_tool(&call.name) {
                     let (started, started_wall) = (self.clock)();
                     let ran = self.run_harness_tool(call, cancel, observe).await?;
-                    if call.name == ASK_HUMAN || call.name == SUGGEST_PROJECT {
+                    if call.name == ASK_HUMAN
+                        || call.name == SUGGEST_PROJECT
+                        || call.name == START_JOB
+                    {
                         *waited += started.elapsed();
                         *wall_waited += started_wall.elapsed().unwrap_or_default();
                     }
