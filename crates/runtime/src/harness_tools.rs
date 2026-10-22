@@ -1113,6 +1113,7 @@ impl Runtime {
             target: Some(args.project.clone()),
             reason: args.reason.clone(),
             call_id: Some(id.clone()),
+            job: None,
             stage: DecisionStage::Ask,
         };
         let proposal = self.append(
@@ -1333,6 +1334,7 @@ impl Runtime {
             target: Some(project.to_owned()),
             reason: reason.to_owned(),
             call_id: Some(call_id.clone()),
+            job: None,
             stage: DecisionStage::Ask,
         };
         let proposal = self.append(

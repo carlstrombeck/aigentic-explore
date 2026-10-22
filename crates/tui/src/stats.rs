@@ -6335,6 +6335,7 @@ api_key_env = "TENSORX_API_KEY"
                     target: None,
                     reason: "which project to start in".to_owned(),
                     call_id: Some(call_id),
+                    job: None,
                     stage: DecisionStage::Ask,
                 })
                 .unwrap(),

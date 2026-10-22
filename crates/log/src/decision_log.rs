@@ -15,7 +15,7 @@ use ulid::Ulid;
 
 use crate::payload::{
     DecisionAnswer, DecisionAnsweredPayload, DecisionKind, DecisionProposedPayload, DecisionStage,
-    is_startup_call,
+    JobProposed, is_startup_call,
 };
 
 /// One proposal and, if it was answered, its answer. `answer: None` is a
@@ -30,6 +30,11 @@ pub struct DecisionRecord {
     pub stage: DecisionStage,
     pub proposal: String,
     pub target: Option<String>,
+    /// A `start_job` proposal's work, brief and read-only flag; `None` on
+    /// every other kind. For a job, `target` is the project it would run
+    /// in, and a `Corrected` answer names the project it belongs to
+    /// instead.
+    pub job: Option<JobProposed>,
     pub reason: String,
     pub answer: Option<RecordedAnswer>,
     /// Raised while no turn ran (issue #85): the payload's `call_id`
@@ -85,6 +90,7 @@ pub fn decision_records(events: &[Event]) -> DecisionFold {
                             stage: p.stage,
                             proposal: p.proposal,
                             target: p.target,
+                            job: p.job,
                             reason: p.reason,
                             answer: None,
                             startup: is_startup_call(p.call_id.as_deref()),
@@ -183,6 +189,7 @@ mod tests {
                 target: None,
                 reason: "the brief names it".into(),
                 call_id: None,
+                job: None,
                 stage: DecisionStage::Ask,
             })
             .unwrap(),
@@ -237,6 +244,35 @@ mod tests {
         assert_eq!(fold.orphans, 0);
         assert_eq!(fold.records.len(), 1);
         assert_eq!(fold.records[0].answer, None);
+    }
+
+    #[test]
+    fn a_job_decision_record_carries_the_work_it_asked_for() {
+        let job = JobProposed {
+            task: "close #77".into(),
+            brief: "#77 is ready: build it, gate it, push".into(),
+            read_only: true,
+        };
+        let p = event(
+            0,
+            EventKind::DecisionProposed,
+            Author::Agent(AgentId("worker".into())),
+            serde_json::to_value(DecisionProposedPayload {
+                kind: DecisionKind::Job,
+                proposal: "start a job: close #77".into(),
+                target: Some("getscale/site".into()),
+                reason: "work too big for this conversation".into(),
+                call_id: Some("c1".into()),
+                job: Some(job.clone()),
+                stage: DecisionStage::Ask,
+            })
+            .unwrap(),
+        );
+        let fold = decision_records(&[p]);
+        assert_eq!(fold.orphans, 0);
+        assert_eq!(fold.records.len(), 1);
+        assert_eq!(fold.records[0].job.as_ref(), Some(&job));
+        assert_eq!(fold.records[0].target.as_deref(), Some("getscale/site"));
     }
 
     /// T3: an answer naming no proposal in the log is an orphan.

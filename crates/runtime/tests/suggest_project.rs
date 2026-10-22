@@ -951,6 +951,7 @@ fn killed_while_parked_log(dir: &std::path::Path, thread: Ulid) -> ThreadLog {
             target: Some(THERE.into()),
             reason: "belongs there".into(),
             call_id: Some("c1".into()),
+            job: None,
             stage: DecisionStage::Ask,
         })
         .unwrap(),

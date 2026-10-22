@@ -1116,6 +1116,10 @@ pub struct DecisionProposedPayload {
     /// and the log agree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
+    /// A `start_job` proposal's work, and how its thread must treat files. `None` on every
+    /// other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobProposed>,
     #[serde(default)]
     pub stage: DecisionStage,
 }
@@ -1157,6 +1161,16 @@ pub struct DecisionAnsweredPayload {
     /// declines proposals`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+/// What a `start_job` proposal asks for: the work, the brief the job's own thread reads
+/// first, and whether it may change files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobProposed {
+    pub task: String,
+    pub brief: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 #[cfg(test)]
@@ -1225,6 +1239,7 @@ mod tests {
             target: Some("getscale/site".into()),
             reason: "the brief names it".into(),
             call_id: Some("c1".into()),
+            job: None,
             stage: DecisionStage::Ask,
         };
         let value = serde_json::to_value(&proposed).unwrap();
@@ -1281,6 +1296,72 @@ mod tests {
             json!({"answer": "withdrawn", "note": "turn interrupted"})
         );
         assert!(value.get("correction").is_none());
+    }
+
+    #[test]
+    fn a_job_proposal_payload_round_trips() {
+        let job = JobProposed {
+            task: "close #77".into(),
+            brief: "#77 is ready: build it, gate it, push".into(),
+            read_only: true,
+        };
+        let proposed = DecisionProposedPayload {
+            kind: DecisionKind::Job,
+            proposal: "start a job: close #77".into(),
+            target: Some("getscale/site".into()),
+            reason: "work too big for this conversation".into(),
+            call_id: Some("c1".into()),
+            job: Some(job.clone()),
+            stage: DecisionStage::Ask,
+        };
+        let value = serde_json::to_value(&proposed).unwrap();
+        assert_eq!(
+            value["job"],
+            json!({
+                "task": job.task,
+                "brief": job.brief,
+                "read_only": true,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<DecisionProposedPayload>(value).unwrap(),
+            proposed
+        );
+    }
+
+    #[test]
+    fn a_project_proposal_carries_no_job_field() {
+        let proposed = DecisionProposedPayload {
+            kind: DecisionKind::Project,
+            proposal: "switch to getscale/site".into(),
+            target: Some("getscale/site".into()),
+            reason: "the brief names it".into(),
+            call_id: None,
+            job: None,
+            stage: DecisionStage::Ask,
+        };
+        let value = serde_json::to_value(&proposed).unwrap();
+        assert!(value.get("job").is_none(), "no job key: {value}");
+
+        let back = serde_json::from_value::<DecisionProposedPayload>(json!({
+            "kind": "project",
+            "proposal": "switch to getscale/site",
+            "target": "getscale/site",
+            "reason": "the brief names it"
+        }))
+        .unwrap();
+        assert_eq!(back.job, None);
+
+        let changeable = JobProposed {
+            task: "close #77".into(),
+            brief: "build it".into(),
+            read_only: false,
+        };
+        let wire = serde_json::to_value(&changeable).unwrap();
+        assert!(
+            wire.get("read_only").is_none(),
+            "a false flag is not written: {wire}"
+        );
     }
 
     #[test]

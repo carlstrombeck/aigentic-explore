@@ -318,6 +318,7 @@ fn append_proposal(log: &mut ThreadLog, call_id: &str, target: &str) -> Ulid {
             target: Some(target.to_owned()),
             reason: REASON.to_owned(),
             call_id: Some(call_id.to_owned()),
+            job: None,
             stage: DecisionStage::Ask,
         })
         .unwrap(),

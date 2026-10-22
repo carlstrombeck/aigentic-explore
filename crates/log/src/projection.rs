@@ -1754,6 +1754,7 @@ mod tests {
                 target: Some("getscale/site".into()),
                 reason: "the-brief-names-it".into(),
                 call_id: None,
+                job: None,
                 stage: DecisionStage::Ask,
             })
             .unwrap(),

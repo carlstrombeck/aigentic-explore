@@ -401,6 +401,7 @@ impl Runtime {
                 target: None,
                 reason: reason.to_owned(),
                 call_id: Some(call_id),
+                job: None,
                 stage: DecisionStage::Ask,
             })
             .expect("serialisable"),

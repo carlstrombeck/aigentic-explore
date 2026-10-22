@@ -12911,6 +12911,7 @@ mod tests {
                         target: None,
                         reason: "it is the front".into(),
                         call_id: None,
+                        job: None,
                         stage: Default::default(),
                     })
                     .unwrap(),
