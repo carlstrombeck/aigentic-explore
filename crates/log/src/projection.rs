@@ -4,11 +4,12 @@
 
 use aigentic_core::{Author, ContentBlock, Event, EventKind, Message, Role};
 use time::format_description::well_known::Rfc3339;
+use ulid::Ulid;
 
 use crate::payload::{
     AssistantMessagePayload, CompactedPayload, CompactionStrategy, ContextEvictedPayload,
-    InterruptedPayload, PinnedPayload, ResultsStubbedPayload, SkillLoadedPayload,
-    ToolResultPayload, UserMessagePayload,
+    InterruptedPayload, JobFinishedPayload, JobOutcome, PinnedPayload, ResultsStubbedPayload,
+    SkillLoadedPayload, ToolResultPayload, UserMessagePayload,
 };
 use crate::recall::{call_index, cut_chars, short_args};
 use crate::store::LogError;
@@ -440,6 +441,23 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                     },
                 );
             }
+            EventKind::JobFinished => {
+                let p: JobFinishedPayload = payload(event)?;
+                push(
+                    &mut body,
+                    &mut pending_calls,
+                    &mut held,
+                    Message {
+                        role: Role::User,
+                        author: Author::System,
+                        blocks: vec![ContentBlock::Text(format!(
+                            "{}\n\n{}",
+                            job_marker(&p.job_thread, p.outcome, p.cost_usd),
+                            p.summary
+                        ))],
+                    },
+                );
+            }
             EventKind::TurnEnded
             | EventKind::Compacted
             | EventKind::Pinned
@@ -482,10 +500,7 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             // model through what it caused (a `project_switched`, a job's
             // summary), not through the record itself.
             | EventKind::DecisionProposed
-            | EventKind::DecisionAnswered
-            // The record of another thread's work contributes no context
-            // to this one, whose transcript is its own log.
-            | EventKind::JobFinished => {}
+            | EventKind::DecisionAnswered => {}
         }
     }
 
@@ -508,6 +523,19 @@ pub fn summary_marker(from_seq: u64, to_seq: u64, model: &str, date: &str) -> St
 /// The line placed before a loaded skill's body so the model knows what it is.
 pub fn skill_marker(name: &str) -> String {
     format!("[Skill `{name}` loaded; follow it for this task]")
+}
+
+/// The line placed before a finished job's summary, so a model reads it as a child
+/// thread's return and knows the child's transcript is not here.
+pub fn job_marker(job_thread: &Ulid, outcome: JobOutcome, cost_usd: f64) -> String {
+    let how = match outcome {
+        JobOutcome::Finished => "finished",
+        JobOutcome::Failed => "failed",
+        JobOutcome::Stopped => "was stopped",
+    };
+    format!(
+        "[Background job {job_thread} {how}, cost ${cost_usd:.2}: below is its summary, not its transcript.]"
+    )
 }
 
 /// The stub an evicted result projects to: what ran, roughly with what,
@@ -1532,11 +1560,16 @@ mod tests {
         );
     }
 
-    /// A finished job's record on the front thread contributes no context:
-    /// the transcript the model reads is that thread's own log, and the
-    /// summary reaches it only through what a later ticket draws with it.
+    /// A finished job reaches the front thread as one system message holding
+    /// the marker and the summary, and as nothing else: its transcript stays
+    /// in the job's own log, which this thread never reads.
     #[test]
-    fn a_finished_job_contributes_no_context() {
+    fn a_finished_job_reaches_context_as_its_summary_only() {
+        let job_thread = Ulid::from_parts(1_700_000_000_000, 9);
+        let outcome = JobOutcome::Finished;
+        let summary = "one screen";
+        let cost_usd = 0.42;
+
         let events = vec![user(0, "build it"), assistant(1, "on it", false), ended(2)];
         let mut with = events.clone();
         with.push(ev(
@@ -1544,15 +1577,64 @@ mod tests {
             EventKind::JobFinished,
             Author::System,
             json!({
-                "job_thread": Ulid::from_parts(1_700_000_000_000, 9).to_string(),
-                "outcome": "finished",
-                "summary": "one screen",
-                "cost_usd": 0.42,
+                "job_thread": job_thread.to_string(),
+                "outcome": outcome,
+                "summary": summary,
+                "cost_usd": cost_usd,
             }),
         ));
+
         let quiet = project_body(&events).unwrap();
         let loud = project_body(&with).unwrap();
-        assert_eq!(quiet, loud);
+        assert_eq!(
+            loud.len(),
+            quiet.len() + 1,
+            "one message more, not two: {loud:?}"
+        );
+        assert_eq!(
+            loud[..quiet.len()],
+            quiet[..],
+            "every earlier message holds"
+        );
+        let appended = &loud[quiet.len()];
+        assert_eq!(appended.role, Role::User);
+        assert_eq!(appended.author, Author::System);
+        assert_eq!(
+            appended.blocks,
+            vec![ContentBlock::Text(format!(
+                "{}\n\n{}",
+                job_marker(&job_thread, outcome, cost_usd),
+                summary
+            ))]
+        );
+    }
+
+    #[test]
+    fn every_job_outcome_is_named_in_its_marker() {
+        let job_thread = Ulid::from_parts(1_700_000_000_000, 9);
+        let cost_usd = 1.5;
+        let markers: Vec<String> = [
+            JobOutcome::Finished,
+            JobOutcome::Failed,
+            JobOutcome::Stopped,
+        ]
+        .into_iter()
+        .map(|outcome| job_marker(&job_thread, outcome, cost_usd))
+        .collect();
+
+        for (i, marker) in markers.iter().enumerate() {
+            assert!(
+                marker.contains(&job_thread.to_string()),
+                "the job's thread is named: {marker}"
+            );
+            assert!(
+                marker.contains(&format!("{cost_usd:.2}")),
+                "the cost is named: {marker}"
+            );
+            for other in &markers[i + 1..] {
+                assert_ne!(marker, other, "an outcome never reads as another");
+            }
+        }
     }
 
     /// T4 (issue #53): the build runner's events are the runner's own

@@ -35,8 +35,8 @@ pub use payload::{
     Usage, UserMessagePayload, Verdict, is_startup_call,
 };
 pub use projection::{
-    Projection, STUB_ARG_MAX_CHARS, project, project_body, shorten_call_args, skill_marker,
-    summary_marker, truncate_middle,
+    Projection, STUB_ARG_MAX_CHARS, job_marker, project, project_body, shorten_call_args,
+    skill_marker, summary_marker, truncate_middle,
 };
 pub use recall::{
     Hit, SNIPPET_MAX_CHARS, call_index, call_of, kind_name, project_at, render_range, search,
