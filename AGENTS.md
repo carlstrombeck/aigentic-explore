@@ -3,6 +3,10 @@
 Aigentic is an open source agent harness in Rust. `docs/PRD.md` and the
 `docs/PLAN-*.md` files are binding; read them before changing anything.
 
+This repository is a fork. Read `docs/FORK.md` too: it says how the fork
+tracks upstream, and `docs/PLAN-portfolio.md` wins over upstream plans
+here where they differ.
+
 ## Crate layout
 
 One Cargo workspace, edition 2024, MIT licence. Directories under `crates/`

@@ -2,6 +2,14 @@
 
 # Aigentic
 
+> **This is a fork** of [stevewerme/aigentic](https://github.com/stevewerme/aigentic),
+> aimed at one person running several projects in parallel from one
+> conversation. It tracks upstream and renames nothing. What it adds and
+> in what order is in [`docs/FORK.md`](docs/FORK.md) and
+> [`docs/PLAN-portfolio.md`](docs/PLAN-portfolio.md). The install
+> instructions below fetch upstream's releases; this fork publishes none
+> yet, so build from this repository to get its changes.
+
 An open source agent harness in Rust that runs open-weight models, on EU
 infrastructure or any OpenAI-compatible or Anthropic endpoint, and ships
 as a single terminal binary. The harness owns everything around the model,
