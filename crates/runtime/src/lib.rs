@@ -7,6 +7,10 @@
 //! result carries the record; [`seams`] still holds the turn queue
 //! pass-through for phase 5.
 
+// `json!` spends recursion per nesting level and the `finish_step` schema
+// nests an object five deep; the default 128 is not enough for it.
+#![recursion_limit = "256"]
+
 // Re-exported so a client can build a `Runtime` while depending on this
 // crate alone, per the dependency rule.
 pub use aigentic_core;
@@ -18,6 +22,9 @@ pub use aigentic_tools;
 
 mod approver;
 mod audit;
+pub mod brief;
+mod brief_refresh;
+pub mod checks;
 mod compaction;
 pub mod config_keys;
 mod context;
@@ -25,38 +32,54 @@ mod decisions;
 mod error;
 pub mod evict;
 pub mod harness_tools;
+pub mod job;
+pub mod job_view;
 pub mod knowledge;
 pub mod layers;
 mod memory;
 pub mod mode;
 pub mod project;
+pub mod recall_tool;
 mod resume;
+pub mod run_status;
+pub mod runner;
 mod runtime;
 pub mod seams;
 mod support;
 pub mod title;
 mod turn;
+pub mod workflow;
 
+pub use aigentic_core::CUT_STREAM;
 pub use approver::{Answer, Approver, DenyAll};
 pub use audit::audit_tool_results;
-pub use compaction::SUMMARY_PROMPT;
+pub use brief::{BRIEF_FILE, PROJECT_BRIEF_CAP, WORKSPACE_BRIEF_CAP};
+pub use compaction::{LINK_PROMPT, SUMMARY_PROMPT};
 pub use context::{Prefix, build_context};
 pub use decisions::{
-    Answered, CancelToken, DecisionError, Decisions, Inbox, Outbox, Pending, Queued, inbox,
+    Answered, CancelToken, DecisionError, Decisions, Inbox, Outbox, Pending, Queued, SwitchAnswer,
+    SwitchCtx, inbox,
 };
 pub use error::RuntimeError;
 pub use evict::{
     Decision, EVICT_BLOCK_CALLS, EVICT_MIN_FREE_PERCENT, RATIO_MAX, RATIO_MIN, RATIO_SMOOTHING,
     calibrated, calibrated_delta, min_free, next_ratio, schemas_tokens,
 };
-pub use knowledge::{Knowledge, KnowledgeMode};
-pub use layers::{Decided, GlobalLayer, Layers, WorkspaceLayer};
-pub use memory::{MEMORY_FILES, MEMORY_PROMPT};
+pub use harness_tools::{
+    IdleProposal, JOB_ASKS_NOBODY, JOB_STARTS_NO_JOB, JOB_STAYS_PUT, NOT_RUN_LENGTH,
+    NOT_RUN_OVER_LIMIT, NOT_RUN_SOLO, Settled,
+};
+pub use job::{JOB_DENY, JOB_RULE_ASK, JOB_RULE_BOUNDARY, JOB_RULE_READ_ONLY, JobSpec};
+pub use knowledge::{Knowledge, KnowledgeMode, ScopeSources};
+pub use layers::{Decided, GlobalLayer, Layers, PERSON_MEMORY_HEADING, WorkspaceLayer};
+pub use memory::{MEMORY_FILES, MEMORY_PROMPT, MEMORY_REQUEST};
 pub use mode::Mode;
-pub use project::{Project, ProjectError, ProjectFile};
-pub use resume::{INTERRUPTED_RESULT, Resumed};
+pub use project::{Project, ProjectError, ProjectFile, ProjectKind};
+pub use resume::{DAEMON_RESTARTED, INTERRUPTED_RESULT, Resumed};
+pub use run_status::{Phase, RunStatus, run_status};
 pub use runtime::{
-    ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, INTERRUPTED, Prices,
-    ProjectContext, Runtime, Signal, TurnOutcome, WindowUsage,
+    ASKED_HUMAN, CompactionSettings, DEFAULT_BUDGET, DEFAULT_COMPACTION, INTERRUPTED, LENGTH_STOP,
+    MAX_TOKENS_STOP, MAX_USD, Prices, ProjectContext, ProjectRow, Runtime, STEP_REPORTED,
+    SUMMARY_LIMIT, Signal, TurnOutcome, WindowUsage, memory_homes_of,
 };
 pub use seams::{SessionGrant, Verdict};

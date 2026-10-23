@@ -22,6 +22,7 @@ use aigentic_runtime::aigentic_log::{
 use aigentic_runtime::aigentic_policy::{Decision, Policy, Rule};
 use aigentic_runtime::aigentic_tools::ToolRegistry;
 use aigentic_runtime::{Mode, Runtime};
+use aigentic_server::runs::Working;
 use aigentic_server::{Mail, Mailbox, NoReports, ThreadActor};
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -133,6 +134,8 @@ struct Rig {
     dir: tempfile::TempDir,
     thread: ulid::Ulid,
     task: tokio::task::JoinHandle<()>,
+    /// The count the actor was built with, so a test can move it.
+    working: Working,
 }
 
 fn rig(script: Vec<Option<Vec<ProviderEvent>>>, allow_slow: bool) -> Rig {
@@ -164,7 +167,15 @@ fn rig_delayed(script: Vec<Option<Vec<ProviderEvent>>>, allow_slow: bool, delay:
         aigentic_runtime::aigentic_core::AgentId("worker".into()),
     )
     .with_policy(policy);
-    let (actor, mailbox) = ThreadActor::new(runtime, None, Arc::new(NoReports)).unwrap();
+    let working = Working::default();
+    let (actor, mailbox) = ThreadActor::new(
+        runtime,
+        None,
+        Arc::new(NoReports),
+        Arc::new(|_: &str| None),
+        working.clone(),
+    )
+    .unwrap();
     let task = tokio::spawn(actor.run());
     Rig {
         mailbox,
@@ -172,6 +183,7 @@ fn rig_delayed(script: Vec<Option<Vec<ProviderEvent>>>, allow_slow: bool, delay:
         dir,
         thread,
         task,
+        working,
     }
 }
 
@@ -256,6 +268,20 @@ impl Rig {
             seen.push(n);
             if hit {
                 return seen;
+            }
+        }
+    }
+
+    /// Wait until a usage line reports `working` as the count.
+    async fn until_usage(rx: &mut mpsc::UnboundedReceiver<Notice>, working: u32) -> Notice {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let n = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("a usage line in time")
+                .expect("channel open");
+            if matches!(&n, Notice::Usage { working: w, .. } if *w == working) {
+                return n;
             }
         }
     }
@@ -727,7 +753,14 @@ async fn a_resumed_open_turn_is_continued_before_the_first_mail() {
         log,
         aigentic_runtime::aigentic_core::AgentId("worker".into()),
     );
-    let (actor, mailbox) = ThreadActor::new(runtime, None, Arc::new(NoReports)).unwrap();
+    let (actor, mailbox) = ThreadActor::new(
+        runtime,
+        None,
+        Arc::new(NoReports),
+        Arc::new(|_: &str| None),
+        Working::default(),
+    )
+    .unwrap();
     let task = tokio::spawn(actor.run());
     // Subscribe after the continuation had time to finish.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -774,8 +807,15 @@ async fn usage_is_pushed_after_the_call_and_again_when_the_turn_ends() {
                 window,
                 turn_elapsed_ms,
                 queued,
+                thread_tokens,
                 ..
-            } => Some((*tokens_in_window, *window, *turn_elapsed_ms, *queued)),
+            } => Some((
+                *tokens_in_window,
+                *window,
+                *turn_elapsed_ms,
+                *queued,
+                *thread_tokens,
+            )),
             _ => None,
         })
         .collect();
@@ -784,6 +824,10 @@ async fn usage_is_pushed_after_the_call_and_again_when_the_turn_ends() {
     assert!(during[0].0 > 0);
     assert!(during[0].2.is_some());
     assert_eq!(during[0].3, 0);
+    // The thread figure (issue #99) rides along: the rig holds no
+    // runtime, so T1 pins the number; here it is present and non-zero.
+    let thread_during = during[0].4.expect("a #99 daemon sends the thread figure");
+    assert!(thread_during > 0);
     // After Idle: the same fill once more, untimed, so a status line
     // drops its clock.
     let last = tokio::time::timeout(Duration::from_secs(2), notices.recv())
@@ -801,6 +845,50 @@ async fn usage_is_pushed_after_the_call_and_again_when_the_turn_ends() {
         ),
         "{last:?}"
     );
+    // The turn-end push re-sends the last call's figure: never smaller.
+    let Notice::Usage {
+        thread_tokens: Some(thread_after),
+        ..
+    } = last
+    else {
+        panic!("{last:?}")
+    };
+    assert!(thread_after >= thread_during);
+    drop(rig.mailbox);
+    rig.task.await.unwrap();
+}
+
+/// A client watching a thread is told the count when a build
+/// starts and stops being driven, with no request of its own. The line is the
+/// one the thread already sends, so nothing new has to be asked for.
+#[tokio::test]
+async fn the_count_follows_the_runs() {
+    let rig = rig(vec![Some(vec![text("reply"), done()])], false);
+    let (_, _, mut notices) = rig.subscribe(0).await;
+    assert_eq!(rig.post(steve(), "one", false).await, Response::Ok);
+    let seen = Rig::until_state(&mut notices, |s| *s == ThreadState::Idle).await;
+    let working_of = |notice: &Notice| match notice {
+        Notice::Usage { working, .. } => Some(*working),
+        _ => None,
+    };
+    let idle: Vec<u32> = seen.iter().filter_map(working_of).collect();
+    assert_eq!(
+        idle.last().copied(),
+        Some(0),
+        "nothing is driven yet: {idle:?}"
+    );
+
+    // A build starts: the count moves to one, and the actor sends the line
+    // again on its own. A line the turn already queued may arrive first.
+    let lead = ulid::Ulid::generate();
+    rig.working.register(lead);
+    let pushed = Rig::until_usage(&mut notices, 1).await;
+    assert_eq!(working_of(&pushed), Some(1), "{pushed:?}");
+
+    // It stops being driven: back to zero, pushed the same way.
+    rig.working.release(lead);
+    let pushed = Rig::until_usage(&mut notices, 0).await;
+    assert_eq!(working_of(&pushed), Some(0), "{pushed:?}");
     drop(rig.mailbox);
     rig.task.await.unwrap();
 }

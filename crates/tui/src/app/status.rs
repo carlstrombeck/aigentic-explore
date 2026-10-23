@@ -9,6 +9,7 @@ use std::time::Duration;
 use aigentic_api::ThreadState;
 
 use crate::app::engine::Identity;
+use crate::progress;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Status {
@@ -21,20 +22,44 @@ pub struct Status {
     /// The thread's title, when it has one.
     pub title: Option<String>,
     pub mode: String,
-    /// (tokens in the window, the ceiling — compaction's line), from
-    /// `Notice::Usage`.
-    pub usage: Option<(u64, u64)>,
+    /// The working and thread figures from `Notice::Usage`.
+    pub usage: Option<Figures>,
+    /// How many builds the daemon drives right now, from `Notice::Usage`
+    ///. Drawn only when it is above zero: a machine with
+    /// nothing running says nothing about builds.
+    pub working: u32,
     /// How long the running turn has run; `None` when idle.
     pub elapsed: Option<Duration>,
     pub queued: u32,
     /// What the thread waits on, when it does.
     pub waiting: Option<&'static str>,
+    /// The followed run's own segment, last on the line while a run is
+    /// followed and dropped when the follow ends.
+    pub run: Option<String>,
+    /// The watched step's own head, as `inside #140 spec`, while a step
+    /// of a running issue is open here: the line is the watch's alone
+    /// then, and the front thread's parts come back when it ends.
+    pub inside: Option<String>,
 }
 
 impl Status {
     /// `vendela · Crate count · flash (deepseek-v4.1-flash) · manual ·
-    /// 58k / 128k context · queued 1`
+    /// working 48k · thread 2.1M · queued 1`
     pub fn line(&self) -> String {
+        // Inside a watch the line is the watch's alone: what the watched
+        // run is doing, and the way back. `inside` already names the
+        // issue and the step, so the run's figures are drawn bare.
+        if let Some(inside) = &self.inside {
+            let mut parts = vec![inside.clone()];
+            if let Some(run) = &self.run {
+                parts.push(run.clone());
+            }
+            if self.working > 0 {
+                parts.push(format!("{} working", self.working));
+            }
+            parts.push("/back".to_owned());
+            return parts.join(" · ");
+        }
         let mut parts = vec![self.project.clone()];
         if let Some(t) = &self.title {
             let short: String = t.chars().take(TITLE_CHARS).collect();
@@ -48,15 +73,30 @@ impl Status {
             parts.push(who);
         }
         parts.push(self.mode.clone());
-        // The last call's context against the ceiling (issue #21): not
-        // a percentage — the two sizes, read as a fraction.
+        // What the model sees and how big the thread really is (issue
+        // #99): information, not a warning, so no ceiling to read it
+        // against. A daemon before #99 sends no thread figure.
         match self.usage {
-            Some((used, ceiling)) => parts.push(format!(
-                "{} / {} context",
-                count_short(used),
-                count_short(ceiling)
+            Some(Figures {
+                working,
+                thread: Some(thread),
+            }) => parts.push(format!(
+                "working {} · thread {}",
+                count_short(working),
+                count_short(thread)
             )),
-            None => parts.push("context ?".into()),
+            Some(Figures {
+                working,
+                thread: None,
+            }) => parts.push(format!("working {}", count_short(working))),
+            // A daemon that has sent no usage figure yet leaves the part
+            // off the line: `?` was never a figure.
+            None => {}
+        }
+        // How busy the machine is: nothing to say when
+        // nothing runs.
+        if self.working > 0 {
+            parts.push(format!("{} working", self.working));
         }
         if let Some(elapsed) = self.elapsed {
             parts.push(elapsed_short(elapsed));
@@ -67,7 +107,37 @@ impl Status {
         if let Some(w) = self.waiting {
             parts.push(w.to_owned());
         }
+        if let Some(run) = &self.run {
+            parts.push(run.clone());
+        }
         parts.join(" · ")
+    }
+
+    /// The terminal title: the gate waiting on the person, else the work
+    /// under way, else the thread's name. `gate` is the name of a gate the
+    /// run left open; `busy` is work under way on this terminal.
+    ///
+    /// The gate wins over both the work marker and the thread's name,
+    /// because a run parked at one waits until a person looks. Below it the
+    /// app's name stays first and the thread's title, else the project,
+    /// follows, so a tab shows which thread is which; with neither known
+    /// the app's name stands alone rather than trailing a separator. It
+    /// reads no clock: a string that changed every second would flicker in
+    /// a tab list.
+    pub fn title(&self, gate: Option<&str>, busy: bool) -> String {
+        if let Some(gate) = gate {
+            return format!("● {APP} · {gate} · waiting");
+        }
+        let name = match (&self.title, self.project.as_str()) {
+            (Some(title), _) if !title.is_empty() => Some(progress::clip(title, TITLE_CHARS)),
+            (_, project) if !project.is_empty() => Some(progress::clip(project, TITLE_CHARS)),
+            _ => None,
+        };
+        let title = match name {
+            Some(name) => format!("{APP} · {name}"),
+            None => APP.to_owned(),
+        };
+        if busy { format!("✳ {title}") } else { title }
     }
 
     /// The parts that come from the thread's state.
@@ -83,12 +153,90 @@ impl Status {
             }
             ThreadState::AwaitingApproval { .. } => self.waiting = Some("awaiting approval"),
             ThreadState::AwaitingHuman { .. } => self.waiting = Some("awaiting an answer"),
+            ThreadState::AwaitingSwitch { .. } => self.waiting = Some("awaiting switch"),
         }
     }
 }
 
+/// The followed run's segment: `#139 spec · 3m12s · 72 calls · $0.51 ·
+/// 2/6 Map the code · quiet 3m`, or `#139 waiting at decide` at a gate. The step's figures come from the
+/// daemon's own fold over the lead's and the child's logs, so the line
+/// repeats nothing the client counts.
+pub fn run_segment(status: &aigentic_api::RunStatus) -> String {
+    // The issue names the whole line; the rest is one phrase, so the
+    // step reads as the issue's own while the figures follow it.
+    format!("#{} {}", status.issue, run_parts(status, true).join(" · "))
+}
+
+/// The run segment's figures without the head it is drawn under: what the
+/// status line shows beside a watch's own head, which already names the
+/// issue and the step, so the figures are the segment's parts alone.
+pub fn run_figures(status: &aigentic_api::RunStatus) -> String {
+    run_parts(status, false).join(" · ")
+}
+
+/// The run segment's parts, in order: the step's own first when `named`,
+/// then its figures, then the silence. One builder keeps the watched
+/// figures a prefix of the segment they come from.
+fn run_parts(status: &aigentic_api::RunStatus, named: bool) -> Vec<String> {
+    let mut parts = Vec::new();
+    match &status.phase {
+        aigentic_api::RunPhase::Step {
+            step,
+            elapsed_secs,
+            calls,
+            cost_usd,
+            checklist,
+            ..
+        } => {
+            if named {
+                parts.push(step.clone());
+            }
+            parts.push(progress::short_duration(*elapsed_secs as i64));
+            parts.push(format!("{calls} calls"));
+            // Two decimals, the provider's own stamp: the segment's money
+            // matches `aigentic status`'s `$a` part, never its estimate.
+            parts.push(format!("${cost_usd:.2}"));
+            if let Some(checklist) = checklist {
+                let mut item = format!("{}/{}", checklist.done, checklist.total);
+                if let Some(active) = &checklist.active {
+                    item.push(' ');
+                    item.push_str(&progress::clip(active, progress::TITLE_CHARS));
+                }
+                parts.push(item);
+            }
+        }
+        aigentic_api::RunPhase::Gate { gate } => parts.push(format!("waiting at {gate}")),
+        aigentic_api::RunPhase::Move { what } => parts.push(what.clone()),
+        aigentic_api::RunPhase::Stopped { reason } => {
+            parts.push(format!("stopped: {}", crate::run_view::reason_line(reason)))
+        }
+    }
+    // Two idle minutes is the point the run reads as stopped rather than
+    // slow, so the figure appears only then.
+    if status.idle_secs >= QUIET_AFTER_SECS {
+        parts.push(format!("quiet {}m", status.idle_secs / 60));
+    }
+    parts
+}
+
+/// Seconds of silence after which the segment says `quiet`.
+const QUIET_AFTER_SECS: u64 = 120;
+
+/// The daemon's last `Notice::Usage` (issue #99): what the model sees
+/// this call, and the whole thread as if nothing had been stubbed or
+/// summarised — `None` from a daemon before #99.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Figures {
+    pub working: u64,
+    pub thread: Option<u64>,
+}
+
 /// How much of the title the footer shows.
 const TITLE_CHARS: usize = 40;
+
+/// The app's own name: the status line's head and the terminal title's.
+const APP: &str = "aigentic";
 
 /// `950`, `4.0k`, `128k`, `1.3M`: a size in decimal thousands — the
 /// one vocabulary for the footer's context and `/cost`'s counts
@@ -121,6 +269,43 @@ pub fn elapsed_short(d: Duration) -> String {
 mod tests {
     use super::*;
 
+    /// The working count is the daemon's, drawn from the
+    /// line's own parts, and only while something is working. A count of
+    /// zero never prints a `0 working` segment, and a line with no count
+    /// reads as it did.
+    #[test]
+    fn the_line_shows_the_count_only_when_something_works() {
+        let base = Status {
+            project: "vendela".into(),
+            mode: "manual".into(),
+            ..Status::default()
+        };
+        assert!(!base.line().contains("working"), "{}", base.line());
+
+        let busy = Status {
+            working: 2,
+            ..base.clone()
+        };
+        let line = busy.line();
+        assert_eq!(line, "vendela · manual · 2 working");
+        assert!(line.starts_with("vendela · manual"));
+        // Inside a watch the line is the watch's own, and the count
+        // draws on it as on any other line.
+        let inside = Status {
+            inside: Some("#64 · spec".into()),
+            ..busy.clone()
+        };
+        let line = inside.line();
+        assert_eq!(line, "#64 · spec · 2 working · /back");
+        // Nothing running: no segment, in both shapes.
+        let idle = Status {
+            inside: Some("#64 · spec".into()),
+            working: 0,
+            ..Status::default()
+        };
+        assert_eq!(idle.line(), "#64 · spec · /back");
+    }
+
     #[test]
     fn the_line_reads_left_to_right() {
         let mut s = Status {
@@ -128,25 +313,259 @@ mod tests {
             identity: None,
             title: None,
             mode: "manual".into(),
-            usage: Some((31_000, 100_000)),
+            usage: Some(Figures {
+                working: 31_000,
+                thread: Some(2_100_000),
+            }),
+            working: 0,
             elapsed: Some(Duration::from_secs(12)),
             queued: 1,
             waiting: None,
+            run: None,
+            inside: None,
         };
-        // The two sizes, used against the ceiling, not a percentage.
+        // Working and thread (issue #99), each in the footer's one
+        // vocabulary, and no ceiling to read them against.
         assert_eq!(
             s.line(),
-            "vendela · manual · 31k / 100k context · 12s · queued 1"
+            format!(
+                "vendela · manual · working {} · thread {} · 12s · queued 1",
+                count_short(31_000),
+                count_short(2_100_000)
+            )
         );
         s.elapsed = None;
         s.queued = 0;
         s.usage = None;
-        assert_eq!(s.line(), "vendela · manual · context ?");
+        assert_eq!(s.line(), "vendela · manual");
         s.title = Some("A title".into());
-        assert_eq!(s.line(), "vendela · A title · manual · context ?");
-        // A fuller window than the ceiling still reads as itself.
-        s.usage = Some((250_000, 100_000));
-        assert_eq!(s.line(), "vendela · A title · manual · 250k / 100k context");
+        assert_eq!(s.line(), "vendela · A title · manual");
+        // A daemon before #99 sends no thread figure: working alone.
+        s.usage = Some(Figures {
+            working: 250_000,
+            thread: None,
+        });
+        assert_eq!(
+            s.line(),
+            format!(
+                "vendela · A title · manual · working {}",
+                count_short(250_000)
+            )
+        );
+    }
+
+    /// A `RunStatus` whose step carries the fixture's own figures, so a
+    /// test's expectation is derived rather than typed twice.
+    fn a_step(issue: u64, elapsed_secs: u64, calls: u32, cost_usd: f64) -> aigentic_api::RunStatus {
+        aigentic_api::RunStatus {
+            issue,
+            phase: aigentic_api::RunPhase::Step {
+                step: STEP.into(),
+                attempt: 1,
+                elapsed_secs,
+                calls,
+                cost_usd,
+                checklist: None,
+            },
+            idle_secs: 0,
+        }
+    }
+
+    const STEP: &str = "spec";
+    const GATE: &str = "decide";
+    const THREAD: &str = "Spec for #185";
+    const PROJECT: &str = "vendela";
+
+    #[test]
+    fn the_segment_reads_the_issues_step_its_figures_and_its_checklist() {
+        const ISSUE: u64 = 139;
+        const ELAPSED: u64 = 192;
+        const CALLS: u32 = 72;
+        const COST: f64 = 0.51;
+        let mut status = a_step(ISSUE, ELAPSED, CALLS, COST);
+        let aigentic_api::RunPhase::Step { checklist, .. } = &mut status.phase else {
+            unreachable!("a_step builds a step");
+        };
+        *checklist = Some(aigentic_api::RunChecklist {
+            done: 2,
+            total: 6,
+            active: Some("Map the code".into()),
+        });
+
+        assert_eq!(
+            run_segment(&status),
+            format!(
+                "#{ISSUE} {STEP} · {} · {CALLS} calls · ${COST:.2} · 2/6 Map the code",
+                progress::short_duration(ELAPSED as i64),
+            )
+        );
+
+        // No checklist names an item: the position alone, and no part
+        // when there is no checklist at all.
+        let aigentic_api::RunPhase::Step { checklist, .. } = &mut status.phase else {
+            unreachable!("a_step builds a step");
+        };
+        checklist.as_mut().unwrap().active = None;
+        assert!(run_segment(&status).ends_with(" · 2/6"));
+        let aigentic_api::RunPhase::Step { checklist, .. } = &mut status.phase else {
+            unreachable!("a_step builds a step");
+        };
+        *checklist = None;
+        assert_eq!(
+            run_segment(&status),
+            format!(
+                "#{ISSUE} {STEP} · {} · {CALLS} calls · ${COST:.2}",
+                progress::short_duration(ELAPSED as i64),
+            )
+        );
+    }
+
+    #[test]
+    fn the_segment_names_the_gate_and_the_move() {
+        let gate = aigentic_api::RunStatus {
+            issue: 139,
+            phase: aigentic_api::RunPhase::Gate {
+                gate: "decide".into(),
+            },
+            idle_secs: 0,
+        };
+        assert_eq!(run_segment(&gate), "#139 waiting at decide");
+
+        let mov = aigentic_api::RunStatus {
+            issue: 139,
+            phase: aigentic_api::RunPhase::Move {
+                what: "running the checks".into(),
+            },
+            idle_secs: 0,
+        };
+        assert_eq!(run_segment(&mov), "#139 running the checks");
+        // A move is a sentence, not a step: it carries no clock.
+        assert!(!run_segment(&mov).contains("calls"));
+    }
+
+    #[test]
+    fn inside_is_drawn_and_nothing_else_changes() {
+        const ISSUE: u64 = 140;
+        let step_fixture = a_step(ISSUE, 192, 72, 0.51);
+        let figures = run_figures(&step_fixture);
+        let inside = format!("inside #{ISSUE} {STEP}");
+
+        // Nothing changes while no watch is open: the line is exactly the
+        // one the front thread draws today.
+        let front = Status {
+            project: "vendela".into(),
+            mode: "manual".into(),
+            ..Status::default()
+        };
+        assert_eq!(front.line(), "vendela · manual");
+        assert!(!front.line().contains(&inside));
+
+        // Inside, the watch's segment leads, the run's figures follow
+        // bare, and `/back` is last.
+        let watching = Status {
+            project: "vendela".into(),
+            mode: "manual".into(),
+            run: Some(figures.clone()),
+            inside: Some(inside.clone()),
+            ..Status::default()
+        };
+        assert_eq!(
+            watching.line(),
+            format!("{inside} · {figures} · /back"),
+            "the run's head is not drawn twice"
+        );
+
+        // A watch whose run has pushed no figures yet: the segment and
+        // the way back, and nothing invented between them.
+        let quiet = Status {
+            inside: Some(inside.clone()),
+            ..Status::default()
+        };
+        assert_eq!(quiet.line(), format!("{inside} · /back"));
+
+        // A followed run of another issue is not the watched one: the
+        // shell hands the watch's own figures, and a status for another
+        // issue never becomes one.
+        let other = a_step(ISSUE + 1, 10, 1, 0.0);
+        let watched = crate::app::watch::figures_after(ISSUE, None, &step_fixture);
+        assert_eq!(watched.as_deref(), Some(figures.as_str()));
+        assert_eq!(
+            crate::app::watch::figures_after(ISSUE, watched.as_deref(), &other),
+            watched,
+            "another issue's run is not the watched one"
+        );
+        let without = Status {
+            run: crate::app::watch::figures_after(ISSUE, None, &other),
+            inside: Some(inside.clone()),
+            ..Status::default()
+        };
+        assert_eq!(without.line(), format!("{inside} · /back"));
+    }
+
+    #[test]
+    fn the_figures_are_the_run_segment_without_the_head() {
+        const ISSUE: u64 = 140;
+        let step_fixture = a_step(ISSUE, 192, 72, 0.51);
+        assert_eq!(
+            run_segment(&step_fixture),
+            format!("#{ISSUE} {STEP} · {}", run_figures(&step_fixture))
+        );
+
+        let gate_fixture = aigentic_api::RunStatus {
+            issue: ISSUE,
+            phase: aigentic_api::RunPhase::Gate { gate: GATE.into() },
+            idle_secs: 0,
+        };
+        assert_eq!(
+            run_segment(&gate_fixture),
+            format!("#{ISSUE} waiting at {GATE}")
+        );
+        assert_eq!(run_figures(&gate_fixture), format!("waiting at {GATE}"));
+    }
+
+    #[test]
+    fn inside_is_distinguishable_by_sight() {
+        const ISSUE: u64 = 140;
+        let step_fixture = a_step(ISSUE, 192, 72, 0.51);
+        let figures = run_figures(&step_fixture);
+        let inside = format!("inside #{ISSUE} {STEP}");
+
+        let watching = Status {
+            run: Some(figures.clone()),
+            inside: Some(inside.clone()),
+            ..Status::default()
+        };
+        assert!(watching.line().contains(&figures));
+
+        // The two configurations the shell builds: with a watch, the
+        // watch's line; without one, the front thread's byte for byte.
+        let front = Status {
+            project: "vendela".into(),
+            mode: "manual".into(),
+            run: Some(figures.clone()),
+            ..Status::default()
+        };
+        assert_eq!(front.line(), format!("vendela · manual · {figures}"));
+        assert!(!front.line().contains(&inside));
+    }
+
+    #[test]
+    fn a_step_quiet_for_two_minutes_says_so() {
+        let at = |idle_secs| aigentic_api::RunStatus {
+            idle_secs,
+            ..a_step(139, 192, 72, 0.51)
+        };
+
+        assert!(
+            !run_segment(&at(QUIET_AFTER_SECS - 1)).contains("quiet"),
+            "just under the threshold stays silent"
+        );
+        for idle_secs in [QUIET_AFTER_SECS, 900] {
+            assert!(
+                run_segment(&at(idle_secs)).ends_with(&format!(" · quiet {}m", idle_secs / 60)),
+                "quiet at {idle_secs}s"
+            );
+        }
     }
 
     #[test]
@@ -160,30 +579,33 @@ mod tests {
             project: "vendela".into(),
             identity: Some(identity(Some("flash"), "deepseek-v4.1-flash", None)),
             mode: "auto".into(),
-            usage: Some((76_000, 128_000)),
+            usage: Some(Figures {
+                working: 76_000,
+                thread: Some(310_000),
+            }),
             ..Status::default()
         };
         assert_eq!(
             s.line(),
-            "vendela · flash (deepseek-v4.1-flash) · auto · 76k / 128k context"
+            "vendela · flash (deepseek-v4.1-flash) · auto · working 76k · thread 310k"
         );
         // The effort rides the model when the profile sets one.
         s.identity = Some(identity(Some("flash"), "deepseek-v4.1-flash", Some("50")));
         assert_eq!(
             s.line(),
-            "vendela · flash (deepseek-v4.1-flash) · effort 50 · auto · 76k / 128k context"
+            "vendela · flash (deepseek-v4.1-flash) · effort 50 · auto · working 76k · thread 310k"
         );
         // A thread with no profile names the model alone.
         s.identity = Some(identity(None, "deepseek-v4.1-flash", None));
         assert_eq!(
             s.line(),
-            "vendela · deepseek-v4.1-flash · auto · 76k / 128k context"
+            "vendela · deepseek-v4.1-flash · auto · working 76k · thread 310k"
         );
         // A daemon that knows no model leaves the line as it was.
         s.identity = Some(identity(None, "unknown", None));
-        assert_eq!(s.line(), "vendela · auto · 76k / 128k context");
+        assert_eq!(s.line(), "vendela · auto · working 76k · thread 310k");
         s.identity = None;
-        assert_eq!(s.line(), "vendela · auto · 76k / 128k context");
+        assert_eq!(s.line(), "vendela · auto · working 76k · thread 310k");
     }
 
     /// The model's own label: profile and model in one name, the effort
@@ -246,8 +668,91 @@ mod tests {
             questions: vec![],
         });
         assert_eq!(s.waiting, Some("awaiting an answer"));
+        s.apply_state(&ThreadState::AwaitingSwitch {
+            call_id: "c".into(),
+            project: "there".into(),
+            workspace: Some("~/there".into()),
+            reason: "belongs there".into(),
+        });
+        assert_eq!(s.waiting, Some("awaiting switch"));
         s.apply_state(&ThreadState::Idle);
         assert_eq!(s.queued, 0);
         assert_eq!(s.waiting, None);
+    }
+
+    /// A `Status` named by its thread, in its project.
+    fn a_named_thread() -> Status {
+        Status {
+            title: Some(THREAD.into()),
+            project: PROJECT.into(),
+            ..Status::default()
+        }
+    }
+
+    /// A gate is where a run sits idle until someone looks, so it outranks
+    /// both the work marker and the thread's name.
+    #[test]
+    fn the_gate_outranks_a_turn_and_the_thread_name() {
+        assert_eq!(
+            a_named_thread().title(Some(GATE), true),
+            format!("● {APP} · {GATE} · waiting")
+        );
+        assert_eq!(
+            a_named_thread().title(Some(GATE), false),
+            format!("● {APP} · {GATE} · waiting")
+        );
+    }
+
+    /// While a turn runs the marker says so, and the name is the thread's
+    /// title, else its project.
+    #[test]
+    fn the_title_marks_work_and_names_the_thread() {
+        assert_eq!(
+            a_named_thread().title(None, true),
+            format!("✳ {APP} · {THREAD}")
+        );
+        let untitled = Status {
+            project: PROJECT.into(),
+            ..Status::default()
+        };
+        assert_eq!(untitled.title(None, true), format!("✳ {APP} · {PROJECT}"));
+    }
+
+    #[test]
+    fn an_idle_thread_names_the_thread() {
+        assert_eq!(
+            a_named_thread().title(None, false),
+            format!("{APP} · {THREAD}")
+        );
+    }
+
+    /// A long thread name is clipped, so it cannot push the app's name or
+    /// the gate's word out of a tab.
+    #[test]
+    fn the_title_clips_a_long_thread_name() {
+        let long = THREAD.repeat(TITLE_CHARS);
+        let status = Status {
+            title: Some(long.clone()),
+            ..Status::default()
+        };
+        let shown: String = long.chars().take(TITLE_CHARS).collect();
+        assert_eq!(status.title(None, false), format!("{APP} · {shown}…"));
+        assert!(
+            long.chars().count() > TITLE_CHARS,
+            "the name is past the limit it is clipped at"
+        );
+    }
+
+    /// Nothing known: the app's own name, never an empty string and never
+    /// a dangling separator.
+    #[test]
+    fn with_nothing_known_the_title_is_the_app_name() {
+        assert_eq!(Status::default().title(None, false), APP);
+        let blank = Status {
+            title: Some(String::new()),
+            ..Status::default()
+        };
+        assert_eq!(blank.title(None, false), APP);
+        assert_eq!(Status::default().title(None, true), format!("✳ {APP}"));
     }
 }

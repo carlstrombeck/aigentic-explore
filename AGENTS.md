@@ -3,6 +3,10 @@
 Aigentic is an open source agent harness in Rust. `docs/PRD.md` and the
 `docs/PLAN-*.md` files are binding; read them before changing anything.
 
+This repository is a fork. Read `docs/FORK.md` too: it says how the fork
+tracks upstream, and `docs/PLAN-portfolio.md` wins over upstream plans
+here where they differ.
+
 ## Crate layout
 
 One Cargo workspace, edition 2024, MIT licence. Directories under `crates/`
@@ -57,7 +61,9 @@ add an event kind, not a side table.
 
 ## Commands
 
-All three must pass before a change is finished:
+The Rust toolchain is pinned in `rust-toolchain.toml`, for every machine and for CI. Bump it on purpose, and fix what the new release flags in the same commit.
+
+All four must pass before a change is finished:
 
 ```bash
 cargo fmt
@@ -69,6 +75,10 @@ cargo clippy -- -D warnings
 
 ```bash
 cargo test
+```
+
+```bash
+scripts/comment-check.sh origin/main
 ```
 
 ## Tool behaviour
@@ -86,7 +96,9 @@ cargo test
 - Every tool caps what it returns, keeping the head and the tail of long
   output and stating how many bytes were omitted.
 - The working directory is shared by the built-in tools and persists across
-  bash calls; a `cd` in a call that times out is discarded.
+  bash calls; a `cd` in a call that times out is discarded. A call whose
+  working directory no longer exists runs in the session's root instead, and
+  its result starts with a line saying so.
 
 ## Configuration and secrets
 
@@ -106,6 +118,26 @@ expected variables.
   (`aigentic.toml`, `.aigentic/`) and vendor-neutral conventions
   (`AGENTS.md`, `SKILL.md`, MCP). It never reads a file because another
   agent product does (`CLAUDE.md`, `.cursorrules`, `.claude/`).
+
+## Comments
+
+A comment says what is true of the code now, and why when the why
+isn't obvious. Models read comments as fact, so a stale one misleads
+more than a missing one does. History belongs in git, the issues and
+the log, not in the code.
+
+- Public items keep a doc comment for their contract: what it takes,
+  what it returns, what it guarantees, what it refuses.
+- Explain a non-obvious why in one or two lines (an invariant, a
+  constraint, a hazard), next to the code it constrains.
+- No issue or PR numbers (`#123`, `issue #123`), no test-plan labels
+  (`T1`, `T6`), and no comparisons with an earlier version ("as
+  before", "used to", "now that", "as #n did", "HEAD's").
+- Don't restate the spec or narrate the change. Don't describe what the
+  next line plainly does.
+- A test's name says what it proves; its doc comment, if any, says why
+  that matters, not which ticket asked for it.
+- When you touch a file, bring the comments you touch up to this rule.
 
 ## Agent skills
 

@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use aigentic_api::ReportKind;
 use aigentic_runtime::aigentic_core::{Author, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
-    AssistantMessagePayload, CompactedPayload, CompactionStrategy, MemoryExtractedPayload,
-    ThreadRenamedPayload,
+    AssistantMessagePayload, BriefRefreshedPayload, CompactedPayload, CompactionStrategy,
+    MemoryExtractedPayload, ThreadRenamedPayload, UserMessagePayload,
 };
 use aigentic_runtime::aigentic_policy::Decision;
 use aigentic_runtime::project::{DOT_DIR, INSTRUCTIONS_FILE};
@@ -28,7 +28,10 @@ pub struct DefaultReports {
 impl Reports for DefaultReports {
     fn render(&self, runtime: &Runtime, events: &[Event], kind: ReportKind) -> String {
         match kind {
-            ReportKind::Cost => cost_of(events).to_string(),
+            ReportKind::Cost => match last_message_line(events) {
+                Some(row) => format!("{}\n{row}", cost_of(events)),
+                None => cost_of(events).to_string(),
+            },
             ReportKind::Project => project_report(runtime, &self.global_instructions),
             ReportKind::Policy => policy_report(runtime),
             ReportKind::Memory => memory_report(runtime, events),
@@ -68,6 +71,9 @@ pub struct Cost {
     /// `/rename` — is no call and is not counted, so an old title is
     /// never priced after the fact.
     pub titles: u32,
+    /// Brief refreshes: each `brief_refreshed` line is one utility call
+    /// that rewrote, or kept, the project brief's current state.
+    pub briefs: u32,
     /// Tokens the side jobs sent and produced: the extractions' and the
     /// title calls' (issues #46, #49).
     pub side_input: u64,
@@ -76,6 +82,11 @@ pub struct Cost {
     /// #46, #49), the same stamping rule as `spent`. `/cost` does no
     /// retro pricing: a line without a stamp puts no dollars here.
     pub side_spent: Option<f64>,
+    /// Sum of `cost_usd` over the summaries that carry one: a continuous
+    /// link on the utility profile (issue #98), or a nest. Printed on the
+    /// `compactions` line beside the summaries' own tokens, so a thread
+    /// whose only side calls are links still shows what they cost.
+    pub summary_spent: Option<f64>,
     /// Sum of `cost_usd` over the calls that carry one.
     pub spent: Option<f64>,
     /// Calls that carried a price / calls that did not.
@@ -101,6 +112,12 @@ pub fn cost_of(events: &[Event]) -> Cost {
                 cost.summary_input +=
                     usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
                 cost.summary_output += usage.output_tokens;
+                // A summary's dollars sit with its tokens on the
+                // `compactions` line (issue #98): under side jobs they
+                // showed nowhere for a thread with no title or extraction.
+                if let Some(usd) = usage.cost_usd {
+                    cost.summary_spent = Some(cost.summary_spent.unwrap_or(0.0) + usd);
+                }
             }
         }
     }
@@ -132,6 +149,21 @@ pub fn cost_of(events: &[Event]) -> Cost {
         cost.side_input += usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
         cost.side_output += usage.output_tokens;
         if let Some(usd) = usage.cost_usd {
+            cost.side_spent = Some(cost.side_spent.unwrap_or(0.0) + usd);
+        }
+    }
+    for event in events
+        .iter()
+        .filter(|e| e.kind == EventKind::BriefRefreshed)
+    {
+        let Ok(p) = serde_json::from_value::<BriefRefreshedPayload>(event.payload.clone()) else {
+            continue;
+        };
+        cost.briefs += 1;
+        cost.side_input +=
+            p.usage.input_tokens + p.usage.cache_read_tokens + p.usage.cache_write_tokens;
+        cost.side_output += p.usage.output_tokens;
+        if let Some(usd) = p.usage.cost_usd {
             cost.side_spent = Some(cost.side_spent.unwrap_or(0.0) + usd);
         }
     }
@@ -182,9 +214,74 @@ pub fn cost_of(events: &[Event]) -> Cost {
     cost
 }
 
+/// The `/cost` `last msg` row (issue #110): what the person's most
+/// recent message cost, its whole cycle, side jobs included.
+///
+/// The slice is everything after the last turn-starting `user_message`
+/// that a person authored: `cost_of` over `events[start..]`. A turn
+/// start is a `user_message` that did not arrive mid-turn, as
+/// `progress.rs` reads it; in a build thread whose prompts are all the
+/// runner's there is no such message, and no row.
+///
+/// Every side job appended after `start` counts with this message — an
+/// extraction, a title, a summary — even one the previous turn asked
+/// for that landed after the person's next message: nothing in the
+/// side-job payloads ties one to the turn that caused it, and the index
+/// is the only attribution available. With the last turn still running
+/// the row is a snapshot of a partial cycle that grows. The priced and
+/// estimated split is `cost_of`'s own; the estimated calls stay out of
+/// the dollars and out of the call counts.
+fn last_message_line(events: &[Event]) -> Option<String> {
+    let start = events.iter().rposition(|e| {
+        e.kind == EventKind::UserMessage
+            && matches!(e.author, Author::User(_))
+            && serde_json::from_value::<UserMessagePayload>(e.payload.clone())
+                .is_ok_and(|p| !p.mid_turn)
+    })?;
+    let cost = cost_of(&events[start..]);
+    // The dollars of the whole cycle: the calls' own, then the side jobs'
+    // (a title's or an extraction's under `side_spent`, a summary's under
+    // `summary_spent`). A thread with no stamp at all shows `unpriced`,
+    // never `$0.0000`.
+    let spent: Option<f64> = [cost.spent, cost.side_spent, cost.summary_spent]
+        .into_iter()
+        .flatten()
+        .reduce(|a, b| a + b);
+    let calls = cost.priced_calls + cost.unpriced_calls;
+    let mut parts = Vec::new();
+    match spent {
+        Some(usd) => parts.push(format!("${usd:.4}")),
+        // A call the provider reported no usage for, or a stamped line
+        // with no dollars, counts as unpriced rather than as free. An
+        // estimated call is unpriced too: its dollars are a guess.
+        None if calls > 0 || cost.estimated_calls > 0 => parts.push("unpriced".into()),
+        None => {}
+    }
+    if calls > 0 {
+        parts.push(format!("{} of {calls} calls priced", cost.priced_calls));
+    }
+    let side = cost.extractions + cost.titles + cost.summaries;
+    if side > 0 {
+        parts.push(format!(
+            "{side} side job{}",
+            if side == 1 { "" } else { "s" }
+        ));
+    }
+    let cache_total = cost.cache_read + cost.cache_write;
+    if cache_total > 0 {
+        let prompt = cost.input + cost.cache_read + cost.cache_write;
+        let share = 100.0 * cost.cache_read as f64 / prompt as f64;
+        parts.push(format!("{share:.0}% cached"));
+    }
+    if parts.is_empty() {
+        parts.push("no calls yet".into());
+    }
+    Some(format!("last msg   {}", parts.join(" · ")))
+}
+
 /// What the side-jobs line says the jobs were, in its own wording:
 /// `1 extraction, 2 lines`, `1 title`, or both (issues #46, #49).
-fn side_parts(extractions: u32, lines: u32, titles: u32) -> String {
+fn side_parts(extractions: u32, lines: u32, titles: u32, briefs: u32) -> String {
     let mut parts = Vec::new();
     if extractions > 0 {
         parts.push(format!(
@@ -196,6 +293,12 @@ fn side_parts(extractions: u32, lines: u32, titles: u32) -> String {
         parts.push(format!(
             "{titles} title{}",
             if titles == 1 { "" } else { "s" }
+        ));
+    }
+    if briefs > 0 {
+        parts.push(format!(
+            "{briefs} brief{}",
+            if briefs == 1 { "" } else { "s" }
         ));
     }
     parts.join(", ")
@@ -228,19 +331,28 @@ impl fmt::Display for Cost {
         if self.truncations + self.summaries > 0 {
             writeln!(
                 f,
-                "compactions {} ({} truncate, {} summary)   summary tokens in {} out {}",
+                "compactions {} ({} truncate, {} summary)   summary tokens in {} out {}{}",
                 self.truncations + self.summaries,
                 self.truncations,
                 self.summaries,
                 self.summary_input,
-                self.summary_output
+                self.summary_output,
+                match self.summary_spent {
+                    Some(usd) => format!("   ${usd:.4} priced"),
+                    None => String::new(),
+                }
             )?;
         }
-        if self.extractions + self.titles > 0 {
+        if self.extractions + self.titles + self.briefs > 0 {
             writeln!(
                 f,
                 "side jobs  {}   tokens in {} out {}{}",
-                side_parts(self.extractions, self.extraction_lines, self.titles),
+                side_parts(
+                    self.extractions,
+                    self.extraction_lines,
+                    self.titles,
+                    self.briefs
+                ),
                 self.side_input,
                 self.side_output,
                 // Only when the lines carry a price (issues #46, #49):
@@ -412,12 +524,13 @@ fn author_name(author: &Author) -> &str {
     }
 }
 
-/// `/policy`: the rule table in order with each rule's name, decision
-/// and reason, the bash allow patterns, the mode, and the session grants
-/// with who gave them.
+/// `/policy`: the file boundary, what it does not confine, the rule table
+/// in order with each rule's name, decision and reason, the bash allow
+/// patterns, the mode, and the session grants with who gave them.
 pub fn policy_report(runtime: &Runtime) -> String {
     let policy = runtime.policy();
-    let mut out = String::from("policy rules, first match wins\n");
+    let mut out = policy_boundary_lines(runtime);
+    out.push_str("policy rules, first match wins\n");
     let width = policy
         .rules
         .iter()
@@ -464,6 +577,27 @@ pub fn policy_report(runtime: &Runtime) -> String {
         }
     }
     out.trim_end().to_owned()
+}
+
+/// The `/policy` header (issue #124): the folders file tools reach
+/// without asking, and the tools the boundary does not confine.
+pub fn policy_boundary_lines(runtime: &Runtime) -> String {
+    let roots: Vec<String> = runtime
+        .policy()
+        .boundary_roots()
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    let reach = if roots.is_empty() {
+        "nothing (no root)".to_owned()
+    } else {
+        roots.join(", ")
+    };
+    format!(
+        "boundary: file tools reach {reach}; outside, they ask (a step is denied)\n\
+         bash and MCP tools with paths are not confined: they reach the whole disk until the \
+         sandbox (PLAN §15 item 6); in a step, and in exec, an outside path is denied\n"
+    )
 }
 
 /// `/memory`: the memory files with line counts, the `through_seq` of
@@ -607,6 +741,7 @@ mod cost_tests {
                 ttft_ms: None,
                 cost_usd: None,
             }),
+            finish_reason: None,
         };
         event(
             EventKind::AssistantMessage,
@@ -657,9 +792,11 @@ mod cost_tests {
                 extractions: 1,
                 extraction_lines: 2,
                 titles: 0,
+                briefs: 0,
                 side_input: 300,
                 side_output: 20,
                 side_spent: None,
+                summary_spent: None,
                 // No usage line in this fixture carries a model or a
                 // price, so nothing is claimed about spend (issue #31)
                 // and the text report stays what it always was. The two
@@ -730,6 +867,106 @@ mod cost_tests {
         );
         // An unpriced line claims nothing about money.
         assert!(!bare.to_string().contains("priced"), "{bare}");
+    }
+
+    /// T8 (issue #98): a stamped summary's dollars reach `/cost` as side
+    /// spend — a continuous link runs on the utility profile, so its
+    /// dollars are side dollars like a title's or an extraction's, while
+    /// its token totals stay in the compaction line they always were.
+    /// The text's `side jobs` line is unchanged: it still prints when
+    /// there is an extraction or a title, and a link's dollars join it
+    /// there. What this pins down is the field a report sums.
+    #[test]
+    fn a_stamped_summary_reports_its_dollars() {
+        let stamped = 0.0081;
+        let summary = |usage: serde_json::Value, continuous: bool| {
+            let mut payload = json!({
+                "from_seq": 0,
+                "to_seq": 5,
+                "strategy": {"kind": "summary", "text": "s", "model": "utility-model", "usage": usage},
+            });
+            if continuous {
+                payload["continuous"] = json!(true);
+            }
+            event(EventKind::Compacted, payload)
+        };
+        let link = cost_of(&[summary(
+            json!({"input_tokens": 300, "output_tokens": 20, "cost_usd": stamped}),
+            true,
+        )]);
+        // The emergency net's or `/compact`'s summary: the stamp prices a
+        // summary, not the flag.
+        let nest = cost_of(&[summary(
+            json!({"input_tokens": 300, "output_tokens": 20, "cost_usd": stamped}),
+            false,
+        )]);
+        // A line with no stamp claims nothing about money.
+        let bare = cost_of(&[summary(
+            json!({"input_tokens": 300, "output_tokens": 20}),
+            true,
+        )]);
+
+        assert_eq!(
+            (link.summaries, link.summary_input, link.summary_output),
+            (1, 300, 20)
+        );
+        // Dollars sit with the summaries, not under side jobs, so a
+        // link-only thread shows them on its `compactions` line.
+        assert_eq!(link.summary_spent, Some(stamped));
+        assert_eq!(link.side_spent, None);
+        assert_eq!((nest.summaries, nest.summary_spent), (1, Some(stamped)));
+        assert_eq!((bare.summaries, bare.summary_spent), (1, None));
+        assert!(
+            link.to_string()
+                .lines()
+                .any(|l| l.starts_with("compactions")
+                    && l.ends_with(&format!("${stamped:.4} priced"))),
+            "{link}"
+        );
+        assert_eq!(
+            (
+                bare.summary_input,
+                bare.summary_output,
+                bare.side_input,
+                bare.side_output
+            ),
+            (
+                link.summary_input,
+                link.summary_output,
+                link.side_input,
+                link.side_output
+            ),
+            "the stamp adds dollars and nothing else"
+        );
+
+        let text = link.to_string();
+        assert!(
+            text.contains("compactions 1 (0 truncate, 1 summary)   summary tokens in 300 out 20"),
+            "{text}"
+        );
+
+        // Beside a title: each line carries its own dollars, the title's
+        // under side jobs and the summary's beside its tokens.
+        let title_stamp = 0.0125;
+        let with_title = cost_of(&[
+            summary(
+                json!({"input_tokens": 300, "output_tokens": 20, "cost_usd": stamped}),
+                true,
+            ),
+            event(
+                EventKind::ThreadRenamed,
+                json!({"title": "t", "model": "utility-model",
+                       "usage": {"input_tokens": 100, "output_tokens": 10, "cost_usd": title_stamp}}),
+            ),
+        ]);
+        assert_eq!(with_title.side_spent, Some(title_stamp));
+        assert_eq!(with_title.summary_spent, Some(stamped));
+        assert!(
+            with_title
+                .to_string()
+                .contains(&format!("${title_stamp:.4} priced")),
+            "{with_title}"
+        );
     }
 
     /// T8 (issue #49): a stamped title line reaches `/cost` — one title,
@@ -849,6 +1086,217 @@ mod cost_tests {
         let estimated = cost_of(&[assistant(100, 10, true)]);
         assert_eq!(estimated.spent, None);
         assert!(!estimated.to_string().contains("cost "), "{estimated}");
+    }
+
+    /// T3 (issue #110): `/cost`'s `last msg` row covers the person's most
+    /// recent message and the side jobs that landed after it, and nothing
+    /// from the turns before.
+    #[test]
+    fn the_last_msg_row_covers_the_persons_last_message() {
+        use aigentic_runtime::aigentic_core::{AgentId, UserId};
+
+        fn person(seq: u64, mid_turn: bool) -> Event {
+            let mut e = event(
+                EventKind::UserMessage,
+                json!({"blocks": [], "mid_turn": mid_turn}),
+            );
+            e.seq = seq;
+            e.author = Author::User(UserId("steve".into()));
+            e
+        }
+        fn runner(seq: u64, mid_turn: bool) -> Event {
+            let mut e = event(
+                EventKind::UserMessage,
+                json!({"blocks": [], "mid_turn": mid_turn}),
+            );
+            e.seq = seq;
+            e.author = Author::Agent(AgentId("runner".into()));
+            e
+        }
+        fn costed(seq: u64, input: u64, cache: u64, usd: Option<f64>) -> Event {
+            let mut e = event(
+                EventKind::AssistantMessage,
+                json!({"blocks": [], "usage": {
+                    "input_tokens": input,
+                    "output_tokens": 10,
+                    "cache_read_tokens": cache,
+                    "cache_write_tokens": 0,
+                    "reasoning_tokens": null,
+                    "estimated": false,
+                    "cost_usd": usd,
+                }}),
+            );
+            e.seq = seq;
+            e
+        }
+        fn title_after(seq: u64, usd: f64) -> Event {
+            let mut e = event(
+                EventKind::ThreadRenamed,
+                json!({"title": "t", "model": "m",
+                       "usage": {"input_tokens": 100, "output_tokens": 5, "cost_usd": usd}}),
+            );
+            e.seq = seq;
+            e
+        }
+        fn extraction_after(seq: u64, usd: f64) -> Event {
+            let mut e = event(
+                EventKind::MemoryExtracted,
+                json!({"through_seq": 5, "written": [], "model": "m",
+                       "usage": {"input_tokens": 200, "output_tokens": 5, "cost_usd": usd}}),
+            );
+            e.seq = seq;
+            e
+        }
+
+        // Two person turns; the second is followed by a title and an
+        // extraction, both stamped. The first turn's own calls and its
+        // dollars are outside the slice.
+        let first_msg = 1000u64;
+        let first_call = 2000u64;
+        let first_usd = 0.5;
+        let second_msg = 3000u64;
+        let second_call = 4000u64;
+        let second_usd = 0.25;
+        let title_usd = 0.03;
+        let extraction_usd = 0.02;
+        let fixture = vec![
+            person(0, false),
+            costed(first_call, first_msg, 900, Some(first_usd)),
+            event(EventKind::TurnEnded, json!({"reason": "done"})),
+            person(1, false),
+            costed(second_call, second_msg, 500, Some(second_usd)),
+            event(EventKind::TurnEnded, json!({"reason": "done"})),
+            title_after(2, title_usd),
+            extraction_after(3, extraction_usd),
+        ];
+        let row = last_message_line(&fixture).expect("a person turn start");
+        let spent = second_usd + title_usd + extraction_usd;
+        let cache_read = 500u64;
+        let prompt = second_msg + 500; // input + cache read + cache write
+        let share = 100.0 * cache_read as f64 / prompt as f64;
+        assert_eq!(
+            row,
+            format!(
+                "last msg   ${spent:.4} · 1 of 1 calls priced · 2 side jobs · {share:.0}% cached"
+            ),
+            "{row}"
+        );
+        // The label is 11 wide and the dollars four decimals.
+        assert_eq!(row.get(..11), Some("last msg   "));
+        assert_eq!(row.chars().nth(11), Some('$'));
+
+        // A title appended after a third person message counts with the
+        // third: leaving only it in the slice.
+        let third_msg = 6000u64;
+        let third_usd = 0.1;
+        let title_usd_late = 0.04;
+        let mut late = fixture.clone();
+        late.push(person(2, false));
+        late.push(costed(5000, third_msg, 0, Some(third_usd)));
+        late.push(title_after(6, title_usd_late));
+        let third_row = last_message_line(&late).expect("a person turn start");
+        assert_eq!(
+            third_row,
+            format!(
+                "last msg   ${:.4} · 1 of 1 calls priced · 1 side job",
+                third_usd + title_usd_late
+            ),
+            "{third_row}"
+        );
+
+        // A message that arrived mid-turn does not move `start`: the
+        // earlier turn's dollars stay in the slice beside the mid-turn
+        // call, and the cache share is the earlier turn's.
+        let mid_usd = 9.99;
+        let mut mid = fixture.clone();
+        mid.push(person(4, true));
+        mid.push(costed(6000, 0, 0, Some(mid_usd)));
+        assert_eq!(
+            last_message_line(&mid),
+            Some(format!(
+                "last msg   ${:.4} · 2 of 2 calls priced · 2 side jobs · {share:.0}% cached",
+                spent + mid_usd
+            )),
+            "mid-turn"
+        );
+
+        // An estimated call in the slice stays out of the dollars, and
+        // out of the call counts: the report keeps it in its own
+        // `estimated` row.
+        let mut guessed = fixture.clone();
+        let mut estimated = assistant(400, 20, true);
+        estimated.payload["usage"]["cost_usd"] = json!(mid_usd);
+        guessed.push(estimated);
+        assert_eq!(last_message_line(&guessed), Some(row.clone()), "estimated");
+
+        // A call with no stamp at all: the row says `unpriced`, and the
+        // cache share is still there. The bare call's fields come from
+        // the `assistant` fixture.
+        let (bare_input, bare_read, bare_write) = (100u64, 50u64, 5u64);
+        let bare = vec![person(0, false), assistant(bare_input, 10, false)];
+        let bare_prompt = bare_input + bare_read + bare_write;
+        let bare_share = 100.0 * bare_read as f64 / bare_prompt as f64;
+        assert_eq!(
+            last_message_line(&bare),
+            Some(format!(
+                "last msg   unpriced · 0 of 1 calls priced · {bare_share:.0}% cached"
+            )),
+            "unpriced"
+        );
+
+        // A slice whose only calls are estimated has measured nothing:
+        // the guessed dollars are not summed and the row says so, rather
+        // than calling a guessed cycle "no calls yet".
+        let mut guessed_only = assistant(100, 10, true);
+        guessed_only.payload["usage"]["cost_usd"] = json!(mid_usd);
+        assert_eq!(
+            last_message_line(&[person(0, false), guessed_only]),
+            Some("last msg   unpriced".into()),
+            "all estimated"
+        );
+
+        // A person message nothing has answered yet is a snapshot of a
+        // cycle that has not started.
+        assert_eq!(
+            last_message_line(&[person(0, false)]),
+            Some("last msg   no calls yet".into())
+        );
+
+        // A thread whose turn starts are all the runner's has no row, and
+        // neither does a thread with no turn start.
+        let runner_only = vec![
+            runner(0, false),
+            costed(1000, 100, 0, Some(0.5)),
+            event(EventKind::TurnEnded, json!({"reason": "done"})),
+        ];
+        assert_eq!(last_message_line(&runner_only), None);
+        assert_eq!(last_message_line(&[costed(1000, 100, 0, Some(0.5))]), None);
+        assert_eq!(last_message_line(&[]), None);
+    }
+
+    /// A brief refresh is a side job: the side line counts it, with its
+    /// tokens and its price beside the other side jobs'.
+    #[test]
+    fn a_brief_refresh_is_counted_and_priced_on_the_side_line() {
+        let events = vec![event(
+            EventKind::BriefRefreshed,
+            json!({
+                "through_seq": 4,
+                "old_hash": "a",
+                "new_hash": "b",
+                "model": "utility",
+                "usage": {"input_tokens": 900, "output_tokens": 60, "cost_usd": 0.0125},
+            }),
+        )];
+        let cost = cost_of(&events);
+        assert_eq!(cost.briefs, 1);
+        assert_eq!((cost.side_input, cost.side_output), (900, 60));
+        assert_eq!(cost.side_spent, Some(0.0125));
+        let shown = cost.to_string();
+        assert!(
+            shown.contains("side jobs  1 brief   tokens in 900 out 60   $0.0125 priced"),
+            "{shown}"
+        );
     }
 }
 

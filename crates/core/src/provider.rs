@@ -68,6 +68,14 @@ pub enum ProviderEvent {
     Error(ProviderError),
 }
 
+/// The `Done` reason both adapters report when a stream ended with no
+/// completion reason from the provider at all (issue #96): the
+/// connection dropped, and neither a reason nor its marker arrived, so
+/// the reply may stop mid-sentence or mid tool call. The runtime turns
+/// it into [`ProviderError::Cut`] rather than a finished reply, and the
+/// adapters likewise never flush a tool call it cut off.
+pub const CUT_STREAM: &str = "end_of_stream";
+
 /// Errors a provider adapter can surface.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 pub enum ProviderError {
@@ -81,6 +89,14 @@ pub enum ProviderError {
     RateLimited,
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// The stream ended before the reply finished (issue #96): the
+    /// provider closed it with no completion marker and no reason, so
+    /// nothing about the reply can be trusted — a tool call it was still
+    /// writing may have half its arguments. Its own variant, not a
+    /// `Protocol`: nothing the provider sent is unreadable, there is
+    /// simply no end to the reply.
+    #[error("the stream ended before the reply finished")]
+    Cut,
 }
 
 impl ProviderError {
@@ -93,7 +109,64 @@ impl ProviderError {
         match self {
             Self::Transport(_) | Self::RateLimited => true,
             Self::Http { status, .. } => *status == 429 || (500..600).contains(status),
-            Self::Protocol(_) | Self::Unsupported(_) => false,
+            Self::Protocol(_) | Self::Unsupported(_) | Self::Cut => false,
+        }
+    }
+
+    /// What happened, in plain words, with no advice (issue #113): the
+    /// first half of [`plain_line`](Self::plain_line), so a turn-end
+    /// report can name the cause and offer `continue` only where the
+    /// branch already does.
+    pub fn cause_line(&self) -> String {
+        match self {
+            Self::Transport(_) => "the connection to the model failed".to_owned(),
+            Self::RateLimited => "the provider is rate limiting (HTTP 429)".to_owned(),
+            Self::Http { status: 429, .. } => "the provider is rate limiting (HTTP 429)".to_owned(),
+            Self::Http { status, .. } if (500..600).contains(status) => {
+                format!("the model is temporarily unavailable (HTTP {status})")
+            }
+            Self::Http { status: 400, body } if mentions_spend_limit(body) => {
+                "the provider refused: the account's spend limit is reached".to_owned()
+            }
+            Self::Http { status, .. } => {
+                format!("the provider refused the request (HTTP {status})")
+            }
+            Self::Protocol(_) => "the provider sent a reply that could not be read".to_owned(),
+            Self::Unsupported(_) => {
+                "this request is unsupported by the provider; check the configuration".to_owned()
+            }
+            Self::Cut => "the model's reply was cut off".to_owned(),
+        }
+    }
+
+    /// What to do about the cause, when the branch has anything to say
+    /// (issue #113): the second half of [`plain_line`](Self::plain_line).
+    /// `None` where the plain line carries no advice.
+    pub fn advice(&self) -> Option<&'static str> {
+        match self {
+            Self::Transport(_)
+            | Self::RateLimited
+            | Self::Http { status: 429, .. }
+            | Self::Protocol(_)
+            | Self::Cut => Some("type continue to retry"),
+            Self::Http { status, .. } if (500..600).contains(status) => {
+                Some("type continue to retry")
+            }
+            Self::Http { status: 400, body } if mentions_spend_limit(body) => {
+                Some("top up or raise the key budget, then type continue")
+            }
+            Self::Http { .. } => Some("type continue to retry"),
+            Self::Unsupported(_) => None,
+        }
+    }
+
+    /// What joins a cause to its advice in
+    /// [`plain_line`](Self::plain_line), unchanged from issue #22: a
+    /// semicolon for most branches, an em dash for the spend-limit one.
+    fn advice_sep(&self) -> &'static str {
+        match self {
+            Self::Http { status: 400, body } if mentions_spend_limit(body) => " — ",
+            _ => "; ",
         }
     }
 
@@ -102,36 +175,9 @@ impl ProviderError {
     /// render time and never stored. Core does not know the profile's
     /// name, so the line never names a vendor.
     pub fn plain_line(&self) -> String {
-        match self {
-            Self::Transport(_) => {
-                "the connection to the model failed; type continue to retry".to_owned()
-            }
-            Self::RateLimited => {
-                "the provider is rate limiting (HTTP 429); type continue to retry".to_owned()
-            }
-            Self::Http { status: 429, .. } => {
-                "the provider is rate limiting (HTTP 429); type continue to retry".to_owned()
-            }
-            Self::Http { status, .. } if (500..600).contains(status) => {
-                format!(
-                    "the model is temporarily unavailable (HTTP {status}); type continue to retry"
-                )
-            }
-            Self::Http { status: 400, body } if mentions_spend_limit(body) => {
-                "the provider refused: the account's spend limit is reached — top up or raise \
-                 the key budget, then type continue"
-                    .to_owned()
-            }
-            Self::Http { status, .. } => {
-                format!("the provider refused the request (HTTP {status}); type continue to retry")
-            }
-            Self::Protocol(_) => {
-                "the provider sent a reply that could not be read; type continue to retry"
-                    .to_owned()
-            }
-            Self::Unsupported(_) => {
-                "this request is unsupported by the provider; check the configuration".to_owned()
-            }
+        match self.advice() {
+            Some(advice) => format!("{}{}{}", self.cause_line(), self.advice_sep(), advice),
+            None => self.cause_line(),
         }
     }
 
@@ -149,6 +195,9 @@ impl ProviderError {
             Self::Protocol(m) => Self::Protocol(prefix + &m),
             Self::RateLimited => Self::Transport(format!("{prefix}rate limited")),
             Self::Unsupported(m) => Self::Unsupported(m),
+            // Nothing was retried: a cut is not an `Error` the adapter
+            // sees, so there are no attempts to report (issue #96).
+            Self::Cut => Self::Cut,
         }
     }
 }
@@ -291,5 +340,81 @@ mod tests {
         for e in refused {
             assert!(!e.is_transient(), "{e:?} is not transient");
         }
+    }
+
+    /// T5 (issue #96): a cut reply round-trips through serde, never
+    /// retries, and keeps its identity through `with_attempts` — no
+    /// adapter retried it, so there is nothing to prefix.
+    #[test]
+    fn a_cut_reply_round_trips_and_never_retries() {
+        let cut = ProviderError::Cut;
+        let json = serde_json::to_string(&cut).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ProviderError>(&json).unwrap(),
+            ProviderError::Cut
+        );
+        assert!(!cut.is_transient());
+        assert_eq!(
+            ProviderError::Cut.with_attempts(4, Duration::from_millis(70_800)),
+            ProviderError::Cut
+        );
+        assert_eq!(
+            cut.plain_line(),
+            "the model's reply was cut off; type continue to retry"
+        );
+    }
+
+    /// T1 (issue #113): every variant's plain line is its cause joined
+    /// with its advice, exactly as the branch read before, and a cause
+    /// never carries the advice itself — so a turn-end report can name
+    /// the cause and suggest `continue` only where it is due.
+    #[test]
+    fn plain_line_is_its_cause_joined_with_its_advice() {
+        let spend = "{\"error\": {\"message\": \"Budget has been exceeded!\"}}".to_owned();
+        let variants = [
+            ProviderError::Transport("dropped".into()),
+            ProviderError::RateLimited,
+            ProviderError::Http {
+                status: 429,
+                body: String::new(),
+            },
+            ProviderError::Http {
+                status: 503,
+                body: String::new(),
+            },
+            ProviderError::Http {
+                status: 400,
+                body: spend.clone(),
+            },
+            ProviderError::Http {
+                status: 400,
+                body: "{\"error\": {\"message\": \"bad request\"}}".into(),
+            },
+            ProviderError::Http {
+                status: 401,
+                body: String::new(),
+            },
+            ProviderError::Protocol("unreadable".into()),
+            ProviderError::Unsupported("images".into()),
+            ProviderError::Cut,
+        ];
+        for e in &variants {
+            let cause = e.cause_line();
+            assert!(!cause.contains("continue"), "{e:?}: {cause}");
+            let expected = match e.advice() {
+                Some(advice) => format!("{cause}{}{advice}", e.advice_sep()),
+                None => cause,
+            };
+            assert_eq!(e.plain_line(), expected, "{e:?}");
+        }
+        assert_eq!(
+            ProviderError::Http {
+                status: 400,
+                body: spend
+            }
+            .advice(),
+            Some("top up or raise the key budget, then type continue")
+        );
+        assert_eq!(ProviderError::Unsupported("images".into()).advice(), None);
     }
 }

@@ -1,6 +1,6 @@
 # Phase 6 plan
 
-Status: grilled and settled on 2026-09-22 (18 questions, section 11 records the answers); steps 1 to 10 landed the same day · Follows `docs/PRD.md` (the Terminal application and Projects sections) and the phase 0 to 5 plans · Renumbers the PRD's build order: the client is phase 6, sandboxing phase 7, the orchestrator phase 8; multiplayer acceptance (phase 5 step 11) waits behind all three
+Status: grilled and settled on 2026-09-22 (18 questions, section 11 records the answers); steps 1 to 10 landed the same day; revised on 2026-10-02 by the grilling against ADR 0002 (9 questions, section 14 records the answers, and it wins over earlier sections where they differ) · Follows `docs/PRD.md` (the Terminal application and Projects sections) and the phase 0 to 5 plans · Renumbers the PRD's build order: the client is phase 6, sandboxing phase 7, the orchestrator phase 8; multiplayer acceptance (phase 5 step 11) waits behind all three
 
 ## 0. Goal and done-when
 
@@ -23,13 +23,16 @@ project at a time.
 The client bar is Codex CLI's terminal client (`openai/codex`,
 `codex-rs/tui`, read on 2026-09-22); where this plan copies it, it says
 so, and where it differs, section 11 says why. One principle holds
-through every phase: the product runs on open-weight models through
-TensorX; Anthropic is the reference backend for comparison and never on
-the product path.
+through every phase (the PRD's, reworded 2026-10-07): the product runs
+on open-weight models, served from sovereign EU infrastructure or
+locally (today: TensorX, Scaleway, the person's own machine); Anthropic
+is the reference backend for comparison and never on the product path.
+Sovereign means an EU-headquartered provider, EU data centres, and no
+retention of prompts.
 
 Done when:
 
-1. **One thread, three projects, one day.** From one thread Steve works
+1. **One front thread, three projects, one day.** From his one front thread (section 14) Steve works
    on the harness (this repository), the marketing site (a second
    repository) and marketing planning (a folder of notes and assets,
    no repository). When a message belongs to another project the model
@@ -47,11 +50,12 @@ Done when:
    and cannot read or write their files. A fact about Steve stated
    anywhere lands in the person-level memory; a fact about the project
    lands in that project's.
-3. **Start is resume.** `aigentic` with no flags resumes the most
-   recent thread wherever it is; the banner names the thread's title
+3. **Start is resume.** `aigentic` with no flags resumes the person's
+   front thread wherever it is; the banner names the thread's title
    and project and, when the directory belongs to another project,
-   asks whether to switch. `--new` starts a thread in the directory's
-   project. Every thread has a title after its first turn.
+   proposes the switch (the `project` decision kind). `/new` starts a
+   fresh front thread, deliberately and rarely. Every thread has a
+   title after its first turn.
 4. **Interrupt is a reflex.** Ctrl-C during a turn cancels the model
    call within a second and the status row says so; Ctrl-C when idle
    with an empty composer quits on the second press within a second.
@@ -85,12 +89,26 @@ Done when:
 9. **Nothing lost.** The phase 3 to 5 acceptance items 1 to 20 in the
    tui README rerun in the new client with the same outcomes, and every
    pre-phase-6 log opens, replays and lists.
+10. **Big work runs in the background.** The model proposes a background
+    job (`start_job`) for work too big for the conversation; on `y` it
+    runs in a child thread in the current project, its permission
+    questions come to the front thread as tagged prompts, and its
+    summary returns as a cell. The status line counts running jobs and
+    `/jobs` lists them, builds included (section 14, Q5 and Q6).
+11. **Length is irrelevant.** The front thread stays near its working-set
+    target (about 120k tokens) however long it gets, and anything evicted
+    comes back through `recall` (section 13, settled in section 14 Q7).
+12. **Every decision is measured.** Each `project` and `job` proposal is
+    logged with its kind and answer, and `aigentic stats --decisions`
+    reports acceptance per kind (section 14, Q3 and Q4).
 
 Not in phase 6: OS sandboxing for bash (phase 7: Seatbelt on macOS,
 bubblewrap or Landlock on Linux, the escalate-and-justify path), the
 orchestrator and any turn that touches two projects (phase 8), a
 classifier that proposes switches without the main model (later, from
-the proposal log; section 12), full markdown and syntax highlighting
+the proposal log; section 12), promoting a decision kind past *ask*
+(after the acceptance week, from its data; ADR 0002), the `ticket` and
+`route` decision kinds, full markdown and syntax highlighting
 inside diffs (light markdown only), image paste, a side pane for pins,
 Vim mode, an external editor key, mouse capture, and multiplayer
 acceptance (phase 5 step 11, after phase 7).
@@ -121,7 +139,7 @@ crates/tui/Cargo.toml  # + ratatui, crossterm, nucleo, ignore, similar;
 crates/api/src/lib.rs  # Push::Usage, Push::ProjectSwitched, Push::AwaitingSwitch,
                        # Request::SwitchProject, AnswerSwitch, Rename, New;
                        # Decision::DeniedWithReason, Decision::AllowPrefix
-crates/core/src/event.rs        # ProjectProposed, ProjectSwitched, ThreadRenamed
+crates/core/src/event.rs        # ProjectProposed (superseded by #74's decision_proposed), ProjectSwitched, ThreadRenamed
 crates/log/src/payload.rs       # the three payloads
 crates/log/src/projection.rs    # the switch as a one-line system note
 crates/runtime/src/runtime.rs   # set_project, usage(), utility provider
@@ -182,6 +200,8 @@ pub enum EventKind { /* ... */ ProjectProposed, ProjectSwitched, ThreadRenamed }
 pub struct ProjectProposedPayload { pub project: String, pub reason: String, pub accepted: Option<bool> }
 pub struct ProjectSwitchedPayload { pub from: Option<String>, pub to: Option<String>, pub root: PathBuf }
 pub struct ThreadRenamedPayload { pub title: String }
+// Superseded (issue #74): `ProjectProposed` is not built — #74 ships one general pair,
+// `decision_proposed`/`decision_answered`, with `DecisionKind::Project` (§14 Q3, issue #74).
 
 // crates/runtime/src/project.rs
 pub struct ProjectFile { /* ... */ pub related: Vec<String> }
@@ -443,6 +463,11 @@ from day one. `/project use <name>` and the start-up directory prompt
 do the same switch by hand. A switch while idle only; the request is
 refused during a turn.
 
+> **Superseded (issue #74):** the actor does not append `project_proposed`;
+> #74 ships one general pair, `decision_proposed`/`decision_answered` (the
+> proposal's `target`/`reason` plus its answer replace `(project, reason,
+> accepted)`).
+
 **What a switch does.** The actor builds a `ProjectContext` for the
 target and calls `Runtime::set_project`: layers, knowledge reload,
 memory, skills, policy root, workdir, MCP servers dropped and
@@ -536,12 +561,17 @@ shared folder); `aigentic workspace new|add <path>|remove
 <project>|list`; or edit the file. Removing a project only drops it
 from the list: its folder, files and threads are untouched.
 
-**Starting.** `aigentic -w vendela` resumes the latest thread whose
-current project is in `vendela`, or starts one there;
-`-w aigentic/site` names a project. Inside a project's folder no flag
-is needed. With nothing to go on (outside any project, no recent
-thread, no flag) the shell shows a picker of workspaces and their
-projects, the same one a bare `/project use` opens.
+**Starting** (revised in section 14, Q8). There are no starting scopes:
+`aigentic` reopens the front thread, and a folder in another project
+proposes the switch. The picker of workspaces and their projects is the
+fallback: on the first run, before a front thread exists, and for a bare
+`/project use`. The `-w` flag is dropped.
+
+**Scale.** A workspace is the boundary for understanding and a project
+the boundary for touching. The front thread's prefix carries the current
+workspace in detail (each project's brief) and every other workspace as
+one line with its project names, so ten workspaces of three projects
+each cost about 30 lines.
 
 ## 10. Steps, one commit each
 
@@ -734,10 +764,10 @@ Settled in the grilling of 2026-09-22 (Q1 to Q18) and in the draft.
 
 ## 12. Open items
 
-- The classifier (decision 3): when the proposal log holds a few
-  hundred answers, try an embedding-similarity proposer run by the
-  daemon before the turn, and compare its accuracy against the model's
-  on the same log. If it wins, it proposes and the model stops.
+- The classifier (decision 3): superseded by section 15, item 7. A
+  classifier runs in shadow on project routing during the acceptance
+  week, so the week itself yields the comparison against the model's
+  proposals and the person's answers.
 - Whether `Explored` folding should also fold consecutive successful
   bash reads (`cat`, `rg`). Start with the file tools only.
 - The `p` prefix heuristic (stop at the first argument that looks like
@@ -755,8 +785,9 @@ Settled in the grilling of 2026-09-22 (Q1 to Q18) and in the draft.
   during the acceptance week; tighten `MEMORY_PROMPT` if it files chatter.
 - As landed in step 10: the workspace layer carries instructions and
   memory; its knowledge and brief come with step 12. A switch keeps the
-  thread's compaction settings and budget (the profile's) and swaps the
-  provider; the thread's log stays under the project it was created in
+  thread's resolved compaction settings (profile values overlaid by its
+  starting project's `[compaction]` table) and profile budget; it swaps the
+  provider. The thread's log stays under the project it was created in
   until step 13's flat directory. `project_of` for an unloaded thread
   still answers from that directory, so a role check before reopening
   uses the first project; step 13 reads the log instead.
@@ -766,8 +797,8 @@ Settled in the grilling of 2026-09-22 (Q1 to Q18) and in the draft.
 - Whether `exec --json`'s output is the raw `Push` or a simplified
   event schema like Codex's `ThreadItem`. Raw first; a stable schema
   when a second consumer exists.
-- A token ceiling for compaction and inline knowledge (superseded by the
-  working-set target in section 13). Both are fractions
+- A token ceiling for compaction and inline knowledge: settled by the
+  working-set target, about 120k tokens (section 14, Q7). Both are fractions
   of the window, and GLM 5.3 on TensorX has a 1 048 576-token window, so a
   thread compacts only near 734k tokens and knowledge stays inline up to
   about 315k: correct, but every call then carries a very long prompt.
@@ -776,7 +807,7 @@ Settled in the grilling of 2026-09-22 (Q1 to Q18) and in the draft.
 - The PRD's build-order table still lists the orchestrator as phase 6;
   update it when phase 6 closes, with the renumbering in section 0.
 
-## 13. The working set (to be grilled)
+## 13. The working set (settled 2026-10-02; the decisions are in section 14, Q7)
 
 The aim is that a person never manages the context window. Agents hit
 it today because forgetting is lossy and permanent; here the log keeps
@@ -805,3 +836,223 @@ switch, whether the child context is phase 6 or phase 8, and how the
 prompt cache survives eviction (a changed early message invalidates
 everything after it, so eviction should happen in batches at a
 compaction boundary, not message by message).
+
+## 14. The grilling against ADR 0002 (2026-10-02)
+
+ADR 0002 (`docs/adr/0002-the-conversation-is-the-interface.md`) puts one
+conversation in front and the structure behind it, with autonomy earned
+per decision kind. Nine questions settled how phase 6 meets it. Where this
+section differs from an earlier one, this section wins.
+
+1. **One front thread** per person, which never has to end. `aigentic`
+   reopens it from any folder; `/new` is a deliberate fresh start. The
+   working set (Q7) is therefore a requirement, not an optimisation.
+2. **The front thread switches project; big work goes behind it.**
+   Conversation-sized work runs in the front thread in its current
+   project, and switches are proposed as section 9 says. Bigger work runs
+   in a thread behind it (Q5), as `/build` already does, so its output
+   never floods the front thread.
+3. **Ask and measure now, promote later.** Every filing decision in phase 6
+   is a proposal answered in one keystroke, logged with its kind and
+   answer, and `aigentic stats --decisions` reports acceptance per kind.
+   Promotion to *tell* and *silent* comes after the acceptance week, from
+   its data. The event shape for proposals of any kind (reuse
+   `project_proposed`, or one general event) is settled when that ticket
+   is specified.
+4. **Kinds in phase 6: `project` and `job`.** `knowledge` stays automatic,
+   ADR 0002's one exception. The `ticket` kind ("this should be an issue")
+   gets its own issue, linked from ADR 0002 and #59. `route` comes later.
+5. **Background jobs.**
+   - The model proposes one with `start_job(task)`. It runs in a child
+     thread (`parent_thread`, the machinery `/build` uses) in the current
+     project, with a brief the front thread writes.
+   - The front thread carries on, and a one-screen summary returns as a
+     cell when the job ends.
+   - Visibility comes at three levels: `N working` on the status line; a
+     cell when a job starts and when it ends; and `/jobs` (what, project,
+     state, cost, number), with `/jobs <n>` opening one read-only. Builds
+     are listed as jobs.
+   - Exploration in a child context (section 13's fifth lever) is a
+     read-only job.
+6. **A job follows the front thread's permission mode.** Its questions come
+   to the front thread as in-place prompts tagged with the job, on #68's
+   checkpoint-prompt machinery; a key answers only the prompt on screen,
+   and waiting prompts queue oldest first. The step deny list (no
+   `git push`, reset or rebase, never `.env`) always applies.
+7. **The working set.**
+   - **Target:** about 120k tokens in context, shown on the status line
+     as `working 48k · thread 2.1M`.
+   - **Stubs:** a used tool result becomes a one-line stub with a handle
+     and a short summary.
+   - **`recall`:** returns a stub by handle, a log range, or a search over
+     the whole front thread. Across a project switch it reaches
+     everything, with other projects' results marked read-only.
+   - **Summaries:** older turns are summarised continuously on the utility
+     model. Eviction and summarising happen in batches at a boundary, so
+     the prompt cache survives.
+8. **Starting and scale.**
+   - No starting scopes (`-w` is dropped); the picker is the fallback.
+   - The workspace commands, `project init` and `doctor`'s checks stay.
+   - A workspace (a client or company) is the boundary for understanding,
+     and a project the boundary for touching.
+   - The prefix carries the current workspace in detail and every other
+     workspace as one line.
+9. **The acceptance (#12).** The hand checks and the phase 3 to 5 reruns
+   stay, against the updated done-when. Then a week of daily use from the
+   front thread, across at least two workspaces and three or more
+   projects, on TensorX only (alternating backends dropped). Each day
+   records:
+   - the asks, with the same target as before;
+   - the proposals per kind, with their answers;
+   - the jobs, and whether each summary was useful;
+   - the peak working set against 120k;
+   - whether Steve ever needed `/new` or had to think about threads.
+
+   The week's decision data sets the ladder's thresholds.
+
+The implementation tickets are cut from this section, replacing what
+section 10's steps 11 to 14 left open:
+- the project proposal on the ladder (#7, revised);
+- siblings and briefs (#8, unchanged);
+- the front thread and start-is-resume (#9, revised);
+- workspaces without starting scopes (#10, revised);
+- the working set (from Q7, replacing #11);
+- background jobs;
+- `/jobs` and the status count;
+- decision measurement;
+- the acceptance (#12, revised).
+
+## 15. Concepts and their seams (2026-10-07)
+
+Ten concepts Steve raised during phase 6, weighed against the PRD, ADR
+0002 and this plan. None is a ticket yet; each names the point in the
+plan where it belongs. Where this section and an earlier one differ,
+this one wins for the item it names.
+
+1. **Skill packs: Matt Pocock's skills and Impeccable.** Both are
+   third-party `SKILL.md` packs, installed per project where they
+   apply, never harness code. Impeccable (impeccable.style: design
+   commands, 61 "AI slop" detectors, `DESIGN.md` and `PRODUCT.md`)
+   belongs in projects with a web UI, not in this repository. Its hook
+   integration is another product's scaffolding, which the harness does
+   not read; its commands and detectors still work as skills. The gap
+   for both is #25 (packs and a user-level skills home): installing a
+   pack into aigentic should be one operation, not a copy of folders.
+   Seam: #25, whenever design work runs through aigentic.
+2. **Matt Pocock's skills v1.3.** `CONTEXT.md` becomes `GLOSSARY.md`,
+   and the updated skills look only for the new name, so this
+   repository renames it, and updates `AGENTS.md`'s domain-docs line,
+   in the same commit as the skills update. `/retro` feeds item 9;
+   `/pr`'s three-part body (a visual summary, evidence, merge danger)
+   is the shape for `## Implementation` and `## Review`. `/implement-spec`
+   overlaps the build loop and background jobs, and is not adopted.
+   Seam: now, by the supervisor, with no model spend.
+3. **Token economics** (after Token Atlas, gille.ai/tokenatlas). Every
+   figure is a projection of the log, which already holds `cost_usd`,
+   cache reads and writes, side jobs and retries per call: cost by day,
+   project, thread and model; the ten most expensive calls; what the
+   fixed prefix costs per call; quota against a provider's limits.
+   Figures, not interpretations: each states how it was computed. Seam:
+   after #98, tui only.
+4. **The true cost of a prompt.** At each turn's end, and in `/cost`,
+   one line for the person's message: total cost, calls, side jobs
+   (titles, memory, summaries on the utility profile) and the cache
+   share. It is only as true as the prices in the profile; TensorX's
+   were derived by hand and say so. Seam: with item 3.
+5. **Developer and normal modes.** Two views of the same log, in the
+   client only. Normal is replies, one line of activity, and cost;
+   developer is every tool cell, retry, sweep, batch and decision. #78
+   brings job cells into the front thread, so the two views are designed
+   before it. Seam: after #98, before #77.
+6. **Sandboxing.** Section 11's order (client, sandbox, orchestrator,
+   multiplayer) makes it phase 7's first item, and it needs no cloud:
+   macOS seatbelt or Linux landlock or bubblewrap around `bash`, as
+   Codex does. Background jobs (#77) run unattended in the front
+   thread's mode, which is what a sandbox protects, so #77's spec leaves
+   the seam for it even if the sandbox lands later. Seam: phase 7,
+   first; #77 designs for it.
+7. **System One classifiers** (the capability Jev showed: typed
+   questions in, answers with calibrated probabilities out, never text;
+   open-weight equivalents exist). What it brings: a decision in well
+   under a second, before the turn, with a probability the autonomy
+   ladder can set thresholds on, and no parsing. The decisions it fits,
+   by value:
+   - project routing, ahead of the model's `suggest_project`;
+   - job or conversation (#77's `job` kind);
+   - the memory cue gate (#14), skipping extraction calls;
+   - approval friction: ranking a command's risk to suggest an allow
+     rule, never the only gate, the policy rules staying the floor;
+   - stale progress (#102), in place of a call count;
+   - the ticket kind (#80), and later model routing.
+
+   In the architecture: a `Classifier` trait in `core` beside
+   `Provider`, a `classifier` profile like `utility`, and every
+   classification an event (the model, the answer, the probability), so
+   `stats --decisions` compares classifier, model and person per kind.
+   Shadow first (ADR 0001): it records what it would decide and changes
+   nothing until the data says so. Seam: **the labels now, the trait later** (revised 2026-10-08, below).
+   As first written: **one ticket before #12**: the
+   trait, the profile, the event, and shadow on project routing only,
+   so the acceptance week measures it. The other decisions follow #12,
+   if the data says it pays.
+
+   The candidate is Laya (github.com/NandhaKishorM/laya, Apache 2.0:
+   ModernBERT-large, 421M, English; mmBERT-base, 322M, multilingual).
+   It runs locally on CPU or Apple Silicon, and its `laya-serve` speaks
+   the `/v1/systemone` protocol Jev introduced. So the trait's adapter
+   speaks that protocol and the model behind it stays swappable, as
+   `Provider` keeps chat models swappable. Constraints the ticket must
+   meet:
+   - a 512-token context (1 024 multilingual, unreliable past about
+     4 000): the state sent is the message and each project's name and
+     one-line brief, never the prefix;
+   - confidence calibrated on this project's own answers before any
+     threshold is set;
+   - a Python sidecar beside the daemon, optional, checked by
+     `doctor`, and shadow mode surviving it being down.
+
+   It is the first model on the product path served outside TensorX:
+   locally while it runs in shadow, then on Scaleway beside the daemon
+   once item 8 puts the daemon there, kept warm (a cold start defeats a
+   pre-turn decision). Both are within the principle as reworded on
+   2026-10-07 (open weights, sovereign EU infrastructure or local; see
+   the top of this plan and the PRD's principles).
+
+   **Revised 2026-10-08 (Steve).** The scarce asset is not the trait, it
+   is the labels, so the seam moves. One small ticket records, for every
+   decision kind, the slice a fast decider would see (the message, each
+   project's name and one-liner, never the prefix), the model's answer
+   and the person's, in one shape: the calibration set, which costs a
+   field and no model. The trait, the `classifier` profile, the shadow
+   event and Laya come **after #12**, when routing has a few hundred
+   labelled answers. A trait with no implementation is a placeholder;
+   the labels are what any System One is calibrated on. The rule this
+   keeps: design for the decision the system needs, not for a classifier.
+   The ticket is `log, runtime: the decider's input on every decision`.
+8. **Single player in the cloud.** The daemon, the socket protocol and
+   roles (phase 5) already exist; the cloud adds a VM, authentication and
+   TLS. An agent with `bash` on a public machine needs item 6 first.
+   Steve's usual hosting (Vercel) does not run long-lived daemons, so
+   this is a VM. Seam: phase 7, after the sandbox.
+9. **From the log to self-improvement.** The log already records
+   everything, decisions included (#74). Improvement is ADR 0002's
+   autonomy ladder, promoted from the acceptance week's data. A small
+   step that fits sooner: a `/retro` skill (item 2) that turns a run
+   into proposed edits to `.aigentic/knowledge/lessons.md`, which the
+   person approves. Seam: `/retro` any time; promotion after #12.
+10. **Code review services (Greptile).** Not adopted. They review pull
+    requests and this repository commits to main; a hosted reviewer on
+    the product path breaks the open-weight rule; and the judges
+    already run probes, mutation checks and the real binary. Revisit
+    only if judges start missing defects.
+
+The order, as of 2026-10-08: item 2 now; #102, #98; items 3 and 4;
+item 5, which #115 carries; #10's ask, then #8; #77 to #79, designed
+with item 6's seam; then the pipeline job (#117), so the loop stops
+needing pasted prompts; item 7's label record; #12; then phase 7 with
+items 6 and 8; item 7's trait, profile and Laya after #12's labels;
+item 9's promotion from #12's data; item 1 when design work starts.
+
+**Revised 2026-10-09 (Steve): #8 split, and how siblings are read.** #10's ask landed as #121. #8 is split into five tickets, in this order: #123 (briefs in the prefix, siblings' one-liners, `read_brief`), #124 (read tools stay inside the project, so a sibling's files ask first; done-when 2's "touching does not" isn't enforced today), #125 (`search_knowledge` across siblings and the workspace, and `related` for links across workspaces), #126 (the utility model keeps a brief's current state fresh) and #127 (memory goes to the person, the workspace or the project). All five come before #77.
+
+Siblings are read **one line each, the whole brief on demand**: the projects block carries each project's brief's first line (as at §9b's projects block), and `read_brief(project)` returns a sibling's whole brief, read-only. That supersedes "their briefs inline" in step 12 and "each project's brief" in Scale, so five siblings cost about 150 tokens, not 2,500. The project's own brief and its workspace's stay inline, capped. A brief is `<root>/.aigentic/brief.md`, or `<shared>/workspace/brief.md` for a workspace. Its first line is its one-liner, which is also what item 7's classifier reads.

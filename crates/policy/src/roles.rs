@@ -107,15 +107,33 @@ impl Participants {
 pub fn needs(request: &Request) -> Option<Role> {
     match request {
         Request::Hello { .. } | Request::ListProjects => None,
-        Request::ListThreads { .. }
-        | Request::Open { .. }
-        | Request::Close { .. }
-        | Request::Report { .. } => Some(Role::Read),
+        // The `Front` handler judges it (issue #84): `read` in the front
+        // thread's project to resume, `write` in the requested project
+        // to create.
+        Request::Front { .. } => None,
+        // The `ListThreads` handler judges it (issue #86), per project:
+        // a named project needs `read` in it, while a listing with none
+        // is filtered to the projects the caller holds a role in.
+        Request::ListThreads { project: None } => None,
+        Request::ListThreads { project: Some(_) } => Some(Role::Read),
+        // The `Jobs` handler judges it, per project: nothing is judged at a
+        // listing that names no project, and the rows are filtered to the
+        // projects the caller may read; a listing scoped to one project
+        // needs `read` in it.
+        Request::Jobs { project: None } => None,
+        Request::Jobs { project: Some(_) } => Some(Role::Read),
+        // The `StartRows` handler judges it (issue #121): the rows are
+        // filtered to this user's own threads, so there is no one
+        // project to check.
+        Request::StartRows => None,
+        Request::Open { .. } | Request::Close { .. } | Request::Report { .. } => Some(Role::Read),
         Request::CreateThread { .. }
+        | Request::NewFront { .. }
         | Request::Post { .. }
         | Request::InvokeSkill { .. }
         | Request::Interrupt { .. }
         | Request::AnswerHuman { .. }
+        | Request::AnswerSwitch { .. }
         | Request::Rename { .. }
         | Request::SwitchProject { .. }
         | Request::Pin { .. }
@@ -123,6 +141,9 @@ pub fn needs(request: &Request) -> Option<Role> {
         Request::Decide { .. } | Request::SetMode { .. } | Request::Compact { .. } => {
             Some(Role::Approve)
         }
+        // A build pushes to the main branch and answers its own gates
+        // (issue #58): both are the approver's.
+        Request::Build { .. } | Request::AnswerCheckpoint { .. } => Some(Role::Approve),
     }
 }
 
@@ -185,11 +206,44 @@ mod tests {
                 None,
             ),
             (Request::ListProjects, None),
+            // T3 (issue #84): `Front`'s handler judges the roles, so the
+            // pre-check asks for none; `NewFront` creates, so it is a
+            // write in the requested project.
+            (
+                Request::Front {
+                    project: "p".into(),
+                    here: None,
+                    asked: None,
+                },
+                None,
+            ),
+            // T2 (issue #86): a listing that names a project needs
+            // `read` in it; one that names none is judged by the
+            // handler, per project.
             (
                 Request::ListThreads {
-                    project: "p".into(),
+                    project: Some("p".into()),
                 },
                 Some(Role::Read),
+            ),
+            (Request::ListThreads { project: None }, None),
+            // A jobs listing is judged per project like a thread listing:
+            // the handler filters rows, and a scoped ask needs `read`.
+            (
+                Request::Jobs {
+                    project: Some("p".into()),
+                },
+                Some(Role::Read),
+            ),
+            (Request::Jobs { project: None }, None),
+            // Issue #121: the ask's light listing is this user's own
+            // threads, so no project is checked here.
+            (Request::StartRows, None),
+            (
+                Request::NewFront {
+                    project: "p".into(),
+                },
+                Some(Role::Write),
             ),
             (
                 Request::Open {
@@ -237,6 +291,14 @@ mod tests {
                 Some(Role::Write),
             ),
             (
+                Request::AnswerSwitch {
+                    thread: t,
+                    call_id: "c".into(),
+                    answer: aigentic_api::SwitchReply::No,
+                },
+                Some(Role::Write),
+            ),
+            (
                 Request::Pin {
                     thread: t,
                     text: "x".into(),
@@ -263,6 +325,23 @@ mod tests {
             ),
             (Request::Compact { thread: t }, Some(Role::Approve)),
             (Request::Interrupt { thread: t }, Some(Role::Write)),
+            (
+                Request::Build {
+                    project: "p".into(),
+                    issue: 58,
+                    workflow: None,
+                },
+                Some(Role::Approve),
+            ),
+            (
+                Request::AnswerCheckpoint {
+                    lead: t,
+                    gate: "brief".into(),
+                    answer: aigentic_api::CheckpointAnswer::Stop,
+                    amendment: None,
+                },
+                Some(Role::Approve),
+            ),
         ];
         for (request, role) in rows {
             assert_eq!(needs(&request), role, "{request:?}");
@@ -298,5 +377,29 @@ mod tests {
         assert!(!may("w", &decide));
         assert!(may("a", &decide));
         assert!(may("nobody", &Request::ListProjects));
+    }
+
+    /// The jobs listing is judged per project. An
+    /// unscoped ask names none, so the pre-check leaves it to the
+    /// handler; a scoped one needs the read role in the project it
+    /// names. `every_request_has_its_row` carries the same two rows.
+    #[test]
+    fn jobs_is_judged_per_project() {
+        let unscoped = Request::Jobs { project: None };
+        let scoped = Request::Jobs {
+            project: Some("p".into()),
+        };
+        assert_eq!(needs(&unscoped), None);
+        assert_eq!(needs(&scoped), Some(Role::Read));
+
+        // Through the participants: a caller the project file does not
+        // name has no role, so it cannot cover the read the scoped ask
+        // needs; the unscoped ask needs nothing, which the handler then
+        // judges per row.
+        let p: Participants = toml::from_str("r = \"read\"\n").unwrap();
+        assert_eq!(needs(&scoped), Some(Role::Read));
+        assert!(p.allows("r", "owner", Role::Read));
+        assert_eq!(p.role("nobody", "owner"), None);
+        assert!(!p.allows("nobody", "owner", Role::Read));
     }
 }

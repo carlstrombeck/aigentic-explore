@@ -464,6 +464,9 @@ async fn pin_and_ask_human_are_harness_tools_in_the_specs() {
             "list_dir",
             "pin",
             "read_file",
+            "recall",
+            "start_job",
+            "suggest_project",
             "touch",
             "update_tasks",
             "write_file"
@@ -558,6 +561,7 @@ async fn a_tool_the_layers_hide_is_not_offered_and_is_refused_as_unknown() {
             instructions: None,
             denied_tools: vec!["touch".into(), "mcp.*".into()],
             denied_skills: vec![],
+            ..GlobalLayer::default()
         },
         workspace: None,
         project: None,
@@ -722,14 +726,17 @@ async fn manual_is_the_default_and_asks_as_before() {
     audit(&r);
 }
 
-/// Allows every prompt, but only after a human-sized pause.
+/// Allows every prompt, but only after a human-sized pause: long enough
+/// that the turn's own working time stays far under the budget even on a
+/// loaded CI runner (a 300 ms pause against a 200 ms budget failed CI once
+/// on 953df39).
 struct SlowYes;
 impl Approver for SlowYes {
     fn author(&self) -> Author {
         steve()
     }
     fn ask(&mut self, _: &PermissionRequestedPayload) -> Answer {
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
         Answer::Allow
     }
     fn ask_human(&mut self, _: &str) -> Option<String> {
@@ -758,7 +765,8 @@ async fn time_waiting_on_a_prompt_does_not_count_against_the_wall_time_budget() 
         .with_budget(aigentic_core::Budget {
             max_iterations: 10,
             max_tokens: u64::MAX,
-            max_wall_time: std::time::Duration::from_millis(200),
+            max_wall_time: std::time::Duration::from_millis(1_000),
+            max_cost_usd: None,
             cache_read_price_ratio: 0.25,
         });
     let outcome = runtime
@@ -767,7 +775,7 @@ async fn time_waiting_on_a_prompt_does_not_count_against_the_wall_time_budget() 
         .unwrap();
     assert_eq!(
         outcome.reason, "done",
-        "600 ms of prompts against a 200 ms budget: only working time counts"
+        "3 s of prompts against a 1 s budget: only working time counts"
     );
     assert_eq!(*touched.lock().unwrap(), vec!["a", "b"]);
 }

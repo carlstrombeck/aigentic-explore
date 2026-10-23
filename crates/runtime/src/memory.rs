@@ -28,13 +28,15 @@
 //! model in between.
 
 use std::io::Write as _;
+use std::path::PathBuf;
 
 use aigentic_core::{
     Author, CompletionRequest, ContentBlock, Event, EventKind, Message, ProviderEvent, Role, Usage,
 };
 use aigentic_log::{
-    AssistantMessagePayload, MemoryExtractedPayload, MemoryLine, MemoryRememberedPayload,
-    SkillLoadedPayload, ToolResultPayload, TurnEndedPayload, UserMessagePayload,
+    AssistantMessagePayload, MemoryExtractedPayload, MemoryHome, MemoryLine,
+    MemoryRememberedPayload, SkillLoadedPayload, ToolResultPayload, TurnEndedPayload,
+    UserMessagePayload,
 };
 use futures_util::StreamExt;
 use time::format_description::well_known::Rfc3339;
@@ -60,7 +62,51 @@ kind is decision, constraint or fact, seq is the entry that stated it, scope is 
 task, and text is one short sentence in the participant's own terms. Reply `none` when there is \
 nothing to file.";
 
-const MEMORY_REQUEST: &str = "Extract the memory lines now.";
+/// The fixed request a thread with no home beyond the project's sends.
+pub const MEMORY_REQUEST: &str = "Extract the memory lines now.";
+
+/// The word that names a home, and the inverse.
+fn home_word(word: &str) -> Option<MemoryHome> {
+    match word.trim().to_ascii_lowercase().as_str() {
+        "person" => Some(MemoryHome::Person),
+        "workspace" => Some(MemoryHome::Workspace),
+        "project" => Some(MemoryHome::Project),
+        _ => None,
+    }
+}
+
+fn home_name(home: MemoryHome) -> &'static str {
+    match home {
+        MemoryHome::Person => "person",
+        MemoryHome::Workspace => "workspace",
+        MemoryHome::Project => "project",
+    }
+}
+
+/// The extraction request: `MEMORY_REQUEST`, plus — only when the thread
+/// keeps a home beyond the project's — one sentence naming those homes and
+/// saying their word goes before the kind. A project-only thread sends
+/// `MEMORY_REQUEST` unchanged.
+fn memory_request(homes: &[MemoryHome]) -> String {
+    if homes.is_empty() {
+        return MEMORY_REQUEST.to_owned();
+    }
+    let list = homes
+        .iter()
+        .map(|h| format!("a {} memory", home_name(*h)))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let words = homes
+        .iter()
+        .map(|h| format!("`{}`", home_name(*h)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{MEMORY_REQUEST} Besides the project's, this thread keeps {list}. On a line that belongs \
+in one of those, put its home word ({words}) before the kind; a line with no home word goes to \
+the project's."
+    )
+}
 
 /// The three files, by kind tag.
 pub const MEMORY_FILES: [(&str, &str); 3] = [
@@ -201,6 +247,8 @@ const RESULT_HEAD: usize = 400;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Proposed {
     pub(crate) file: String,
+    /// Which home the reply's line named; no word means the project's.
+    pub(crate) home: MemoryHome,
     pub(crate) at_seq: u64,
     /// The model's own scope verdict; `task` lines are dropped even
     /// when the attribution holds, because they are instructions for
@@ -227,7 +275,7 @@ impl Runtime {
             return Ok(None);
         }
         let every = project.file.memory.every_n_turns.max(1);
-        let memory_dir = project.memory_dir();
+        let homes = self.layers.extra_memory_homes();
 
         let events = self.log.read_all()?;
         let Some(through_seq) = events.last().map(|e| e.seq) else {
@@ -253,7 +301,7 @@ impl Runtime {
             Message {
                 role: Role::User,
                 author: Author::System,
-                blocks: vec![ContentBlock::Text(MEMORY_REQUEST.into())],
+                blocks: vec![ContentBlock::Text(memory_request(&homes))],
             },
         ];
         let request = CompletionRequest {
@@ -275,9 +323,22 @@ impl Runtime {
         drop(stream);
 
         let kept = filter_stated(parse_reply(&text), &since, &self.agent);
+        // A home this thread has not got, and a person line nobody but the
+        // owner stated, are dropped — never re-filed somewhere else.
+        let owner = self.layers.global.owner.clone();
+        let kept: Vec<_> = kept
+            .into_iter()
+            .filter(|l| self.layers.memory_home(l.home).is_some())
+            .filter(|l| match l.home {
+                MemoryHome::Person => {
+                    matches!(&l.stated_by, Author::User(id) if Some(&id.0) == owner.as_ref())
+                }
+                _ => true,
+            })
+            .collect();
         // Not new memory either: a line that restates the project's
-        // name or something the instructions or knowledge layers
-        // already carry.
+        // name, the instructions or knowledge layers, or either of the
+        // other memories.
         let known = self.known();
         let kept: Vec<_> = kept
             .into_iter()
@@ -288,7 +349,33 @@ impl Runtime {
             .unwrap_or_default();
         let date = date.get(..10).unwrap_or(&date).to_owned();
         let thread = self.log.thread_id().to_string();
-        let written = write_lines(&memory_dir, &kept, &date, &thread)?;
+        // One write per home, then the payload's `written` back in the
+        // reply's own order.
+        let mut landed: Vec<Option<MemoryLine>> = vec![None; kept.len()];
+        for home in [
+            MemoryHome::Person,
+            MemoryHome::Workspace,
+            MemoryHome::Project,
+        ] {
+            let Some(dir) = self.layers.memory_home(home) else {
+                continue;
+            };
+            let group: Vec<MemoryLine> = kept.iter().filter(|l| l.home == home).cloned().collect();
+            let mut pool = write_lines(&dir, &group, &date, &thread)?;
+            for (i, line) in kept.iter().enumerate() {
+                if line.home != home {
+                    continue;
+                }
+                match pool.iter().position(|w| w == line) {
+                    Some(pos) => {
+                        pool.remove(pos);
+                        landed[i] = Some(line.clone());
+                    }
+                    None => continue,
+                }
+            }
+        }
+        let written: Vec<MemoryLine> = landed.into_iter().flatten().collect();
 
         // Which provider ran the extraction: the utility profile's when
         // one is configured, else the thread's own (issue #18).
@@ -322,21 +409,30 @@ impl Runtime {
             None,
             observe,
         )?;
-        if let Some(project) = self.layers.project.as_mut() {
-            project.reload_memory()?;
-        }
+        self.layers.reload_memory()?;
         self.measured = None;
         Ok(Some(payload))
     }
 
-    /// The project's name and its instructions and knowledge layers,
-    /// for the restatement filter: a line that restates any of them is
-    /// not new memory.
+    /// The project's name and its instructions and knowledge layers, the
+    /// person's memory and the workspace's, for the restatement filter: a
+    /// line that restates any of them is not new memory, whichever home
+    /// the reply pointed at.
     fn known(&self) -> Known {
         let Some(project) = self.layers.project.as_ref() else {
             return Known::default();
         };
         let mut text = project.instructions.clone().unwrap_or_default();
+        for (_, body) in self
+            .layers
+            .global
+            .memory
+            .iter()
+            .chain(self.layers.workspace.iter().flat_map(|w| w.memory.iter()))
+        {
+            text.push('\n');
+            text.push_str(body);
+        }
         if let Ok(entries) = std::fs::read_dir(project.knowledge_dir()) {
             for entry in entries.flatten() {
                 if let Ok(md) = std::fs::read_to_string(entry.path()) {
@@ -353,20 +449,26 @@ impl Runtime {
 
     /// `/remember <text>` (issue #14): the person files a line
     /// themselves — no model call, no filter, because the command is
-    /// the statement. An optional first word (`decision`, `constraint`
-    /// or `fact`) picks the file; without one the line lands in
-    /// `facts.md`. Appends a `memory_remembered` event (the audit, and
-    /// what the client prints) and reloads the prefix.
+    /// the statement. A leading home word (`person`, `workspace`,
+    /// `project`) picks the home, and an optional kind word
+    /// (`decision`, `constraint` or `fact`) picks the file; without one
+    /// the line lands in `facts.md`. Refuses a home this thread has not
+    /// got, and the person's home for anyone but the owner. Appends a
+    /// `memory_remembered` event (the audit, and what the client
+    /// prints) and reloads the homes.
     pub fn remember(
         &mut self,
         author: Author,
         text: &str,
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<(), RuntimeError> {
-        let Some(project) = self.layers.project.as_ref() else {
+        let (home, text) = split_home(text);
+        if home == MemoryHome::Project && self.layers.project.is_none() {
             return Err(RuntimeError::NoProject);
-        };
-        let memory_dir = project.memory_dir();
+        }
+        let memory_dir = self
+            .writable_home(home, &author)
+            .ok_or(RuntimeError::NoMemoryHome(home))?;
 
         let (file, text) = split_kind(text);
         let (file, text) = (file.to_owned(), text.to_owned());
@@ -380,6 +482,7 @@ impl Runtime {
         let thread = self.log.thread_id().to_string();
         let line = MemoryLine {
             file: file.clone(),
+            home,
             text: text.clone(),
             stated_by: author.clone(),
             at_seq,
@@ -388,6 +491,7 @@ impl Runtime {
 
         let payload = MemoryRememberedPayload {
             file,
+            home,
             text,
             written: !written.is_empty(),
         };
@@ -398,12 +502,48 @@ impl Runtime {
             None,
             observe,
         )?;
-        if let Some(project) = self.layers.project.as_mut() {
-            project.reload_memory()?;
-        }
+        self.layers.reload_memory()?;
         self.measured = None;
         Ok(())
     }
+
+    /// The folder a line in `home` goes to, when this thread may file
+    /// there: the folder must be known, and the person's home is the
+    /// owner's alone.
+    fn writable_home(&self, home: MemoryHome, by: &Author) -> Option<PathBuf> {
+        let owner = self.layers.global.owner.as_deref();
+        match (home, by) {
+            (MemoryHome::Person, Author::User(id)) if owner == Some(id.0.as_str()) => {
+                self.layers.memory_home(home)
+            }
+            (MemoryHome::Person, _) => None,
+            _ => self.layers.memory_home(home),
+        }
+    }
+}
+
+/// Split a leading home word off a `/remember` line. The word counts
+/// only when a kind word with a line after it follows, so
+/// `/remember workspace is noisy this week` stays a project fact.
+pub(crate) fn split_home(text: &str) -> (MemoryHome, &str) {
+    let trimmed = text.trim();
+    let Some((word, rest)) = trimmed.split_once(char::is_whitespace) else {
+        return (MemoryHome::Project, trimmed);
+    };
+    let Some(home) = home_word(word) else {
+        return (MemoryHome::Project, trimmed);
+    };
+    let rest = rest.trim();
+    let Some((kind, line)) = rest.split_once(char::is_whitespace) else {
+        return (MemoryHome::Project, trimmed);
+    };
+    let kind_known = MEMORY_FILES
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case(kind));
+    if !kind_known || line.trim().is_empty() {
+        return (MemoryHome::Project, trimmed);
+    }
+    (home, rest)
 }
 
 /// Split an optional kind word off the front of a `/remember` line:
@@ -538,8 +678,12 @@ pub(crate) fn parse_reply(text: &str) -> Vec<Proposed> {
             continue;
         };
         let mut parts = head.split_whitespace();
-        let (Some(kind), Some(seq), Some(scope)) = (parts.next(), parts.next(), parts.next())
-        else {
+        let first = parts.next();
+        let (home, kind) = match first.and_then(home_word) {
+            Some(home) => (home, parts.next()),
+            None => (MemoryHome::Project, first),
+        };
+        let (Some(kind), Some(seq), Some(scope)) = (kind, parts.next(), parts.next()) else {
             continue;
         };
         let Some((_, file)) = MEMORY_FILES
@@ -565,6 +709,7 @@ pub(crate) fn parse_reply(text: &str) -> Vec<Proposed> {
         }
         out.push(Proposed {
             file: (*file).to_owned(),
+            home,
             at_seq,
             durable,
             text: text.to_owned(),
@@ -607,6 +752,7 @@ pub(crate) fn filter_stated(
             };
             stated.then(|| MemoryLine {
                 file: p.file,
+                home: p.home,
                 text: p.text,
                 stated_by: e.author.clone(),
                 at_seq: p.at_seq,
@@ -734,18 +880,21 @@ mod tests {
             vec![
                 Proposed {
                     file: "decisions.md".into(),
+                    home: MemoryHome::Project,
                     at_seq: 3,
                     durable: true,
                     text: "Use Swedish.".into()
                 },
                 Proposed {
                     file: "facts.md".into(),
+                    home: MemoryHome::Project,
                     at_seq: 5,
                     durable: true,
                     text: "The repo is aigentic.".into()
                 },
                 Proposed {
                     file: "constraints.md".into(),
+                    home: MemoryHome::Project,
                     at_seq: 7,
                     durable: false,
                     text: "No tokio in core".into()
@@ -873,6 +1022,7 @@ fact @0 durable: The project is called aigentic.\n";
             let kept = filter_stated(
                 vec![Proposed {
                     file: "facts.md".into(),
+                    home: MemoryHome::Project,
                     at_seq: 0,
                     durable: true,
                     text: (*source).to_owned(),
@@ -982,6 +1132,7 @@ with what changed and close it.";
         let kept = filter_stated(
             vec![Proposed {
                 file: "decisions.md".into(),
+                home: MemoryHome::Project,
                 at_seq: 0,
                 durable: true,
                 text: "Deliver steering at the next safe point.".into(),
@@ -1056,6 +1207,7 @@ with what changed and close it.";
         let mut proposed = (0..7)
             .map(|s| Proposed {
                 file: "facts.md".into(),
+                home: MemoryHome::Project,
                 at_seq: s,
                 durable: true,
                 text: format!("line {s}"),
@@ -1065,6 +1217,7 @@ with what changed and close it.";
         // does not.
         proposed.push(Proposed {
             file: "facts.md".into(),
+            home: MemoryHome::Project,
             at_seq: 0,
             durable: false,
             text: "task line 0".into(),
@@ -1123,6 +1276,7 @@ with what changed and close it.";
         let mem = dir.path().join("memory");
         let line = |text: &str| MemoryLine {
             file: "decisions.md".into(),
+            home: MemoryHome::Project,
             text: text.into(),
             stated_by: steve(),
             at_seq: 0,

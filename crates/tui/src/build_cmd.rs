@@ -1,0 +1,1266 @@
+//! `aigentic build <n>` (issue #58, slice 1's acceptance): start — or
+//! resume — the build workflow for an issue, and follow it, with nothing
+//! pasted.
+//!
+//! One line per lead event goes to stderr: the step and its attempt, the
+//! checks, the commits, the gate and the outcome. With `--json` every
+//! notice is one JSON line on stdout instead.
+//!
+//! The command never answers a checkpoint itself: a gate that waits for a
+//! person is left waiting, and a gate the runner answered itself — a
+//! `decided_by` gate whose decider proposed `go` — needs nothing from it
+//! but to be followed. Exit 0 for a run that closed, 3 for one that
+//! stopped (a human is needed), 1 for one a runner error stopped. Ctrl-C
+//! detaches; the run stays resumable.
+
+use std::io::Write;
+
+use aigentic_api::client::Client;
+use aigentic_api::{CheckpointAnswer, Notice, Request, Response};
+use aigentic_runtime::aigentic_core::EventKind;
+use aigentic_runtime::aigentic_log::{CheckpointAskedPayload, RunFinishedPayload, RunOutcome};
+use anyhow::{Context, bail};
+use tokio::sync::mpsc;
+use ulid::Ulid;
+
+use crate::run_view::{Refused, fetch_backlog, outcome_line, render};
+
+/// The run finished `Closed`: the issue is done.
+pub const EXIT_OK: i32 = 0;
+/// The run needs a person: it stopped, it escalated, or it waits at a gate.
+pub const EXIT_NEEDS_HUMAN: i32 = 3;
+/// The request itself failed.
+pub const EXIT_FAILED: i32 = 1;
+
+#[derive(Debug, Clone)]
+pub struct BuildArgs {
+    /// The issue number.
+    pub issue: u64,
+    /// The workflow to run; `None` is the daemon's default (`build`).
+    pub workflow: Option<String>,
+    /// Every notice as a JSON line on stdout.
+    pub json: bool,
+}
+
+/// What the run came to; `code` is the process's exit code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildOutcome {
+    pub code: i32,
+    pub lead: Ulid,
+    pub resumed: bool,
+    pub outcome: Option<RunOutcome>,
+    pub reason: Option<String>,
+}
+
+/// Start or resume the run for `args.issue` and follow it to its end.
+/// `out` receives the JSON lines (or nothing), `err` the progress.
+pub async fn run(
+    client: &Client,
+    mut notices: mpsc::Receiver<Notice>,
+    project: &str,
+    by: &str,
+    args: &BuildArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> anyhow::Result<BuildOutcome> {
+    let replied = client
+        .request(Request::Build {
+            project: project.to_owned(),
+            issue: args.issue,
+            workflow: args.workflow.clone(),
+        })
+        .await
+        .context("asking the daemon to build")?;
+    let (lead, resumed) = match replied {
+        Response::Run { lead, resumed } => (lead, resumed),
+        Response::Refused { reason } => bail!("the daemon refused to build: {reason}"),
+        other => bail!("unexpected reply to build: {other:?}"),
+    };
+    writeln!(
+        err,
+        "run {lead} for issue #{} ({})",
+        args.issue,
+        if resumed { "resumed" } else { "started" }
+    )?;
+
+    let mut outcome = BuildOutcome {
+        code: EXIT_OK,
+        lead,
+        resumed,
+        outcome: None,
+        reason: None,
+    };
+    // The lead belongs to a run, and the daemon serves it from its log
+    // (a `Build` on a resumed run subscribes to events written from now
+    // on; fix 4 of #58). Read the log first, so a resumed run shows what
+    // it did, and answer a gate that is already open instead of waiting
+    // for a live event that will never come.
+    let (mut printed, parked) = backlog(client, lead, err).await?;
+    if let Some(gate) = parked {
+        return left_for_a_person(outcome, &gate, args.issue, err);
+    }
+    loop {
+        let Some(notice) = notices.recv().await else {
+            // The session ended: the run is still resumable, and the
+            // person watching was told which lead it is.
+            bail!("the daemon's session ended before the run did");
+        };
+        if args.json {
+            writeln!(out, "{}", serde_json::to_string(&notice)?)?;
+            out.flush()?;
+        }
+        match notice {
+            Notice::Event { thread, event } if thread == lead => {
+                // The backlog already printed this one; a subscription
+                // may repeat the boundary event.
+                if event.seq <= printed {
+                    continue;
+                }
+                printed = event.seq;
+                let line = render(&event);
+                if let Some(line) = &line {
+                    writeln!(err, "{line}")?;
+                    err.flush()?;
+                }
+                if event.kind == EventKind::RunErrored {
+                    // The runner's own turn died. The run has not ended —
+                    // the next `build` resumes it — and only where the log
+                    // is can anyone read why it stopped. The line printed
+                    // above already carries the bounded reason.
+                    outcome.reason = line;
+                    outcome.code = EXIT_FAILED;
+                    return Ok(outcome);
+                }
+                if event.kind == EventKind::CheckpointAsked {
+                    let asked: Option<CheckpointAskedPayload> =
+                        serde_json::from_value(event.payload.clone()).ok();
+                    if let Some(gate) = asked.as_ref().filter(|a| takes_go(a)).map(|a| &a.gate) {
+                        // The loop may answer this gate itself, and its answer
+                        // is written in the same step, with no awaiting call
+                        // between the ask and it: a read of the log made after
+                        // the ask has reached us already holds the answer.
+                        let events = fetch_backlog(client, lead).await?;
+                        if !answered(&events, gate) {
+                            return left_for_a_person(outcome, gate, args.issue, err);
+                        }
+                        continue;
+                    }
+                    let gate = asked.map(|a| a.gate).unwrap_or_default();
+                    answer_stop(client, lead, &gate, err).await?;
+                }
+                if event.kind == EventKind::RunFinished {
+                    let finished: RunFinishedPayload =
+                        serde_json::from_value(event.payload.clone())
+                            .context("reading the run's outcome")?;
+                    writeln!(
+                        err,
+                        "run {lead} finished: {}",
+                        outcome_line(&finished.outcome)
+                    )?;
+                    outcome.outcome = Some(finished.outcome);
+                    outcome.code = match finished.outcome {
+                        RunOutcome::Closed => EXIT_OK,
+                        // Stopped and Escalated both leave the run for a
+                        // person: slice 2's prompts answer them.
+                        RunOutcome::Stopped | RunOutcome::Escalated => EXIT_NEEDS_HUMAN,
+                    };
+                    return Ok(outcome);
+                }
+            }
+            Notice::Note { thread, text } if thread == lead => {
+                writeln!(err, "note: {text}")?;
+                err.flush()?;
+                if text.starts_with("run stopped") {
+                    outcome.reason = Some(text);
+                    outcome.code = EXIT_FAILED;
+                    return Ok(outcome);
+                }
+            }
+            _ => {}
+        }
+        let _ = by;
+    }
+}
+
+/// Print the lead's backlog, and answer a gate it is already waiting at.
+///
+/// The lead's last event being `checkpoint_asked` means the run is
+/// parked on that gate with nobody to answer it: the live loop would
+/// wait for a `checkpoint_asked` that was written before this command
+/// connected, and never answer it (#58 fix 4). So it is answered here,
+/// as a live one is.
+///
+/// The events come from [`fetch_backlog`], which prints nothing and
+/// answers nothing; what `build` does with the last one is `build`'s
+/// own (issue #68: the REPL shows a prompt there instead).
+async fn backlog(
+    client: &Client,
+    lead: Ulid,
+    err: &mut dyn Write,
+) -> anyhow::Result<(u64, Option<String>)> {
+    let events = match fetch_backlog(client, lead).await {
+        Ok(events) => events,
+        Err(e) if e.downcast_ref::<Refused>().is_some() => {
+            // Nothing appended and nothing to answer: the daemon said no,
+            // and the live loop still follows the run.
+            writeln!(err, "note: no backlog: {e}")?;
+            err.flush()?;
+            return Ok((0, None));
+        }
+        Err(e) => return Err(e),
+    };
+    let mut printed = 0;
+    for event in &events {
+        if let Some(line) = render(event) {
+            writeln!(err, "{line}")?;
+        }
+        printed = event.seq;
+    }
+    err.flush()?;
+    if let Some(last) = events.last()
+        && last.kind == EventKind::CheckpointAsked
+    {
+        let asked: Option<CheckpointAskedPayload> =
+            serde_json::from_value(last.payload.clone()).ok();
+        if let Some(asked) = asked.as_ref().filter(|a| takes_go(a)) {
+            return Ok((printed, Some(asked.gate.clone())));
+        }
+        let gate = asked.map(|a| a.gate).unwrap_or_default();
+        answer_stop(client, lead, &gate, err).await?;
+    }
+    Ok((printed, None))
+}
+
+/// A gate that offers `go` is a workflow's own checkpoint, put there for
+/// a person: this command never answers one.
+fn takes_go(asked: &CheckpointAskedPayload) -> bool {
+    asked.options.iter().any(|option| option == "go")
+}
+
+/// Whether the log already holds the answer to `gate`: a
+/// `checkpoint_answered` after the last `checkpoint_asked` for it. The
+/// answer's payload carries no gate id, so it answers the ask before it —
+/// the pairing the fold makes.
+fn answered(events: &[aigentic_runtime::aigentic_core::Event], gate: &str) -> bool {
+    // A gate asked twice is open again: an answer to the earlier ask does
+    // not stand for the later one, so the read is the last ask and whether
+    // an answer of its own follows it.
+    let mut open: Option<String> = None;
+    let mut asked_at: Option<usize> = None;
+    let mut answered_at: Option<usize> = None;
+    for (index, event) in events.iter().enumerate() {
+        match event.kind {
+            EventKind::CheckpointAsked => {
+                open = serde_json::from_value::<CheckpointAskedPayload>(event.payload.clone())
+                    .ok()
+                    .map(|asked| asked.gate);
+                if open.as_deref() == Some(gate) {
+                    asked_at = Some(index);
+                }
+            }
+            EventKind::CheckpointAnswered if open.take().as_deref() == Some(gate) => {
+                answered_at = Some(index);
+            }
+            _ => {}
+        }
+    }
+    matches!((asked_at, answered_at), (Some(asked), Some(answered)) if answered > asked)
+}
+
+/// Leave the run waiting at a person's checkpoint, say where to answer
+/// it, and exit as "a human is needed".
+fn left_for_a_person(
+    mut outcome: BuildOutcome,
+    gate: &str,
+    issue: u64,
+    err: &mut dyn Write,
+) -> anyhow::Result<BuildOutcome> {
+    writeln!(
+        err,
+        "checkpoint `{gate}` waits for a person: in the REPL, /build {issue} then \
+         /answer go, /answer amend <text> or /answer stop"
+    )?;
+    err.flush()?;
+    outcome.code = EXIT_NEEDS_HUMAN;
+    outcome.reason = Some(format!("waiting at checkpoint `{gate}`"));
+    Ok(outcome)
+}
+
+/// Answer one gate `stop` — this command never answers `go`.
+async fn answer_stop(
+    client: &Client,
+    lead: Ulid,
+    gate: &str,
+    err: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let answered = client
+        .request(Request::AnswerCheckpoint {
+            lead,
+            gate: gate.to_owned(),
+            answer: CheckpointAnswer::Stop,
+            amendment: None,
+        })
+        .await
+        .context("answering the checkpoint")?;
+    match answered {
+        Response::Ok => writeln!(
+            err,
+            "answered gate `{gate}` stop: this command never answers go"
+        )?,
+        Response::Refused { reason } => writeln!(err, "could not answer gate `{gate}`: {reason}")?,
+        other => writeln!(err, "could not answer gate `{gate}`: {other:?}")?,
+    }
+    err.flush()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use aigentic_runtime::aigentic_core::Event;
+
+    use super::*;
+    // The helpers the moved renderer keeps beside it (issue #68).
+    use crate::run_view::{answer_word, answered_by, check_result, short, step_status};
+    use aigentic_runtime::aigentic_log::{
+        CheckpointAnsweredPayload, ChecksRunPayload, PushedPayload, RouteTakenPayload,
+        StepFinishedPayload, StepStartedPayload,
+    };
+
+    /// One event, as the log stores it.
+    fn event(kind: EventKind, payload: serde_json::Value) -> Event {
+        serde_json::from_value(serde_json::json!({
+            "id": Ulid::generate(),
+            "thread_id": Ulid::generate(),
+            "seq": 0,
+            "created_at": "2026-09-23T10:00:00Z",
+            "kind": kind,
+            "author": {"kind": "agent", "id": "runner"},
+            "payload": payload,
+            "parent_event": null,
+        }))
+        .expect("the fixture event reads")
+    }
+
+    /// T10 — each lead event kind renders its line: the expected strings
+    /// are built from the fixture payloads, not hand-written.
+    #[test]
+    fn t10_each_event_kind_renders_its_line() {
+        let child = Ulid::generate();
+        let started = event(
+            EventKind::StepStarted,
+            serde_json::json!({
+                "step": "implement-alone",
+                "role": "implementer",
+                "profile": "flash",
+                "child_thread": child,
+                "attempt": 2,
+                "budget_usd": 3.0,
+            }),
+        );
+        let payload: StepStartedPayload = serde_json::from_value(started.payload.clone()).unwrap();
+        assert_eq!(
+            render(&started).unwrap(),
+            format!(
+                "step {} attempt {} → child {}",
+                payload.step, payload.attempt, payload.child_thread
+            )
+        );
+
+        let finished = event(
+            EventKind::StepFinished,
+            serde_json::json!({
+                "step": "implement-alone",
+                "status": "done",
+                "end_reason": "done",
+                "cost_usd": 0.41,
+            }),
+        );
+        let payload: StepFinishedPayload =
+            serde_json::from_value(finished.payload.clone()).unwrap();
+        let line = render(&finished).unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "step {} finished: {} ({}) · ${:.2}",
+                payload.step,
+                step_status(&payload.status),
+                payload.end_reason,
+                payload.cost_usd
+            ),
+            "the status, the end reason and the cost are the payload's"
+        );
+
+        let checks = event(
+            EventKind::ChecksRun,
+            serde_json::json!({
+                "step": "implement-alone",
+                "checks": [
+                    {"id": "E1", "result": "pass", "detail": "the trailer is there"},
+                    {"id": "E2", "result": "flag", "detail": null},
+                ],
+            }),
+        );
+        let payload: ChecksRunPayload = serde_json::from_value(checks.payload.clone()).unwrap();
+        let line = render(&checks).unwrap();
+        assert_eq!(
+            line.lines().next().unwrap(),
+            format!(
+                "checks {}: {}/{} passed",
+                payload.step,
+                1,
+                payload.checks.len()
+            )
+        );
+        for check in &payload.checks {
+            assert!(
+                line.contains(&check.id) && line.contains(&check_result(&check.result)),
+                "every check's id and result is on a line: {line}"
+            );
+        }
+
+        let route = event(
+            EventKind::RouteTaken,
+            serde_json::json!({
+                "branch": "main",
+                "proposed": "full",
+                "taken": "ask",
+                "budget_usd": 4.0,
+            }),
+        );
+        let payload: RouteTakenPayload = serde_json::from_value(route.payload.clone()).unwrap();
+        assert_eq!(
+            render(&route).unwrap(),
+            format!(
+                "route on {} proposed {} taken {} · budget ${:.2}",
+                payload.branch,
+                payload.proposed,
+                payload.taken,
+                payload.budget_usd.unwrap()
+            )
+        );
+
+        let pushed = event(
+            EventKind::Pushed,
+            serde_json::json!({
+                "commits": [
+                    {"sha": "1111111111111111111111111111111111111111", "subject": "pancake: one"},
+                ],
+                "ref_before": "2222222222222222222222222222222222222222",
+                "ref_after": "3333333333333333333333333333333333333333",
+            }),
+        );
+        let payload: PushedPayload = serde_json::from_value(pushed.payload.clone()).unwrap();
+        let line = render(&pushed).unwrap();
+        assert_eq!(
+            line.lines().next().unwrap(),
+            format!(
+                "pushed {} → {} ({} commit)",
+                short(&payload.ref_before),
+                short(&payload.ref_after),
+                payload.commits.len()
+            )
+        );
+        for commit in &payload.commits {
+            assert!(
+                line.contains(&short(&commit.sha)) && line.contains(&commit.subject),
+                "every commit's sha and subject is on a line: {line}"
+            );
+        }
+
+        let asked = event(
+            EventKind::CheckpointAsked,
+            serde_json::json!({
+                "gate": "route",
+                "shown": ["size: full", "budget: 4"],
+                "options": ["go", "amend", "stop"],
+            }),
+        );
+        let payload: CheckpointAskedPayload =
+            serde_json::from_value(asked.payload.clone()).unwrap();
+        let line = render(&asked).unwrap();
+        assert!(line.contains(&format!("checkpoint `{}`", payload.gate)));
+        for shown in &payload.shown {
+            assert!(line.contains(shown), "each shown line is rendered: {line}");
+        }
+
+        let answered = event(
+            EventKind::CheckpointAnswered,
+            serde_json::json!({
+                "answer": "stop",
+                "amendment": null,
+            }),
+        );
+        let payload: CheckpointAnsweredPayload =
+            serde_json::from_value(answered.payload.clone()).unwrap();
+        assert_eq!(
+            render(&answered).unwrap(),
+            format!(
+                "checkpoint answered {}{}",
+                answer_word(&payload.answer),
+                answered_by(&answered.author)
+            )
+        );
+        // The fixture's author is the runner, so the line says the loop
+        // answered; a person's answer says nothing extra.
+        assert_eq!(
+            render(&answered).unwrap(),
+            format!(
+                "checkpoint answered {} (by the loop)",
+                answer_word(&payload.answer)
+            )
+        );
+        let mut by_person = answered.clone();
+        by_person.author = serde_json::from_value(serde_json::json!({
+            "kind": "user",
+            "id": "steve",
+        }))
+        .unwrap();
+        assert_eq!(
+            render(&by_person).unwrap(),
+            format!("checkpoint answered {}", answer_word(&payload.answer))
+        );
+
+        let done = event(
+            EventKind::RunFinished,
+            serde_json::json!({
+                "outcome": "closed",
+                "cost_usd": 1.5,
+            }),
+        );
+        let payload: RunFinishedPayload = serde_json::from_value(done.payload.clone()).unwrap();
+        assert_eq!(
+            render(&done).unwrap(),
+            format!("run finished: {}", outcome_line(&payload.outcome))
+        );
+
+        // An event the command has nothing to say about renders nothing.
+        let other = event(EventKind::TurnEnded, serde_json::json!({"reason": "done"}));
+        assert_eq!(render(&other), None);
+    }
+
+    /// T11 — `checkpoint_asked` → sends `AnswerCheckpoint { stop }`; the
+    /// exit-code mapping is `Closed` → 0, `Stopped`/`Escalated` → 3, an
+    /// error (the run stopped) → 1.
+    #[test]
+    fn t11_stop_is_the_answer_and_the_codes_map() {
+        // The answer this command sends is `stop`, never `go`.
+        let answer = CheckpointAnswer::Stop;
+        assert_eq!(
+            serde_json::to_string(&answer).unwrap(),
+            "\"stop\"",
+            "the word crossing the wire is `stop`"
+        );
+        assert_ne!(answer, CheckpointAnswer::Go);
+
+        // The exit codes, from the outcome.
+        let codes = |outcome: RunOutcome| -> i32 {
+            match outcome {
+                RunOutcome::Closed => EXIT_OK,
+                RunOutcome::Stopped | RunOutcome::Escalated => EXIT_NEEDS_HUMAN,
+            }
+        };
+        assert_eq!(codes(RunOutcome::Closed), 0, "closed maps to 0");
+        assert_eq!(codes(RunOutcome::Stopped), 3, "stopped maps to 3");
+        assert_eq!(codes(RunOutcome::Escalated), 3, "escalated maps to 3");
+
+        // A run stopped by a runner error: the note this command sees.
+        assert_eq!(EXIT_FAILED, 1, "a run stopped by an error maps to 1");
+    }
+
+    /// A live `run_errored` stops the command: the bounded reason goes to
+    /// stderr, `outcome.reason` carries it and the code is `EXIT_FAILED`,
+    /// because the error is the provider's or the work's, not a person's
+    /// to answer.
+    #[tokio::test]
+    async fn a_live_run_errored_answers_exit_failed_and_prints_the_reason() {
+        use crate::run_view::fake_daemon::{FakeDaemon, Script};
+        use aigentic_api::Notice;
+
+        const REASON: &str = "turn: provider_error: HTTP 400 from the endpoint";
+
+        let dir = tempfile::tempdir().unwrap();
+        let lead = Ulid::generate();
+        // The lead as the incident left it: a step open, and the runner's
+        // own turn dead. The log holds the whole error; a line does not.
+        let backlog = vec![event_at(
+            EventKind::StepStarted,
+            0,
+            lead,
+            serde_json::json!({
+                "step": "implement",
+                "role": "implementer",
+                "profile": "flash",
+                "child_thread": Ulid::generate(),
+                "attempt": 1,
+                "budget_usd": 3.0,
+            }),
+        )];
+        let daemon = FakeDaemon::start(
+            dir.path(),
+            Script {
+                lead,
+                backlog,
+                resumed: true,
+                role: "admin",
+                refuse_build: None,
+                refuse_open: None,
+                refuse_answer: None,
+                missing: Vec::new(),
+                rows: Vec::new(),
+                children: Vec::new(),
+                jobs: Vec::new(),
+            },
+        )
+        .await;
+        let (client, _) = Client::connect(&daemon.addr(), "steve").await.unwrap();
+        let notices = client.take_notices().expect("the notice stream");
+        daemon.push(Notice::Event {
+            thread: lead,
+            event: event_at(
+                EventKind::RunErrored,
+                1,
+                lead,
+                serde_json::json!({"reason": REASON, "cost_usd": 0.4}),
+            ),
+        });
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = run(
+            &client,
+            notices,
+            "proj",
+            "steve",
+            &BuildArgs {
+                issue: 163,
+                workflow: None,
+                json: false,
+            },
+            &mut out,
+            &mut err,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.code, EXIT_FAILED,
+            "an error is not a person's to answer: {outcome:?}"
+        );
+        let line = outcome.reason.as_deref().unwrap_or_default();
+        assert!(
+            line.contains(REASON),
+            "the reason the runner noted is what the command answers with: {line}"
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains(line), "the same line reaches stderr: {err}");
+        daemon.stop();
+    }
+
+    /// One event with a chosen seq, as the log stores it.
+    fn event_at(kind: EventKind, seq: u64, thread: Ulid, payload: serde_json::Value) -> Event {
+        serde_json::from_value(serde_json::json!({
+            "id": Ulid::generate(),
+            "thread_id": thread,
+            "seq": seq,
+            "created_at": "2026-09-23T10:00:00Z",
+            "kind": kind,
+            "author": {"kind": "agent", "id": "runner"},
+            "payload": payload,
+            "parent_event": null,
+        }))
+        .expect("the fixture event reads")
+    }
+
+    /// T17 — a lead already waiting at its gate: `aigentic build <n>`
+    /// prints the lead's backlog, answers the open gate `stop` once, and
+    /// exits 3 (issue #58 fix 4). A fake daemon over a socket records
+    /// what the command asked of it.
+    #[tokio::test]
+    async fn t17_a_lead_waiting_at_a_gate_is_shown_and_answered() {
+        use aigentic_api::{Body, Frame, ThreadState, Welcome, encode};
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let lead = Ulid::generate();
+        // The lead as a resumed command finds it: the work so far, then
+        // the gate it is parked on. The daemon wrote `checkpoint_asked`
+        // before this command connected, so no live notice will carry it.
+        let backlog = vec![
+            event_at(
+                EventKind::StepStarted,
+                0,
+                lead,
+                serde_json::json!({
+                    "step": "implement-alone",
+                    "role": "implementer",
+                    "profile": "flash",
+                    "child_thread": Ulid::generate(),
+                    "attempt": 1,
+                    "budget_usd": 3.0,
+                }),
+            ),
+            event_at(
+                EventKind::ChecksRun,
+                1,
+                lead,
+                serde_json::json!({
+                    "step": "implement-alone",
+                    "checks": [{"id": "E1", "result": "pass", "detail": "the trailer is there"}],
+                }),
+            ),
+            event_at(
+                EventKind::CheckpointAsked,
+                2,
+                lead,
+                serde_json::json!({
+                    "gate": "route",
+                    "shown": ["size: full"],
+                    "options": ["stop"],
+                }),
+            ),
+        ];
+        let seen: Arc<Mutex<Vec<Request>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let daemon = {
+            let backlog = backlog.clone();
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    let Ok(frame) = aigentic_api::decode(&line) else {
+                        break;
+                    };
+                    let id = frame.id.unwrap_or(0);
+                    let request = match frame.body {
+                        Body::Request(request) => request,
+                        _ => break,
+                    };
+                    seen.lock().unwrap().push(request.clone());
+                    let response = match request {
+                        Request::Hello { .. } => Response::Welcome(Welcome {
+                            user: "steve".into(),
+                            projects: Vec::new(),
+                            server: "fake".into(),
+                        }),
+                        Request::Build { issue, .. } => {
+                            assert_eq!(issue, 58);
+                            Response::Run {
+                                lead,
+                                resumed: true,
+                            }
+                        }
+                        Request::Open { thread, from_seq } => {
+                            assert_eq!(thread, lead);
+                            assert_eq!(from_seq, 0, "the backlog is the whole log");
+                            Response::Opened {
+                                state: ThreadState::Idle,
+                                events: backlog.clone(),
+                                run: None,
+                                mode: "manual".into(),
+                                profile: None,
+                                model: "unknown".into(),
+                                effort: None,
+                            }
+                        }
+                        Request::AnswerCheckpoint { .. } => {
+                            // The answer ends the run, as the daemon's task
+                            // would: the outcome arrives as a live notice.
+                            let done = event_at(
+                                EventKind::RunFinished,
+                                3,
+                                lead,
+                                serde_json::json!({"outcome": "stopped", "cost_usd": 0.0}),
+                            );
+                            write
+                                .write_all(
+                                    format!(
+                                        "{}\n",
+                                        encode(&Frame::notice(Notice::Event {
+                                            thread: lead,
+                                            event: done,
+                                        }))
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await
+                                .unwrap();
+                            Response::Ok
+                        }
+                        other => panic!("the command sent {other:?}"),
+                    };
+                    let line = format!("{}\n", encode(&Frame::response(id, response)));
+                    write.write_all(line.as_bytes()).await.unwrap();
+                }
+            })
+        };
+
+        let (client, _) = Client::connect(&aigentic_api::client::Addr::Unix(socket), "steve")
+            .await
+            .unwrap();
+        let notices = client.take_notices().expect("the notice stream");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = run(
+            &client,
+            notices,
+            "p",
+            "steve",
+            &BuildArgs {
+                issue: 58,
+                workflow: None,
+                json: false,
+            },
+            &mut out,
+            &mut err,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.resumed, "the run was picked up, not started");
+        assert_eq!(
+            outcome.code, EXIT_NEEDS_HUMAN,
+            "the run stopped, so a person is needed: {outcome:?}"
+        );
+
+        // The backlog is printed: the step and the gate it waits at.
+        let err = String::from_utf8(err).unwrap();
+        assert!(
+            err.contains("step implement-alone attempt 1"),
+            "the step already run is shown: {err}"
+        );
+        assert!(
+            err.contains("checkpoint `route`"),
+            "the gate it waits at is shown: {err}"
+        );
+
+        // The open gate was answered `stop`, once, and only because the
+        // backlog ended at `checkpoint_asked`.
+        let seen = seen.lock().unwrap();
+        let answers: Vec<&Request> = seen
+            .iter()
+            .filter(|request| matches!(request, Request::AnswerCheckpoint { .. }))
+            .collect();
+        assert_eq!(answers.len(), 1, "one answer, and only one");
+        match answers[0] {
+            Request::AnswerCheckpoint {
+                lead: answered,
+                gate,
+                answer,
+                amendment,
+            } => {
+                assert_eq!(*answered, lead, "the lead the command was told");
+                assert_eq!(gate, "route", "the gate the backlog named");
+                assert_eq!(*answer, CheckpointAnswer::Stop, "never go");
+                assert!(amendment.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        daemon.abort();
+    }
+
+    /// A run parked at a workflow's own checkpoint (it offers `go`) is a
+    /// person's to answer: the command answers nothing, says where to
+    /// answer it, and exits 3 with the run still waiting.
+    #[tokio::test]
+    async fn a_persons_checkpoint_is_left_waiting() {
+        use aigentic_api::{Body, Frame, ThreadState, Welcome, encode};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let lead = Ulid::generate();
+        let backlog = vec![event_at(
+            EventKind::CheckpointAsked,
+            0,
+            lead,
+            serde_json::json!({
+                "gate": "decide",
+                "shown": ["read the spec check, then decide"],
+                "options": ["go", "amend", "stop"],
+            }),
+        )];
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let Ok(frame) = aigentic_api::decode(&line) else {
+                    break;
+                };
+                let id = frame.id.unwrap_or(0);
+                let Body::Request(request) = frame.body else {
+                    break;
+                };
+                let response = match request {
+                    Request::Hello { .. } => Response::Welcome(Welcome {
+                        user: "steve".into(),
+                        projects: Vec::new(),
+                        server: "fake".into(),
+                    }),
+                    Request::Build { .. } => Response::Run {
+                        lead,
+                        resumed: true,
+                    },
+                    Request::Open { .. } => Response::Opened {
+                        state: ThreadState::Idle,
+                        events: backlog.clone(),
+                        run: None,
+                        mode: "manual".into(),
+                        profile: None,
+                        model: "unknown".into(),
+                        effort: None,
+                    },
+                    other => panic!("the command answered a person's checkpoint: {other:?}"),
+                };
+                let line = format!("{}\n", encode(&Frame::response(id, response)));
+                write.write_all(line.as_bytes()).await.unwrap();
+            }
+        });
+
+        let (client, _) = Client::connect(&aigentic_api::client::Addr::Unix(socket), "steve")
+            .await
+            .unwrap();
+        let notices = client.take_notices().expect("the notice stream");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = run(
+            &client,
+            notices,
+            "p",
+            "steve",
+            &BuildArgs {
+                issue: 58,
+                workflow: Some("loop".into()),
+                json: false,
+            },
+            &mut out,
+            &mut err,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.code, EXIT_NEEDS_HUMAN);
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some("waiting at checkpoint `decide`")
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert!(
+            err.contains("/answer go") && err.contains("/build 58"),
+            "it says where to answer: {err}"
+        );
+        daemon.abort();
+    }
+
+    /// A gate the loop answered itself is followed, not left: the answer is
+    /// already in the log by the time the ask reaches the command, so a
+    /// read of the log decides it. A gate still open after that read is a
+    /// person's, exactly as before.
+    #[tokio::test]
+    async fn a_gate_the_loop_answered_is_followed_and_an_open_one_is_not() {
+        use aigentic_api::{Body, Frame, Notice, ThreadState, Welcome, encode};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        // `answered` decides whether the log the second `Open` returns
+        // holds the loop's answer: with it the run closes, without it the
+        // gate is a person's.
+        for answered in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let lead = Ulid::generate();
+            let asked = event_at(
+                EventKind::CheckpointAsked,
+                1,
+                lead,
+                serde_json::json!({
+                    "gate": "decide",
+                    "shown": ["read the spec check, then decide"],
+                    "options": ["go", "amend", "stop"],
+                }),
+            );
+            let mut live = vec![
+                asked.clone(),
+                event_at(
+                    EventKind::CheckpointAnswered,
+                    2,
+                    lead,
+                    serde_json::json!({"answer": "go", "amendment": null}),
+                ),
+                event_at(
+                    EventKind::RunFinished,
+                    3,
+                    lead,
+                    serde_json::json!({"outcome": "closed", "cost_usd": 1.0}),
+                ),
+            ];
+            // What the log holds once the ask has reached the command: the
+            // answer after the ask, or nothing but the ask.
+            let in_log = if answered {
+                live.clone()
+            } else {
+                vec![asked.clone()]
+            };
+            let notices: Vec<Notice> = live
+                .drain(..)
+                .map(|event| Notice::Event {
+                    thread: lead,
+                    event,
+                })
+                .collect();
+            let daemon = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                let mut opens = 0;
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    let Ok(frame) = aigentic_api::decode(&line) else {
+                        break;
+                    };
+                    let id = frame.id.unwrap_or(0);
+                    let Body::Request(request) = frame.body else {
+                        break;
+                    };
+                    let response = match request {
+                        Request::Hello { .. } => {
+                            // The live stream, as the runner writes it: the
+                            // ask, then its own answer, then the end.
+                            for notice in &notices {
+                                let frame = Frame::notice(notice.clone());
+                                write
+                                    .write_all(format!("{}\n", encode(&frame)).as_bytes())
+                                    .await
+                                    .unwrap();
+                            }
+                            Response::Welcome(Welcome {
+                                user: "steve".into(),
+                                projects: Vec::new(),
+                                server: "fake".into(),
+                            })
+                        }
+                        Request::Build { .. } => Response::Run {
+                            lead,
+                            resumed: true,
+                        },
+                        Request::Open { .. } => {
+                            opens += 1;
+                            Response::Opened {
+                                state: ThreadState::Idle,
+                                // The run starts with nothing behind it: what
+                                // the command knows of the ask comes live.
+                                events: if opens > 1 {
+                                    in_log.clone()
+                                } else {
+                                    Vec::new()
+                                },
+                                run: None,
+                                mode: "manual".into(),
+                                profile: None,
+                                model: "unknown".into(),
+                                effort: None,
+                            }
+                        }
+                        other => panic!("the command answered a checkpoint: {other:?}"),
+                    };
+                    let line = format!("{}\n", encode(&Frame::response(id, response)));
+                    write.write_all(line.as_bytes()).await.unwrap();
+                }
+            });
+
+            let (client, _) = Client::connect(&aigentic_api::client::Addr::Unix(socket), "steve")
+                .await
+                .unwrap();
+            let notices = client.take_notices().expect("the notice stream");
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let outcome = run(
+                &client,
+                notices,
+                "p",
+                "steve",
+                &BuildArgs {
+                    issue: 174,
+                    workflow: Some("loop".into()),
+                    json: false,
+                },
+                &mut out,
+                &mut err,
+            )
+            .await
+            .unwrap();
+            let err = String::from_utf8(err).unwrap();
+            if answered {
+                assert_eq!(outcome.code, EXIT_OK, "{err}");
+                assert_eq!(outcome.outcome, Some(RunOutcome::Closed), "{err}");
+                assert!(
+                    err.contains("checkpoint answered go") && err.contains("run finished"),
+                    "the answer and the end are both printed: {err}"
+                );
+            } else {
+                assert_eq!(outcome.code, EXIT_NEEDS_HUMAN, "{err}");
+                assert_eq!(
+                    outcome.reason.as_deref(),
+                    Some("waiting at checkpoint `decide`"),
+                    "{err}"
+                );
+            }
+            daemon.abort();
+        }
+    }
+
+    /// A gate asked a second time is open again: the answer to the earlier
+    /// ask does not stand for the later one, so the command leaves the run
+    /// to the person instead of waiting for events nobody will write.
+    #[tokio::test]
+    async fn a_re_asked_gate_is_not_answered_by_its_earlier_answer() {
+        use aigentic_api::{Body, Frame, Notice, ThreadState, Welcome, encode};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let lead = Ulid::generate();
+        let ask = |seq| {
+            event_at(
+                EventKind::CheckpointAsked,
+                seq,
+                lead,
+                serde_json::json!({
+                    "gate": "decide",
+                    "shown": ["read the spec check, then decide"],
+                    "options": ["go", "amend", "stop"],
+                }),
+            )
+        };
+        // The same gate asked a second time: the loop answered the first
+        // ask, and the second is a person's.
+        let live = vec![
+            ask(1),
+            event_at(
+                EventKind::CheckpointAnswered,
+                2,
+                lead,
+                serde_json::json!({"answer": "go", "amendment": null}),
+            ),
+            ask(3),
+        ];
+        // What the log holds while the second ask is live: nothing after it.
+        let in_log = live.clone();
+        // The read itself, on the same three events: the answer belongs to
+        // the first ask, so the second is open.
+        assert!(
+            !answered(&in_log, "decide"),
+            "an answer to the earlier ask does not answer the later one"
+        );
+        let notices: Vec<Notice> = live
+            .into_iter()
+            .map(|event| Notice::Event {
+                thread: lead,
+                event,
+            })
+            .collect();
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let mut opens = 0;
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let Ok(frame) = aigentic_api::decode(&line) else {
+                    break;
+                };
+                let id = frame.id.unwrap_or(0);
+                let Body::Request(request) = frame.body else {
+                    break;
+                };
+                let response = match request {
+                    Request::Hello { .. } => {
+                        for notice in &notices {
+                            let frame = Frame::notice(notice.clone());
+                            write
+                                .write_all(format!("{}\n", encode(&frame)).as_bytes())
+                                .await
+                                .unwrap();
+                        }
+                        Response::Welcome(Welcome {
+                            user: "steve".into(),
+                            projects: Vec::new(),
+                            server: "fake".into(),
+                        })
+                    }
+                    Request::Build { .. } => Response::Run {
+                        lead,
+                        resumed: true,
+                    },
+                    Request::Open { .. } => {
+                        opens += 1;
+                        Response::Opened {
+                            state: ThreadState::Idle,
+                            // The run starts with nothing behind it: what
+                            // the command knows of the asks comes live.
+                            events: if opens > 1 {
+                                in_log.clone()
+                            } else {
+                                Vec::new()
+                            },
+                            run: None,
+                            mode: "manual".into(),
+                            profile: None,
+                            model: "unknown".into(),
+                            effort: None,
+                        }
+                    }
+                    other => panic!("the command answered a checkpoint: {other:?}"),
+                };
+                let line = format!("{}\n", encode(&Frame::response(id, response)));
+                write.write_all(line.as_bytes()).await.unwrap();
+            }
+        });
+
+        let (client, _) = Client::connect(&aigentic_api::client::Addr::Unix(socket), "steve")
+            .await
+            .unwrap();
+        let notices = client.take_notices().expect("the notice stream");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run(
+                &client,
+                notices,
+                "p",
+                "steve",
+                &BuildArgs {
+                    issue: 174,
+                    workflow: Some("loop".into()),
+                    json: false,
+                },
+                &mut out,
+                &mut err,
+            ),
+        )
+        .await
+        .expect("the command returns at the second ask rather than waiting")
+        .expect("the command returns at the second ask");
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(
+            outcome.code, EXIT_NEEDS_HUMAN,
+            "the second ask waits for a person: {err}"
+        );
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some("waiting at checkpoint `decide`"),
+            "{err}"
+        );
+        daemon.abort();
+    }
+}

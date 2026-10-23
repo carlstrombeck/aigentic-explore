@@ -8,20 +8,42 @@
 //! `read_all` followed by `project`; a torn tail after a crash can be cut
 //! with [`ThreadLog::open_with`].
 
+mod decision_log;
 mod payload;
 mod projection;
+mod recall;
+mod run_state;
 mod store;
 
+pub use decision_log::{
+    DecisionFold, DecisionRecord, RecordedAnswer, decision_records, declined_at_startup,
+};
 pub use payload::{
-    AssistantMessagePayload, CompactedPayload, CompactionStrategy, ContextEvictedPayload,
-    ContextSaturatedPayload, DecisionScope, InterruptedPayload, Invoker, MemoryExtractedPayload,
-    MemoryLine, MemoryRememberedPayload, PermissionDecidedPayload, PermissionRequestedPayload,
-    PinnedPayload, PolicyRecord, ProjectSwitchedPayload, ProviderRetriedPayload,
-    SkillLoadedPayload, ThreadRenamedPayload, ThreadStartedPayload, ToolResultPayload,
-    TurnEndedPayload, Usage, UserMessagePayload,
+    AssistantMessagePayload, BriefRefreshedPayload, BudgetRaisedPayload, BudgetScope,
+    BudgetWarnedPayload, CheckOutcome, CheckResult, CheckpointAnswer, CheckpointAnsweredPayload,
+    CheckpointAskedPayload, ChecksRunPayload, CommitRef, CompactedPayload, CompactionStrategy,
+    ContextEvictedPayload, ContextSaturatedPayload, Decide, DecideItem, DecideItemKind,
+    DecideOption, DecideProposal, DecisionAnswer, DecisionAnsweredPayload, DecisionKind,
+    DecisionProposedPayload, DecisionScope, DecisionStage, Finding, FindingMark, FixSize, Handoff,
+    InterruptedPayload, Invoker, JobFinishedPayload, JobOutcome, JobProposed, LedgerEntry,
+    LedgerStatus, MemoryExtractedPayload, MemoryHome, MemoryLine, MemoryRememberedPayload,
+    PermissionDecidedPayload, PermissionRequestedPayload, PinnedPayload, PlannedTest, PolicyRecord,
+    ProjectSwitchedPayload, ProviderRetriedPayload, PushedPayload, ReleaseImpact, ReportStatus,
+    ResultsStubbedPayload, RevealMark, Route, RouteTakenPayload, RunErroredPayload,
+    RunFinishedPayload, RunOutcome, RunStartedPayload, STARTUP_PREFIX, SkillLoadedPayload,
+    StepFinishedPayload, StepReport, StepStartedPayload, StepStatus, ThreadRenamedPayload,
+    ThreadStartedPayload, ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload, Verdict,
+    is_startup_call,
 };
 pub use projection::{
-    Projection, STUB_ARG_MAX_CHARS, project, project_body, shorten_call_args, skill_marker,
-    summary_marker, truncate_middle,
+    Projection, STUB_ARG_MAX_CHARS, job_marker, project, project_body, shorten_call_args,
+    skill_marker, summary_marker, truncate_middle,
+};
+pub use recall::{
+    Hit, SNIPPET_MAX_CHARS, call_index, call_of, kind_name, project_at, render_range, search,
+    short_args,
+};
+pub use run_state::{
+    BUDGET_GATE, ChecksOutcome, NextMove, RunState, STEP_STOP, StepRecord, run_state,
 };
 pub use store::{LogError, NewEvent, Repair, ThreadLog};

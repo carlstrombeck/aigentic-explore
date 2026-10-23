@@ -20,12 +20,12 @@ walkdir.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 ulid.workspace = true
 
 [dev-dependencies]
 futures-core.workspace = true
 nix.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 schemars.workspace = true

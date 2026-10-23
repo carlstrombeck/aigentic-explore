@@ -11,15 +11,18 @@
 //! from the actor's mirror of the log. What needs the runtime itself
 //! (pin, compact, set the mode, a report) waits for the turn to end.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use aigentic_api::{AskedOption, AskedQuestion, Notice, ReportKind, Response, ThreadState};
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
-use aigentic_runtime::aigentic_log::{PermissionRequestedPayload, UserMessagePayload};
+use aigentic_runtime::aigentic_log::{
+    JobFinishedPayload, PermissionRequestedPayload, UserMessagePayload, declined_at_startup,
+};
 use aigentic_runtime::{
-    ASKED_HUMAN, Answered, CancelToken, Decisions, Mode, Outbox, Pending, Queued, Resumed, Runtime,
-    RuntimeError, Signal, TurnOutcome, WindowUsage, inbox,
+    ASKED_HUMAN, Answered, CancelToken, Decisions, IdleProposal, Mode, Outbox, Pending, Queued,
+    Resumed, Runtime, RuntimeError, Settled, Signal, SwitchAnswer, SwitchCtx, TurnOutcome,
+    WindowUsage, inbox,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -62,6 +65,16 @@ pub enum Mail {
         text: String,
         reply: oneshot::Sender<Response>,
     },
+    /// A person's answer to a `suggest_project` proposal (issue #7). A
+    /// `yes` carries the target's context and the ack the session waits
+    /// on; every other answer carries `SwitchCtx::none()`.
+    AnswerSwitch {
+        by: Author,
+        call_id: String,
+        answer: SwitchAnswer,
+        ctx: SwitchCtx,
+        reply: oneshot::Sender<Response>,
+    },
     Pin {
         author: Author,
         text: String,
@@ -83,6 +96,28 @@ pub enum Mail {
         by: Author,
         reply: oneshot::Sender<Response>,
     },
+    /// Offer to switch the thread to `project` while it is idle (issue
+    /// #92): the start-up proposal. Refused, writing nothing, when one
+    /// is already waiting, when a turn is running, or when `project`
+    /// has already been declined at start-up. Otherwise the proposal's
+    /// `decision_proposed` is appended and the thread waits.
+    ProposeSwitch {
+        project: String,
+        reason: String,
+        reply: oneshot::Sender<Response>,
+    },
+    /// Record the start-up ask's answer (issue #121): the person was
+    /// asked which project to work in before anything was open, and the
+    /// pair — a `project` proposal and its answer — is written back to
+    /// back through the real observer, with no state waiting and no
+    /// keep-awake guard. Idle only, like every other writer.
+    RecordStartupAsk {
+        offered: String,
+        chosen: String,
+        reason: String,
+        by: Author,
+        reply: oneshot::Sender<Response>,
+    },
     Compact {
         reply: oneshot::Sender<Response>,
     },
@@ -93,6 +128,21 @@ pub enum Mail {
     Report {
         kind: ReportKind,
         reply: oneshot::Sender<Response>,
+    },
+    /// A job this thread approved has ended: append its `job_finished`,
+    /// then reply. Taken idle and mid-turn; mid-turn it is written when
+    /// the turn ends, since only the turn may write while it runs.
+    JobFinished {
+        payload: JobFinishedPayload,
+        reply: oneshot::Sender<Response>,
+    },
+    /// A notice from a job this thread approved, for this thread's
+    /// subscribers: broadcast as `Notice::Job`, never written, so it is
+    /// taken idle and mid-turn alike.
+    JobNotice {
+        job: Ulid,
+        number: u32,
+        notice: Notice,
     },
     /// The state now, for the table's idle sweep.
     Status {
@@ -109,6 +159,11 @@ pub enum Mail {
         reply: oneshot::Sender<(ThreadState, Vec<Event>, String, Identity)>,
     },
 }
+
+/// Names the workspace a project sits in, for the switch notice (issue
+/// #7). The table's `workspace_label`, as a seam so the actor is built
+/// with it and tests can pass one of their own.
+pub type WorkspaceLabel = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// Who the thread runs as: the profile, its model and its effort
 /// label, carried on `Subscribe` so a client's footer can name them
@@ -162,6 +217,24 @@ struct Shared {
     /// The last window fill the runtime reported, re-sent when the queue
     /// changes or the turn ends so a status line stays current.
     last_usage: Mutex<Option<WindowUsage>>,
+    /// Names the workspace a project sits in (issue #7), handed in when
+    /// the actor is built: the table's `workspace_label`, so the actor
+    /// never re-derives it. An `AwaitingSwitch` state carries it.
+    labels: WorkspaceLabel,
+    /// Set when the running turn switched the thread's project (issue
+    /// #7): `after_turn` announces the new identity once, as an idle
+    /// switch does.
+    switched: Mutex<bool>,
+    /// The daemon's working count: the usage line carries
+    /// it, and a change wakes the loop so every open thread re-pushes
+    /// that line.
+    working: crate::runs::Working,
+    /// The table that opened this actor, weak because the table owns it.
+    /// A job a person approves in a turn is started through it; a handle
+    /// that no longer upgrades is a daemon shutting down.
+    store: Mutex<Weak<crate::threads::ThreadTable>>,
+    /// Job returns that arrived mid-turn, written when the turn ends.
+    job_notes: Mutex<Vec<(JobFinishedPayload, oneshot::Sender<Response>)>>,
     /// The keep-awake guard and whether a hold is outstanding (issue
     /// #47), under one lock. `held` keeps hold and release paired, so a
     /// turn interrupted while it was waiting cannot release twice, and
@@ -228,8 +301,18 @@ impl Shared {
         self.guard.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Take the switch flag `after_turn` reads (issues #7, #92). A switch
+    /// settled outside a turn must announce its identity and clear this
+    /// itself, since `after_turn` never runs for it.
+    fn take_switched(&self) -> bool {
+        std::mem::take(&mut *self.switched.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// `Notice::Usage` from the last fill, the turn's elapsed time and
     /// the queue; nothing until the first model call reported a fill.
+    /// The fill and the thread figure (issue #99) are the last model
+    /// call's: a queue change or a turn's end re-sends them, not a fresh
+    /// count, so `thread` can trail a message just queued by one push.
     fn push_usage(&self) {
         let Some(usage) = *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) else {
             return;
@@ -242,6 +325,19 @@ impl Shared {
             window: usage.window,
             turn_elapsed_ms: started.map(|t| t.elapsed().as_millis() as u64),
             queued,
+            thread_tokens: Some(usage.thread_tokens),
+            working: self.working.count(),
+        });
+    }
+
+    /// Pass a job's own notice to this thread's subscribers, tagged with
+    /// the job.
+    fn forward_job(&self, job: Ulid, number: u32, notice: Notice) {
+        self.broadcast(Notice::Job {
+            thread: self.thread,
+            job,
+            number,
+            notice: Box::new(notice),
         });
     }
 
@@ -321,12 +417,19 @@ impl Shared {
                         self.push_usage();
                     }
                 }
+                // A switch inside the turn (issue #7) rebinds the
+                // provider and the profile; `after_turn` announces it.
+                if event.kind == EventKind::ProjectSwitched {
+                    *self.switched.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                }
                 // A decision or a result ends a wait.
                 let waiting = !matches!(self.state(), ThreadState::Running { .. });
                 if waiting
                     && matches!(
                         event.kind,
-                        EventKind::PermissionDecided | EventKind::ToolResult
+                        EventKind::PermissionDecided
+                            | EventKind::ToolResult
+                            | EventKind::DecisionAnswered
                     )
                 {
                     self.running(turn_by.clone());
@@ -348,6 +451,29 @@ impl Shared {
                 thread: self.thread,
                 call: call.clone(),
             }),
+            Signal::JobApproved {
+                task,
+                brief,
+                read_only,
+                by,
+                mode,
+            } => {
+                let table = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .upgrade();
+                if let Some(table) = table {
+                    let approved = crate::jobs::Approved {
+                        by: by.clone(),
+                        task: task.to_owned(),
+                        brief: brief.to_owned(),
+                        read_only,
+                        mode,
+                    };
+                    tokio::spawn(crate::jobs::start(table, self.thread, approved));
+                }
+            }
             // A wait is not work: a person may take minutes, and the
             // machine must be free to sleep meanwhile (issue #47).
             Signal::Waiting(pending) => {
@@ -366,6 +492,16 @@ impl Shared {
                             reason,
                         }
                     }
+                    Pending::Switch {
+                        call_id,
+                        project,
+                        reason,
+                    } => ThreadState::AwaitingSwitch {
+                        call_id: call_id.clone(),
+                        project: project.clone(),
+                        workspace: (self.labels)(project),
+                        reason: reason.clone(),
+                    },
                     Pending::Human {
                         call_id,
                         question,
@@ -414,6 +550,18 @@ pub struct ThreadActor {
     rx: mpsc::UnboundedReceiver<Mail>,
     /// A `Compact` taken while idle runs after the mail loop yields.
     pending_compact: Option<oneshot::Sender<Response>>,
+    /// The idle start-up proposal waiting for an answer (issue #92):
+    /// its call id, the `decision_proposed` event, and the project it
+    /// offers. `None` when nothing is waiting.
+    idle_switch: Option<IdleSwitch>,
+}
+
+/// An idle start-up switch proposal and the answer `AnswerSwitch` must
+/// name to settle it (issue #92).
+struct IdleSwitch {
+    call_id: String,
+    proposal: Ulid,
+    project: String,
 }
 
 /// The sending side of an actor's mailbox. Cloned per session.
@@ -427,6 +575,8 @@ impl ThreadActor {
         mut runtime: Runtime,
         torn: Option<u64>,
         reports: Arc<dyn Reports>,
+        labels: WorkspaceLabel,
+        working: crate::runs::Working,
     ) -> Result<(Self, Mailbox), aigentic_runtime::RuntimeError> {
         let decisions = Arc::new(Decisions::new());
         runtime = runtime.with_decisions(decisions.clone());
@@ -443,6 +593,11 @@ impl ThreadActor {
             last_queued_by: Mutex::new(None),
             mode: Mutex::new(runtime.mode().name().to_owned()),
             identity: Mutex::new(runtime.identity()),
+            labels,
+            working: working.clone(),
+            switched: Mutex::new(false),
+            store: Mutex::new(Weak::new()),
+            job_notes: Mutex::new(Vec::new()),
             guard: Mutex::new(Hold {
                 guard: Arc::new(crate::awake::ProcessGuard::off()),
                 held: false,
@@ -457,6 +612,7 @@ impl ThreadActor {
             reports,
             rx,
             pending_compact: None,
+            idle_switch: None,
         };
         actor.resume(torn)?;
         Ok((actor, tx))
@@ -475,6 +631,41 @@ impl ThreadActor {
             waiting: false,
         };
         self
+    }
+
+    /// Hand the actor the table that opened it, so a job approved in one
+    /// of its turns can be started.
+    pub fn with_store(self, store: Weak<crate::threads::ThreadTable>) -> Self {
+        *self.shared.store.lock().unwrap_or_else(|e| e.into_inner()) = store;
+        self
+    }
+
+    /// Append a job's return through the runtime, and say how it went. A
+    /// return this thread already holds for the same job is not written
+    /// again: a driver and the start-up repair may both reach here.
+    fn write_job_note(&mut self, payload: JobFinishedPayload, reply: oneshot::Sender<Response>) {
+        let held = crate::jobs::returned(
+            &self.shared.events.lock().unwrap_or_else(|e| e.into_inner()),
+            payload.job_thread,
+        );
+        if held {
+            let _ = reply.send(Response::Ok);
+            return;
+        }
+        let shared = self.shared.clone();
+        let sys = Author::System;
+        let written = self.runtime.append_note(
+            EventKind::JobFinished,
+            Author::System,
+            serde_json::to_value(payload).expect("job_finished serialises"),
+            &mut |s| shared.observe(s, &sys),
+        );
+        let _ = reply.send(match written {
+            Ok(_) => Response::Ok,
+            Err(e) => Response::Error {
+                message: e.to_string(),
+            },
+        });
     }
 
     /// Phase 2's resume: repair events are appended (and mirrored) and,
@@ -523,14 +714,23 @@ impl ThreadActor {
             self.turn(Start::Continue(Author::System)).await;
         }
         loop {
-            let Some(mail) = self.rx.recv().await else {
-                break;
-            };
-            if let Some(start) = self.handle_idle(mail) {
-                self.turn(start).await;
-            }
-            if let Some(reply) = self.pending_compact.take() {
-                self.compact(reply).await;
+            tokio::select! {
+                mail = self.rx.recv() => {
+                    let Some(mail) = mail else {
+                        break;
+                    };
+                    if let Some(start) = self.handle_idle(mail).await {
+                        self.turn(start).await;
+                    }
+                    if let Some(reply) = self.pending_compact.take() {
+                        self.compact(reply).await;
+                    }
+                }
+                // A build elsewhere in the daemon started, parked or
+                // ended: this thread's line carries the new count. A
+                // thread that has had no model call pushes nothing
+                // (`push_usage`'s own guard).
+                () = self.shared.working.changed() => self.shared.push_usage(),
             }
         }
     }
@@ -555,7 +755,11 @@ impl ThreadActor {
     }
 
     /// Mail while idle. Returns a turn to start, if the mail starts one.
-    fn handle_idle(&mut self, mail: Mail) -> Option<Start> {
+    ///
+    /// Async since issue #92: raising, answering and withdrawing a
+    /// start-up proposal goes through the async runtime and appends
+    /// events.
+    async fn handle_idle(&mut self, mail: Mail) -> Option<Start> {
         match mail {
             Mail::Post {
                 author,
@@ -563,6 +767,8 @@ impl ThreadActor {
                 reply,
                 ..
             } => {
+                self.withdraw_idle_switch("a message was sent instead")
+                    .await;
                 let _ = reply.send(Response::Ok);
                 Some(Start::Post(author, blocks))
             }
@@ -572,6 +778,7 @@ impl ThreadActor {
                 args,
                 reply,
             } => {
+                self.withdraw_idle_switch("a skill was run instead").await;
                 let _ = reply.send(Response::Ok);
                 Some(Start::Skill(author, name, args))
             }
@@ -579,6 +786,60 @@ impl ThreadActor {
                 let _ = reply.send(Response::Refused {
                     reason: format!("nothing is pending for call {call_id}"),
                 });
+                None
+            }
+            Mail::AnswerSwitch {
+                by,
+                call_id,
+                answer,
+                ctx,
+                reply,
+            } => {
+                self.answer_idle_switch(by, call_id, answer, ctx, reply)
+                    .await;
+                None
+            }
+            Mail::ProposeSwitch {
+                project,
+                reason,
+                reply,
+            } => {
+                self.propose_switch_idle(project, reason, reply).await;
+                None
+            }
+            Mail::RecordStartupAsk {
+                offered,
+                chosen,
+                reason,
+                by,
+                reply,
+            } => {
+                let shared = self.shared.clone();
+                let sys = Author::System;
+                let _ = reply.send(
+                    match self.runtime.record_startup_ask(
+                        &offered,
+                        &chosen,
+                        &reason,
+                        by,
+                        &mut |s| shared.observe(s, &sys),
+                    ) {
+                        Ok(()) => {
+                            // `observe` reads the answered event as the
+                            // end of a wait and puts the guard up, but no
+                            // turn runs here: nothing would take it down,
+                            // so do it here, the way `answer_idle_switch`
+                            // does after an idle answer (#47).
+                            shared.set_state(ThreadState::Idle);
+                            shared.take_switched();
+                            shared.drop_guard();
+                            Response::Ok
+                        }
+                        Err(e) => Response::Error {
+                            message: e.to_string(),
+                        },
+                    },
+                );
                 None
             }
             Mail::Pin {
@@ -642,6 +903,8 @@ impl ThreadActor {
                 None
             }
             Mail::SwitchProject { ctx, by, reply } => {
+                self.withdraw_idle_switch("the project was switched by hand")
+                    .await;
                 let shared = self.shared.clone();
                 let sys = Author::System;
                 let sent = match self
@@ -702,11 +965,171 @@ impl ThreadActor {
                 self.subscribe(from_seq, notices, reply);
                 None
             }
+            Mail::JobFinished { payload, reply } => {
+                self.write_job_note(payload, reply);
+                None
+            }
+            Mail::JobNotice {
+                job,
+                number,
+                notice,
+            } => {
+                self.shared.forward_job(job, number, notice);
+                None
+            }
             Mail::Status { reply } => {
                 let _ = reply.send(self.shared.state());
                 None
             }
         }
+    }
+
+    /// Raise the start-up switch proposal while idle (issue #92), as
+    /// `Mail::ProposeSwitch` asks. Refused, writing nothing, when one is
+    /// already waiting, when a turn is running, or when `project` has
+    /// been declined at start-up before. The proposal goes through the
+    /// real observer, so the thread's events and its subscribers learn
+    /// of it as they would of any write.
+    async fn propose_switch_idle(
+        &mut self,
+        project: String,
+        reason: String,
+        reply: oneshot::Sender<Response>,
+    ) {
+        if self.idle_switch.is_some() {
+            let _ = reply.send(Response::Refused {
+                reason: "a proposal is already waiting".into(),
+            });
+            return;
+        }
+        if !matches!(self.shared.state(), ThreadState::Idle) {
+            let _ = reply.send(Response::Refused {
+                reason: "a turn is running".into(),
+            });
+            return;
+        }
+        let declined = declined_at_startup(
+            &self.shared.events.lock().unwrap_or_else(|e| e.into_inner()),
+            &project,
+        );
+        if declined {
+            let _ = reply.send(Response::Refused {
+                reason: "declined before".into(),
+            });
+            return;
+        }
+        let shared = self.shared.clone();
+        let sys = Author::System;
+        let proposed = self
+            .runtime
+            .propose_switch_idle(&project, &reason, &mut |s| shared.observe(s, &sys))
+            .await;
+        match proposed {
+            Ok(IdleProposal { call_id, proposal }) => {
+                let waiting = IdleSwitch {
+                    call_id,
+                    proposal,
+                    project,
+                };
+                // The waiting proposal drives the state it raises: its
+                // own call id and project, not the mail's copy.
+                let state = ThreadState::AwaitingSwitch {
+                    call_id: waiting.call_id.clone(),
+                    project: waiting.project.clone(),
+                    workspace: (self.shared.labels)(&waiting.project),
+                    reason,
+                };
+                self.idle_switch = Some(waiting);
+                self.shared.set_state(state);
+                let _ = reply.send(Response::Ok);
+            }
+            Err(e) => {
+                let _ = reply.send(Response::Error {
+                    message: e.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Settle the waiting start-up proposal (issue #92), as
+    /// `Mail::AnswerSwitch` asks while idle. A `call_id` that names no
+    /// waiting proposal keeps the old refusal.
+    async fn answer_idle_switch(
+        &mut self,
+        by: Author,
+        call_id: String,
+        answer: SwitchAnswer,
+        ctx: SwitchCtx,
+        reply: oneshot::Sender<Response>,
+    ) {
+        let matches = self
+            .idle_switch
+            .as_ref()
+            .is_some_and(|w| w.call_id == call_id);
+        if !matches {
+            let _ = reply.send(Response::Refused {
+                reason: format!("nothing is pending for call {call_id}"),
+            });
+            return;
+        }
+        let proposal = self
+            .idle_switch
+            .as_ref()
+            .map(|w| w.proposal)
+            .expect("checked above");
+        let shared = self.shared.clone();
+        let sys = Author::System;
+        let settled = self
+            .runtime
+            .answer_switch_idle(proposal, answer, by, ctx, &mut |s| shared.observe(s, &sys))
+            .await;
+        // The proposal is no longer waiting whatever the outcome: clear
+        // it and return to idle, releasing the keep-awake hold the way
+        // `after_turn` would (#47), since no turn runs here.
+        self.idle_switch = None;
+        self.shared.set_state(ThreadState::Idle);
+        self.shared.take_switched();
+        self.shared.drop_guard();
+        match settled {
+            Ok(Settled::Switched) => {
+                // The project changed with no turn to announce it.
+                self.announce_identity();
+                let _ = reply.send(Response::Ok);
+            }
+            Ok(_) => {
+                let _ = reply.send(Response::Ok);
+            }
+            Err(e) => {
+                let _ = reply.send(Response::Error {
+                    message: e.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Withdraw a waiting start-up proposal before a mail that would
+    /// otherwise leave it unanswered (issue #92). Always clears it: a
+    /// withdrawal that fails, because another path already answered,
+    /// only loses the note, never the mail that withdrew it.
+    async fn withdraw_idle_switch(&mut self, note: &str) {
+        let Some(waiting) = self.idle_switch.take() else {
+            return;
+        };
+        let shared = self.shared.clone();
+        let sys = Author::System;
+        let _ = self
+            .runtime
+            .answer_switch_idle(
+                waiting.proposal,
+                SwitchAnswer::Withdrawn(note.to_owned()),
+                Author::System,
+                SwitchCtx::none(),
+                &mut |s| shared.observe(s, &sys),
+            )
+            .await;
+        self.shared.set_state(ThreadState::Idle);
+        self.shared.take_switched();
+        self.shared.drop_guard();
     }
 
     fn subscribe(
@@ -817,6 +1240,16 @@ impl ThreadActor {
                 .take();
             next = self.after_turn(outcome, last_poster);
         }
+        let notes = std::mem::take(
+            &mut *self
+                .shared
+                .job_notes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for (payload, reply) in notes {
+            self.write_job_note(payload, reply);
+        }
         *self
             .shared
             .started
@@ -874,6 +1307,22 @@ impl ThreadActor {
                 }
             }
             Err(_) => note(&self.shared, "memory extraction timed out".into()),
+        }
+        // The brief is written only after the whole reply, so a timeout
+        // drops the call before anything reaches the file.
+        match tokio::time::timeout(
+            SIDE_JOB_LIMIT,
+            self.runtime.refresh_project_brief(&mut observe),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(ref e)) => {
+                if let Some(text) = Self::side_job_note("brief refresh", e) {
+                    note(&self.shared, text);
+                }
+            }
+            Err(_) => note(&self.shared, "brief refresh timed out".into()),
         }
         match tokio::time::timeout(SIDE_JOB_LIMIT, self.runtime.title_if_untitled(&mut observe))
             .await
@@ -960,6 +1409,26 @@ impl ThreadActor {
                     },
                 );
             }
+            Mail::AnswerSwitch {
+                by,
+                call_id,
+                answer,
+                ctx,
+                reply,
+            } => {
+                // A refused decide hands the context back by dropping
+                // it, which closes the ack: the session reads that as
+                // "the turn left" and never waits for a context that
+                // cannot arrive.
+                let _ = reply.send(
+                    match decisions.decide(&call_id, Answered::Switch { answer, by, ctx }) {
+                        Ok(()) => Response::Ok,
+                        Err(e) => Response::Refused {
+                            reason: e.to_string(),
+                        },
+                    },
+                );
+            }
             Mail::Subscribe {
                 from_seq,
                 notices,
@@ -991,6 +1460,18 @@ impl ThreadActor {
             Mail::Status { reply } => {
                 let _ = reply.send(shared.state());
             }
+            Mail::JobFinished { payload, reply } => {
+                shared
+                    .job_notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((payload, reply));
+            }
+            Mail::JobNotice {
+                job,
+                number,
+                notice,
+            } => shared.forward_job(job, number, notice),
             Mail::Interrupt { by, reply } => {
                 cancel.cancel(by);
                 let _ = reply.send(Response::Ok);
@@ -1004,6 +1485,8 @@ impl ThreadActor {
             | Mail::Remember { reply, .. }
             | Mail::Rename { reply, .. }
             | Mail::SwitchProject { reply, .. }
+            | Mail::ProposeSwitch { reply, .. }
+            | Mail::RecordStartupAsk { reply, .. }
             | Mail::Compact { reply }
             | Mail::SetMode { reply, .. }
             | Mail::Report { reply, .. } => {
@@ -1024,6 +1507,18 @@ impl ThreadActor {
         outcome: Result<TurnOutcome, aigentic_runtime::RuntimeError>,
         last_poster: Option<Author>,
     ) -> Option<Start> {
+        // A turn that switched the thread's project (issue #7) may run
+        // a different model now: tell the subscribers, as an idle switch
+        // does, before the continuation.
+        if std::mem::take(
+            &mut *self
+                .shared
+                .switched
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        ) {
+            self.announce_identity();
+        }
         let queued = *self.shared.queued.lock().unwrap_or_else(|e| e.into_inner());
         match outcome {
             Ok(o) if o.reason == ASKED_HUMAN => {

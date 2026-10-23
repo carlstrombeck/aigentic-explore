@@ -2,38 +2,157 @@
 //! use, unloaded after an idle period with no open sessions and nothing
 //! waited for. The log is the state, so unloading loses nothing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use aigentic_api::{ThreadInfo, ThreadState};
-use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind};
+use aigentic_api::{
+    CheckpointAnswer, JobRow, Notice, ReportKind, StartRow, ThreadInfo, ThreadKind, ThreadState,
+};
+use aigentic_runtime::ProjectFile;
+use aigentic_runtime::ProjectRow;
+use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind, RiskClass, UserId};
 use aigentic_runtime::aigentic_log::{
-    NewEvent, ThreadLog, ThreadStartedPayload, UserMessagePayload,
+    NewEvent, ProjectSwitchedPayload, Repair, RunStartedPayload, ThreadLog, ThreadStartedPayload,
+    UserMessagePayload,
 };
 use aigentic_runtime::aigentic_policy::Participants;
-use aigentic_runtime::{Project, ProjectFile};
+use aigentic_runtime::workflow::WorkflowFile;
+use aigentic_runtime::{JobSpec, Mode};
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::oneshot;
-use ulid::Ulid;
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
+use ulid::{Generator, Ulid};
 
 use crate::actor::{Mail, Mailbox, Reports, ThreadActor};
+use crate::auth;
 use crate::awake::KeepAwake;
 use crate::build::{BuildError, ProviderFactory, Root, build_thread, project_context};
 use crate::config::{Config, ServerConfig};
-use crate::workspaces::Workspace;
+use crate::listing::{Listed, projects_listing};
+use crate::migrate::Migrated;
+use crate::runs::{Answer, Claim, IssueLock, ProdDeps, RunDeps, RunWorld, Runs, drive};
+use crate::session::role_in_project;
+use crate::skills::SkillPaths;
+use crate::workspaces::{Workspace, project_name, workspace_of};
 
-/// Threads of a root without a project file.
-pub const NO_PROJECT_DIR: &str = "_none";
+/// The project name a pre-phase-6 log wrote for a root with no project
+/// file, when the per-project directory was the index. #9 dropped the
+/// stand-in name — a bare root is named by `project_name_at` now — but a
+/// log already written still says this, so the index must know it.
+const LEGACY_NONE_PROJECT: &str = "_none";
+
+/// The workflow a `Build` runs when the request names none (issue #58):
+/// the bundled build workflow, the one the acceptance uses.
+pub const DEFAULT_WORKFLOW: &str = "build";
 
 struct Entry {
     mailbox: Mailbox,
     project: String,
+    /// Who started the thread, from its log's `thread_started` (issue
+    /// #81): the listing is theirs, so someone else opening the thread
+    /// sees the same one. `None` for a thread an agent started — a
+    /// build's or a step's child — which gets no block.
+    creator: Option<UserId>,
     /// Sessions that opened it and have not closed.
     open: usize,
     /// When the last session closed, for the idle clock.
     idle_since: Instant,
+}
+
+/// One thread, as its log says it is (issue #9). The per-project
+/// directory used to be the index; now the log is, and this is what a
+/// daemon start reads out of it.
+#[derive(Debug, Clone)]
+pub struct Indexed {
+    /// Where its log lives: `<base>/<id>.jsonl`, or `<base>/<project>/`
+    /// while a held lead waits for a later start.
+    pub dir: PathBuf,
+    /// The project the log says the thread is in, canonicalised for a
+    /// pre-phase-6 `_none` thread.
+    pub home: Option<String>,
+    /// The last `project_switched.to`.
+    pub switched: Option<String>,
+    /// `project_switched.root` (issue #88): the root of the project a
+    /// switch moved the thread to, as the log has it. A live switch
+    /// refreshes it through `note_project`, so it is the daemon's root
+    /// for the name while the switch runs and the log's root after a
+    /// restart. `None` for an index built before the field existed.
+    pub switched_root: Option<PathBuf>,
+    /// `thread_started.root`.
+    pub root: Option<PathBuf>,
+    /// Who started it, a person only, filled only where it is read.
+    pub creator: Option<UserId>,
+    /// The run this thread is part of, if any.
+    pub run: RunThread,
+    /// A line promised a `run_started` and wasn't: its issue is unknown.
+    pub torn_run: bool,
+    /// `thread_started.front` (issue #84): the person's front thread,
+    /// the newest of which plain `aigentic` reopens.
+    pub front: bool,
+}
+
+/// A brief's one-liner as the cache holds it (issue #123): the file's
+/// mtime when it was read, and the line — `None` when the project has no
+/// brief, which is worth caching too.
+type CachedBrief = (Option<SystemTime>, Option<String>);
+
+/// The daemon's thread ids, from one source per process.
+///
+/// Every id is greater than the one before it, so the greatest id in a
+/// base is the newest thread there — the rule `latest_front` and
+/// `front_root` judge by.
+pub struct Ids {
+    source: Mutex<Source>,
+}
+
+enum Source {
+    /// The clock through a monotone generator: within one millisecond the
+    /// random part counts up, so two ids made together still have an order.
+    Live(Generator),
+    /// Always `at`, with the random part counting from 1: a test pins the
+    /// millisecond with this so two threads land in one and still differ.
+    Fixed { at: u64, next: u64 },
+}
+
+impl Ids {
+    /// A source that reads the clock: what a daemon builds.
+    pub fn live() -> Self {
+        Self {
+            source: Mutex::new(Source::Live(Generator::new())),
+        }
+    }
+
+    /// A source frozen at `millisecond`, whose ids count up from 1.
+    pub fn fixed(millisecond: u64) -> Self {
+        Self {
+            source: Mutex::new(Source::Fixed {
+                at: millisecond,
+                next: 1,
+            }),
+        }
+    }
+
+    /// The next thread id: greater than every id this source gave out.
+    pub(crate) fn next(&self) -> Ulid {
+        let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
+        match &mut *source {
+            Source::Live(generator) => match generator.generate() {
+                Ok(id) => id,
+                // The 80-bit random part would have to wrap inside one
+                // millisecond (about 10^24 ids). The crate's recovery moves
+                // to the next millisecond, which is still greater than the
+                // id before it.
+                Err(overflow) => overflow.commit_overflow_random(),
+            },
+            Source::Fixed { at, next } => {
+                let id = Ulid::from_parts(*at, u128::from(*next));
+                *next += 1;
+                id
+            }
+        }
+    }
 }
 
 /// The table, shared by every session.
@@ -53,9 +172,47 @@ pub struct ThreadTable {
     workspaces: Vec<Workspace>,
     /// The daemon's one keep-awake guard (issue #47). Every thread's
     /// actor gets a clone of it, so one program holds the machine awake
-    /// for the whole daemon however many threads work at once.
-    guard: Arc<dyn KeepAwake>,
+    /// for the whole daemon however many threads work at once. A run's
+    /// task holds it too, while it advances. Swapped under a lock so a
+    /// test can install a recording guard, as `with_run_deps` swaps the
+    /// world's seams.
+    guard: Mutex<Arc<dyn KeepAwake>>,
+    /// The source of every thread id this daemon makes, the person's
+    /// threads and a run's children alike. Swapped under a lock for the
+    /// same reason as the guard: a test pins the millisecond with
+    /// [`Ids::fixed`] and then drives the daemon through `Server::new`.
+    ids: Mutex<Arc<Ids>>,
+    /// Which runs a task drives, and who watches them (issue #58). It
+    /// hangs off the table because a session sees nothing but the table
+    /// and the config.
+    runs: Arc<Runs>,
+    /// The forge, installer and repo a run drives. Production's are the
+    /// real ones; the tests install their own through `with_run_deps`,
+    /// which is why this is swapped under a lock rather than at build
+    /// time: a test drives a daemon the way a client does, through
+    /// `Server::new`.
+    run_deps: Mutex<Arc<dyn RunDeps>>,
+    /// How often a job's driver looks at its child, and how long it lets
+    /// one run before stopping it: [`crate::jobs::JOB_TICK`] and
+    /// [`crate::jobs::JOB_DEADLINE`] unless a test installed its own.
+    job_limits: Mutex<(Duration, Duration)>,
+    /// Each project's brief one-liner, by root and the mtime it was read
+    /// at (issue #123). A `stat` per project per build or switch is
+    /// cheap; a read happens only when the file changed, and `None` — no
+    /// brief — is cached too.
+    brief_cache: Mutex<HashMap<PathBuf, CachedBrief>>,
+    /// Serialises the "is there an unfinished run for this issue?" check
+    /// and the lead it creates under it within this process; the issue's
+    /// OS lock ([`IssueLock`]) does the same across processes.
+    build_lock: AsyncMutex<()>,
     entries: Mutex<HashMap<Ulid, Entry>>,
+    /// Which project and which directory each thread is in, read from
+    /// the logs at start-up and kept in step as threads are made and
+    /// switch (issue #9). A miss is a cache miss, never "no thread".
+    index: Mutex<HashMap<Ulid, Indexed>>,
+    /// What `migrate` did at start-up: the move's counts, or why it
+    /// failed. Kept for tests and a later `doctor` (issue #9).
+    migrated: Mutex<Result<Migrated, String>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,8 +229,99 @@ pub enum ThreadError {
     Runtime(#[from] aigentic_runtime::RuntimeError),
     #[error("the thread's actor is gone")]
     Gone,
+    #[error("no run in thread {0}: its log holds no `run_started`")]
+    NotARun(Ulid),
+    #[error("workflow: {0}")]
+    Workflow(#[from] aigentic_runtime::workflow::WorkflowError),
     #[error("{0}")]
     Refused(String),
+}
+
+/// The rows `[project] related` adds, and one warning for every entry
+/// that does not resolve. An entry is `<workspace>/<project>`; it
+/// resolves to the first root the named workspace lists under that
+/// project name, found through `project_name` — the rule the block, the
+/// roster and `read_brief` all use — never through the daemon's merged
+/// list, where one name can shadow another root.
+///
+/// Nothing here fails a build: a miss is a warning. An entry naming a
+/// root the thread already understands (its own, or one of its
+/// workspace) is skipped so a project never carries two names; a root an
+/// earlier entry resolved is a duplicate; and the creator's role is read
+/// from the resolved root, `None` meaning the entry does not resolve —
+/// `related` declares a link, it never grants a role.
+fn related_in_reach(
+    rows: &[Listed],
+    workspaces: &[Workspace],
+    related: &[String],
+    here_root: Option<&Path>,
+    here_workspace: Option<&str>,
+    user: &str,
+    owner: Option<&str>,
+) -> (Vec<Listed>, Vec<String>) {
+    let mut added: Vec<Listed> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    for entry in related {
+        let Some((ws, project)) = entry.split_once('/') else {
+            warnings.push(format!(
+                "related entry `{entry}` is not `<workspace>/<project>`"
+            ));
+            continue;
+        };
+        let Some(workspace) = workspaces.iter().find(|w| w.name == ws) else {
+            warnings.push(format!("related entry `{entry}`: no workspace `{ws}`"));
+            continue;
+        };
+        let Some(root) = workspace
+            .projects
+            .iter()
+            .find(|root| project_name(root) == project)
+        else {
+            warnings.push(format!(
+                "related entry `{entry}`: workspace `{ws}` lists no project `{project}`"
+            ));
+            continue;
+        };
+        let understood = rows
+            .iter()
+            .any(|r| r.understood && r.root.as_path() == root.as_path());
+        if understood || here_root == Some(root.as_path()) || here_workspace == Some(ws) {
+            warnings.push(format!(
+                "related entry `{entry}` is already understood by this thread; skipped"
+            ));
+            continue;
+        }
+        if added.iter().any(|r| r.root == *root) {
+            warnings.push(format!("related entry `{entry}` duplicates an earlier one"));
+            continue;
+        }
+        let file = root.join(aigentic_runtime::project::FILE_NAME);
+        let participants = if file.is_file() {
+            match ProjectFile::load(&file) {
+                Ok(f) => f.participants,
+                Err(e) => {
+                    warnings.push(format!("related entry `{entry}`: {e}"));
+                    continue;
+                }
+            }
+        } else {
+            Participants::default()
+        };
+        if auth::role_in(user, owner, &participants).is_none() {
+            warnings.push(format!(
+                "related entry `{entry}`: {user} holds no role in `{ws}/{project}`"
+            ));
+            continue;
+        }
+        added.push(Listed {
+            name: format!("{ws}/{project}"),
+            root: root.clone(),
+            workspace: Some(ws.to_owned()),
+            one_line: None,
+            understood: true,
+        });
+    }
+    (added, warnings)
 }
 
 impl ThreadTable {
@@ -86,6 +334,10 @@ impl ThreadTable {
         threads_base: PathBuf,
         guard: Arc<dyn KeepAwake>,
     ) -> Self {
+        // The index is read before anything can serve from it, so a
+        // daemon that starts over a tree another one wrote sees every
+        // log that is there now (issue #9).
+        let index = scan_index(&threads_base, &server);
         Self {
             config,
             config_dir,
@@ -93,17 +345,92 @@ impl ThreadTable {
             providers,
             reports,
             threads_base,
-            guard,
+            guard: Mutex::new(guard),
+            ids: Mutex::new(Arc::new(Ids::live())),
+            runs: Arc::new(Runs::new()),
+            run_deps: Mutex::new(Arc::new(ProdDeps)),
+            job_limits: Mutex::new((crate::jobs::JOB_TICK, crate::jobs::JOB_DEADLINE)),
+            brief_cache: Mutex::new(HashMap::new()),
+            build_lock: AsyncMutex::new(()),
             profile_override: None,
             workspaces: Vec::new(),
             entries: Mutex::new(HashMap::new()),
+            index: Mutex::new(index),
+            migrated: Mutex::new(Ok(Migrated::default())),
         }
     }
 
     /// The guard every actor is built with: a test installs a recording
     /// one here, so a thread built from the table can be watched.
     pub fn guard(&self) -> Arc<dyn KeepAwake> {
-        self.guard.clone()
+        self.guard.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Install the keep-awake guard every actor and run task gets from
+    /// now on: a test's recording one, so it can watch what a run holds,
+    /// step by step (#58 fix 1). A thread built before the swap keeps
+    /// the guard it was built with.
+    pub fn with_keep_awake(&self, guard: Arc<dyn KeepAwake>) {
+        *self.guard.lock().unwrap_or_else(|e| e.into_inner()) = guard;
+    }
+
+    /// The source of the next thread id, as it stands now.
+    fn ids(&self) -> Arc<Ids> {
+        self.ids.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Install the thread id source every thread made from now on reads:
+    /// a test's [`Ids::fixed`], so two threads land in one millisecond.
+    /// A create that already took a source keeps it.
+    pub fn with_ids(&self, ids: Arc<Ids>) {
+        *self.ids.lock().unwrap_or_else(|e| e.into_inner()) = ids;
+    }
+
+    /// The run registry: which lead a task drives, and who watches it.
+    pub fn runs(&self) -> Arc<Runs> {
+        self.runs.clone()
+    }
+
+    /// What the start-up migration did to the threads directory: the
+    /// counts, or why it failed. An error never stopped the daemon
+    /// (issue #9).
+    pub fn migrated(&self) -> Result<Migrated, String> {
+        self.migrated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Record what `migrate` did, kept for tests and a later `doctor`.
+    pub fn with_migrated(self, migrated: Result<Migrated, String>) -> Self {
+        *self.migrated.lock().unwrap_or_else(|e| e.into_inner()) = migrated;
+        self
+    }
+
+    /// Replace the seams a run drives the world through. `ProdDeps`
+    /// unless a test installed its own; see [`crate::runs::RunDeps`].
+    pub fn with_run_deps(&self, deps: Arc<dyn RunDeps>) {
+        *self.run_deps.lock().unwrap_or_else(|e| e.into_inner()) = deps;
+    }
+
+    /// Replace how often a job's driver looks at its child and how long a
+    /// job may run, so a test need not wait out the real ones.
+    #[doc(hidden)]
+    pub fn with_job_limits(&self, tick: Duration, deadline: Duration) {
+        *self.job_limits.lock().unwrap_or_else(|e| e.into_inner()) = (tick, deadline);
+    }
+
+    /// The driver's tick and a job's deadline, as they stand now.
+    pub(crate) fn job_limits(&self) -> (Duration, Duration) {
+        *self.job_limits.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The seams a run drives the world through, as they stand now.
+    pub fn run_deps(&self) -> Arc<dyn RunDeps> {
+        self.run_deps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Build every thread from `profile` instead of its project's
@@ -122,43 +449,282 @@ impl ThreadTable {
         &self.workspaces
     }
 
+    /// The directory the logs live in (issue #88): where the front lock
+    /// and `front_root` work, the same base `build` computes.
+    pub fn threads_base(&self) -> &Path {
+        &self.threads_base
+    }
+
     /// Move an open thread to `project`: its context is built here, the
     /// actor swaps it in while idle and records `project_switched`.
     pub async fn switch(&self, thread: Ulid, project: &str, by: Author) -> Result<(), ThreadError> {
         let mailbox = self.mailbox(thread).ok_or(ThreadError::NoThread(thread))?;
-        let root = self.root_of(project)?;
-        let built = project_context(
-            &self.config,
-            &self.config_dir,
-            &*self.providers,
-            &root,
-            &self.workspaces,
-            self.profile_override.as_deref(),
-        )
-        .await?;
+        let ctx = self.build_target(thread, project).await?;
         let (reply, rx) = oneshot::channel();
         mailbox
             .send(Mail::SwitchProject {
-                ctx: Box::new(built.ctx),
+                ctx: Box::new(ctx),
                 by,
                 reply,
             })
             .map_err(|_| ThreadError::Gone)?;
         match rx.await.map_err(|_| ThreadError::Gone)? {
             aigentic_api::Response::Ok => {
-                if let Some(e) = self
-                    .entries
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get_mut(&thread)
-                {
-                    e.project = project.to_owned();
-                }
+                self.note_project(thread, project);
                 Ok(())
             }
             aigentic_api::Response::Refused { reason } => Err(ThreadError::Refused(reason)),
             other => Err(ThreadError::Refused(format!("{other:?}"))),
         }
+    }
+
+    /// The context a move to `project` needs: its providers, seams and
+    /// listing, built the one way both a `SwitchProject` and a `yes` to
+    /// a `suggest_project` proposal use (issue #7). The listing follows
+    /// the switch: the target is now the current project. The creator
+    /// comes from the entry, never a log read — a switch must not touch
+    /// another project's threads directory (#81).
+    pub async fn build_target(
+        &self,
+        thread: Ulid,
+        project: &str,
+    ) -> Result<aigentic_runtime::ProjectContext, ThreadError> {
+        let root = self.root_of(project)?;
+        let mut built = project_context(
+            &self.config,
+            &self.config_dir,
+            self.server.owner(),
+            &*self.providers,
+            &root,
+            &self.workspaces,
+            self.profile_override.as_deref(),
+        )
+        .await?;
+        let reach = self.reach(self.creator(thread).as_ref(), Some(project));
+        built.ctx.projects = reach.as_ref().and_then(|(block, _)| block.clone());
+        built.ctx.project_rows = reach.map(|(_, rows)| rows).unwrap_or_default();
+        Ok(built.ctx)
+    }
+
+    /// Remember that the thread is in `project` now. The log's
+    /// `project_switched` is the truth; this is the entry, so the next
+    /// open does not rebuild the old project.
+    pub fn note_project(&self, thread: Ulid, project: &str) {
+        if let Some(e) = self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&thread)
+        {
+            e.project = project.to_owned();
+        }
+        // The index too, so a listing and the next open see the switch
+        // without rereading the log (issue #9).
+        if let Some(i) = self
+            .index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&thread)
+        {
+            i.switched = Some(project.to_owned());
+            // Where the daemon has that project now (issue #88): the
+            // switch's root is this daemon's, not the one an older log
+            // line recorded. A name this daemon cannot resolve leaves
+            // the field as the log had it.
+            i.switched_root = self.root_of(project).ok().map(|r| r.root);
+        }
+    }
+
+    /// The project a live `suggest_project` proposal names, when one
+    /// waits on `call_id` (issue #7): what a `yes` needs before it can
+    /// build the target's context and check the role there. `None` when
+    /// nothing is pending — the turn has moved on, or another client
+    /// answered first.
+    pub async fn waiting_switch(&self, thread: Ulid, call_id: &str) -> Option<String> {
+        let mailbox = self.mailbox(thread)?;
+        let (reply, rx) = oneshot::channel();
+        mailbox.send(Mail::Status { reply }).ok()?;
+        match rx.await.ok()? {
+            ThreadState::AwaitingSwitch {
+                call_id: waiting,
+                project,
+                ..
+            } if waiting == call_id => Some(project),
+            _ => None,
+        }
+    }
+
+    /// Names the workspace a project sits in (issue #7), for the actor:
+    /// `workspace_label` without the table, so an actor never holds one.
+    fn labels(&self) -> crate::actor::WorkspaceLabel {
+        let projects = self.server.projects.clone();
+        let workspaces = self.workspaces.clone();
+        Arc::new(move |project: &str| {
+            let root = &projects.iter().find(|p| p.name == project)?.root;
+            workspace_of(&workspaces, root).map(|w| w.name.clone())
+        })
+    }
+
+    /// The workspace naming a project (issue #81): `workspace_of`'s
+    /// first match over the loaded workspace files. #7's
+    /// `AwaitingSwitch { workspace }` reuses it.
+    pub fn workspace_label(&self, project: &str) -> Option<String> {
+        let root = self.root_of(project).ok()?;
+        workspace_of(&self.workspaces, &root.root).map(|w| w.name.clone())
+    }
+
+    /// The projects block for a thread (issue #81), rendered for whoever
+    /// asks: the projects its creator holds a role in, the thread's
+    /// `project` marked as its own. `None` when the creator is not a
+    /// person (an agent's thread) or holds no role anywhere — no block
+    /// at all, so the prefix is exactly what it was.
+    pub fn shown_projects(&self, thread: Ulid, project: Option<&str>) -> Option<String> {
+        let creator = self.creator(thread);
+        self.projects_in_reach(creator.as_ref(), project)
+    }
+
+    /// The thread's creator, stored when it was opened; `None` for an
+    /// agent's thread and for one this table has not opened.
+    fn creator(&self, thread: Ulid) -> Option<UserId> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&thread)
+            .and_then(|e| e.creator.clone())
+    }
+
+    /// The listing for a creator: the projects where they hold any role
+    /// — `read` counts — in the daemon's order, each with the workspace
+    /// naming it and its brief's one-liner (issue #123), and `project` as
+    /// the thread's own. The rule is `role_in_project`'s, the same one
+    /// the client's project list uses.
+    pub(crate) fn projects_in_reach(
+        &self,
+        creator: Option<&UserId>,
+        project: Option<&str>,
+    ) -> Option<String> {
+        self.reach(creator, project).and_then(|(block, _)| block)
+    }
+
+    /// The same listing with the rows it was rendered from: the block is
+    /// what the prefix shows, the rows are what `read_brief` looks a
+    /// sibling up in (issue #123). `None` is nothing to list at all.
+    pub(crate) fn reach(
+        &self,
+        creator: Option<&UserId>,
+        project: Option<&str>,
+    ) -> Option<(Option<String>, Vec<ProjectRow>)> {
+        let user = creator?.0.as_str();
+        let mut all: Vec<Listed> = self
+            .server
+            .projects
+            .iter()
+            .filter(|p| role_in_project(&self.server, self, &p.name, user).is_some())
+            .map(|p| Listed {
+                name: p.name.clone(),
+                root: p.root.clone(),
+                workspace: self.workspace_label(&p.name),
+                one_line: self.brief_one_line(&p.root),
+                understood: false,
+            })
+            .collect();
+        let current = project.and_then(|name| {
+            all.iter().find(|l| l.name == name).cloned().or_else(|| {
+                // The thread's own project can be outside its
+                // creator's reach: line 1 still names it, from
+                // itself, and no row is marked as it.
+                self.server.project(name).map(|p| Listed {
+                    name: p.name.clone(),
+                    root: p.root.clone(),
+                    workspace: self.workspace_label(&p.name),
+                    one_line: self.brief_one_line(&p.root),
+                    understood: true,
+                })
+            })
+        });
+        // The workspace a thread understands beyond its own project: the
+        // workspace of the project it is in. Rows outside it stay in the
+        // block, so the model still sees them, but no tool opens them
+        // unless `[project] related` names one, which the resolver below
+        // turns into a row. The same expression decides what a row can
+        // be served as (`ProjectRow.understood`).
+        let here_workspace = current.as_ref().and_then(|c| c.workspace.as_deref());
+        for l in &mut all {
+            l.understood = current.as_ref().is_some_and(|c| c.name == l.name)
+                || (here_workspace.is_some() && l.workspace.as_deref() == here_workspace);
+        }
+        let related = self.related_entries(project);
+        let here_root = current.as_ref().map(|c| c.root.clone());
+        let (mut added, warnings) = related_in_reach(
+            &all,
+            &self.workspaces,
+            &related,
+            here_root.as_deref(),
+            here_workspace,
+            user,
+            self.server.owner(),
+        );
+        for warning in &warnings {
+            eprintln!("warn  {warning}");
+        }
+        // A related row replaces the plain other-workspace row for its
+        // root, by root: the block lists that project once, under the
+        // name `related` can address it by, and a shadowing project
+        // sharing a name keeps its own row.
+        let replaced: Vec<PathBuf> = added.iter().map(|l| l.root.clone()).collect();
+        all.retain(|l| !replaced.contains(&l.root));
+        for l in &mut added {
+            l.one_line = self.brief_one_line(&l.root);
+        }
+        all.extend(added);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let block = projects_listing(&all, current.as_ref(), home.as_deref())?;
+        Some((
+            Some(block),
+            all.iter()
+                .map(|l| ProjectRow {
+                    name: l.name.clone(),
+                    root: l.root.clone(),
+                    workspace: l.workspace.clone(),
+                    one_line: l.one_line.clone(),
+                    understood: l.understood,
+                })
+                .collect(),
+        ))
+    }
+
+    /// `[project] related` from the current project's file, empty when
+    /// there is no project, no file, or a file that does not parse — the
+    /// daemon builds nothing for a thread whose own file is broken.
+    fn related_entries(&self, project: Option<&str>) -> Vec<String> {
+        project
+            .and_then(|name| self.root_of(name).ok())
+            .and_then(|root| {
+                ProjectFile::load(&root.root.join(aigentic_runtime::project::FILE_NAME)).ok()
+            })
+            .and_then(|file| file.project)
+            .map(|p| p.related)
+            .unwrap_or_default()
+    }
+
+    /// A project's brief one-liner (issue #123), by root. A `stat` is
+    /// cheap and the file is read only when its mtime changed since the
+    /// last read; no brief and no file are cached too.
+    fn brief_one_line(&self, root: &Path) -> Option<String> {
+        let mtime = std::fs::symlink_metadata(aigentic_runtime::brief::project_brief_path(root))
+            .ok()
+            .and_then(|meta| meta.modified().ok());
+        let mut cache = self.brief_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((seen, line)) = cache.get(root)
+            && *seen == mtime
+        {
+            return line.clone();
+        }
+        let line = aigentic_runtime::brief::project_brief(root)
+            .as_deref()
+            .and_then(aigentic_runtime::brief::one_line);
+        cache.insert(root.to_path_buf(), (mtime, line.clone()));
+        line
     }
 
     fn root_of(&self, project: &str) -> Result<Root, ThreadError> {
@@ -169,8 +735,121 @@ impl ThreadTable {
         Ok(Root {
             name: p.name.clone(),
             root: p.root.clone(),
-            threads_dir: self.threads_base.join(&p.name),
+            // New threads and new children are written flat (issue #9):
+            // the directory is no longer the index, so nothing is filed
+            // by project.
+            threads_dir: self.threads_base.clone(),
         })
+    }
+
+    /// The directory a thread's log lives in: `<base>` for everything
+    /// written since #9, `<base>/<project>` for a held lead the
+    /// migration left behind.
+    pub fn dir_of(&self, thread: Ulid) -> Option<PathBuf> {
+        self.lookup(thread).map(|i| i.dir.clone())
+    }
+
+    /// Who started a thread, from the index (issue #81): only a person
+    /// counts, so an agent's thread — a build's or a step's child — gets
+    /// no block. A miss reads the log, which is why this is a method and
+    /// not a free function over a directory any more (issue #9).
+    fn creator_of(&self, thread: Ulid) -> Option<UserId> {
+        self.lookup(thread)?.creator
+    }
+
+    /// The thread's title, from its log's last `thread_renamed` (issue
+    /// #9): read on demand, since it is not on any request's hot path.
+    /// `None` for an unknown id.
+    pub fn title_of(&self, thread: Ulid) -> Option<String> {
+        let dir = self.dir_of(thread)?;
+        let events = ThreadLog::open(dir, thread).ok()?.read_all().ok()?;
+        aigentic_runtime::title::title_of(&events)
+    }
+
+    /// The newest front thread `user` made (issue #84): over every id
+    /// this daemon knows — through `known_ids`, so a front thread
+    /// another daemon wrote is found too — the greatest whose entry is
+    /// `front` and whose creator is `user`. PLAN §2's `latest_for`
+    /// becomes this, in its neighbours' shape: `Option`, not `Result`.
+    /// The greatest id is the newest thread because thread ids are made
+    /// by one strictly increasing source ([`Ids`]), so this order is the
+    /// order they were made in.
+    pub fn latest_front(&self, user: &str) -> Option<Ulid> {
+        self.known_ids()
+            .into_iter()
+            .filter(|id| {
+                self.lookup(*id).is_some_and(|entry| {
+                    entry.front && entry.creator.as_ref().is_some_and(|c| c.0.as_str() == user)
+                })
+            })
+            .max()
+    }
+
+    /// Every id this daemon knows: the index's, plus every log file on
+    /// disk — the flat directory and each legacy one (issue #9). The
+    /// names are a `read_dir` each; a file already indexed is not read
+    /// again, so the only reads are for logs this daemon has not seen.
+    fn known_ids(&self) -> Vec<Ulid> {
+        let mut ids: Vec<Ulid> = self
+            .index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        let mut seen: std::collections::HashSet<Ulid> = ids.iter().copied().collect();
+        for path in log_files(&self.threads_base).into_iter().chain(
+            legacy_dirs(&self.threads_base)
+                .into_iter()
+                .flat_map(|sub| log_files(&sub)),
+        ) {
+            let Some(id) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<Ulid>().ok())
+            else {
+                continue;
+            };
+            if seen.insert(id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// The index entry for `thread`, scanning on a miss (issue #9): the
+    /// flat log first, then each legacy subdirectory. A miss is a cache
+    /// miss, never "no thread" — a child another daemon wrote, or a log
+    /// written into a legacy directory after this table was built, turns
+    /// up here. A miss is not cached as nothing.
+    fn lookup(&self, thread: Ulid) -> Option<Indexed> {
+        if let Some(found) = self
+            .index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&thread)
+        {
+            return Some(found.clone());
+        }
+        let mut memo = HashMap::new();
+        let flat = self.threads_base.join(format!("{thread}.jsonl"));
+        let found = scan_log(&flat, &self.server, &mut memo)
+            .map(|(_, entry)| entry)
+            .or_else(|| {
+                legacy_dirs(&self.threads_base).into_iter().find_map(|sub| {
+                    scan_log(
+                        &sub.join(format!("{thread}.jsonl")),
+                        &self.server,
+                        &mut memo,
+                    )
+                    .map(|(_, entry)| entry)
+                })
+            })?;
+        self.index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(thread, found.clone());
+        Some(found)
     }
 
     /// The project's participants and the daemon's owner, for the role
@@ -185,8 +864,12 @@ impl ThreadTable {
         Ok(file.participants)
     }
 
-    /// Which project a thread belongs to: the directory that holds its
-    /// log, since the directory is the index (phase 4).
+    /// Which project a thread belongs to (issue #9). The entry while it
+    /// is open; otherwise what its log says: its last switch if this
+    /// daemon knows that project — the one `open` would build in — else
+    /// its home. `None` for a log with no project: a pre-phase-4 one, or
+    /// a `_none` thread whose name another project holds at a different
+    /// root.
     pub fn project_of(&self, thread: Ulid) -> Option<String> {
         if let Some(e) = self
             .entries
@@ -196,90 +879,412 @@ impl ThreadTable {
         {
             return Some(e.project.clone());
         }
-        self.server
-            .projects
-            .iter()
-            .map(|p| p.name.clone())
-            .find(|name| {
-                self.threads_base
-                    .join(name)
-                    .join(format!("{thread}.jsonl"))
-                    .is_file()
-            })
+        let indexed = self.lookup(thread)?;
+        indexed
+            .switched
+            .filter(|name| self.server.project(name).is_some())
+            .or(indexed.home)
+    }
+
+    /// The root of the project a thread is in now (issue #88), for the
+    /// front-thread root check: when `project_of` answers the switched
+    /// name, the switch's root; when it answers the home, the home's
+    /// root. `None` when nothing is recorded — a thread whose switch
+    /// predates this field, which is not refused for it.
+    pub fn root_of_thread(&self, thread: Ulid) -> Option<PathBuf> {
+        let indexed = self.lookup(thread)?;
+        let project = self.project_of(thread);
+        root_of_indexed(&indexed, project.as_deref())
+    }
+
+    /// The root this daemon has for a project name (issue #88). `None`
+    /// for a name no project has.
+    pub fn project_root(&self, project: &str) -> Option<PathBuf> {
+        self.root_of(project).ok().map(|r| r.root)
     }
 
     pub fn projects(&self) -> Vec<(String, PathBuf, u64)> {
+        // A row's count is the threads whose project is that row: a
+        // switched thread counts under its current project, and one
+        // whose project names no configured project counts nowhere
+        // (issue #9). `known_ids` adds what is on disk, so a thread
+        // another daemon made since this one started counts too (#9
+        // review); `project_of` scans it on its first miss.
+        let ids = self.known_ids();
+        let projects: Vec<Option<String>> = ids.iter().map(|id| self.project_of(*id)).collect();
         self.server
             .projects
             .iter()
             .map(|p| {
-                let count = std::fs::read_dir(self.threads_base.join(&p.name))
-                    .map(|d| {
-                        d.filter_map(Result::ok)
-                            .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
-                            .count() as u64
-                    })
-                    .unwrap_or(0);
+                let count = projects
+                    .iter()
+                    .filter(|name| name.as_deref() == Some(p.name.as_str()))
+                    .count() as u64;
                 (p.name.clone(), p.root.clone(), count)
             })
             .collect()
     }
 
     /// Every thread of a project, newest first, with the state of the
-    /// ones that are open.
-    pub fn list(&self, project: &str) -> Result<Vec<ThreadInfo>, ThreadError> {
-        let root = self.root_of(project)?;
-        let mut ids: Vec<Ulid> = match std::fs::read_dir(&root.threads_dir) {
-            Ok(d) => d
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-                .filter_map(|p| p.file_stem()?.to_str()?.parse().ok())
-                .collect(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(BuildError::from(e).into()),
-        };
-        ids.sort_unstable_by(|a, b| b.cmp(a));
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(ids
+    /// ones that are open — or, with no project (issue #86), every
+    /// thread of every project `readable` allows, in the order
+    /// `/threads` shows: the caller's front thread first, then the
+    /// builds, then everything else grouped by workspace.
+    ///
+    /// `readable` is the caller's one role rule (`role_in_project`, in
+    /// the session), asked per project: never a copy of it here. A
+    /// thread with no project at all — a pre-phase-4 log, or an
+    /// unplaceable `_none` one — has nothing to judge, so `None` never
+    /// lists it.
+    pub fn list(
+        &self,
+        project: Option<&str>,
+        user: &str,
+        readable: impl Fn(&str) -> bool,
+    ) -> Result<Vec<ThreadInfo>, ThreadError> {
+        // The caller's front thread (issue #84), asked once: `Front` on
+        // exactly that row.
+        let front = self.latest_front(user);
+        // The index plus what is on disk: a thread another daemon made
+        // since this one started is listed too (#9 review).
+        let mut ids = self.known_ids();
+        match project {
+            Some(project) => {
+                // The project has to be one this daemon knows, as before.
+                self.root_of(project)?;
+                ids.retain(|id| self.project_of(*id).as_deref() == Some(project));
+                ids.sort_unstable_by(|a, b| b.cmp(a));
+                // Which threads have an actor, read under the lock and
+                // dropped before any log is read.
+                let open: HashSet<Ulid> = self
+                    .entries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .keys()
+                    .copied()
+                    .collect();
+                Ok(ids
+                    .into_iter()
+                    .map(|id| {
+                        let dir = self.dir_of(id).unwrap_or_else(|| self.threads_base.clone());
+                        let mut info = self.row(id, project, &dir, front);
+                        if open.contains(&id) {
+                            // Open: the actor knows the live state; the
+                            // session asks it on Open. Listings show it
+                            // as idle unless asked, which is cheap and
+                            // never wrong for long.
+                            info.state = ThreadState::Idle;
+                        }
+                        info
+                    })
+                    .collect())
+            }
+            None => {
+                ids.retain(|id| self.project_of(*id).is_some_and(|q| readable(&q)));
+                let rows: Vec<ThreadInfo> = ids
+                    .into_iter()
+                    .filter_map(|id| {
+                        let project = self.project_of(id)?;
+                        let dir = self.dir_of(id).unwrap_or_else(|| self.threads_base.clone());
+                        Some(self.row(id, &project, &dir, front))
+                    })
+                    .collect();
+                Ok(order_across_projects(rows))
+            }
+        }
+    }
+
+    /// The start-up ask's light listing (issue #121): this user's own
+    /// threads, from the index alone. Nothing here reads a log body —
+    /// no `summarise`, no `read_all` — so a bare-folder start-up does
+    /// not parse every thread on disk; `lookup` scans an unindexed log
+    /// exactly as it does today, one first line.
+    ///
+    /// A thread with no project (an agent's, or an unplaceable `_none`
+    /// one) has no row: the ask is about projects.
+    pub fn start_rows(&self, user: &str) -> Vec<StartRow> {
+        let mut rows: Vec<StartRow> = self
+            .known_ids()
             .into_iter()
-            .map(|id| {
-                let mut info = summarise(&root.threads_dir, id, project);
-                if entries.contains_key(&id) {
-                    // Open: the actor knows the live state; the session
-                    // asks it on Open. Listings show it as idle unless
-                    // asked, which is cheap and never wrong for long.
-                    info.state = ThreadState::Idle;
+            .filter_map(|id| {
+                let entry = self.lookup(id)?;
+                let creator = entry.creator.as_ref()?;
+                if creator.0.as_str() != user {
+                    return None;
                 }
-                info
+                let project = entry
+                    .switched
+                    .clone()
+                    .filter(|name| self.server.project(name).is_some())
+                    .or_else(|| entry.home.clone())?;
+                Some(StartRow {
+                    id,
+                    root: root_of_indexed(&entry, Some(&project)),
+                    workspace: self.workspace_label(&project),
+                    front: entry.front,
+                    project,
+                })
             })
-            .collect())
+            .collect();
+        // Newest first, so the ask's "last used" is the first id per
+        // project.
+        rows.sort_unstable_by_key(|r| std::cmp::Reverse(r.id));
+        rows
+    }
+
+    /// The rows `/jobs` shows: every build lead and every background job
+    /// this daemon knows from today, newest first, with the project the
+    /// caller may read. A build's `what` is `build #<issue>`, a job's
+    /// `job <n>`, its place among its front thread's jobs. A step's child
+    /// and an ordinary thread are never rows, and a row whose project the
+    /// caller cannot read is left out — a listing they may not read
+    /// anywhere is empty rather than refused.
+    ///
+    /// Nothing here reads a log body: the index carries the run mark and
+    /// the project. `state` and `cost_usd` stay unset.
+    pub fn job_rows(
+        &self,
+        project: Option<&str>,
+        readable: impl Fn(&str) -> bool,
+    ) -> Result<Vec<JobRow>, ThreadError> {
+        if let Some(wanted) = project {
+            self.root_of(wanted)?;
+        }
+        // The day is the row's own, from the id the run was minted with:
+        // no log body is read here, so a listing over a long index stays
+        // cheap.
+        let mut rows: Vec<JobRow> = self
+            .known_ids()
+            .into_iter()
+            .filter_map(|id| {
+                if !crate::runs::minted_today(id) {
+                    return None;
+                }
+                let indexed = self.lookup(id)?;
+                let (issue, what) = match indexed.run {
+                    RunThread::Lead { issue } => (Some(issue), format!("build #{issue}")),
+                    RunThread::Job { front } => {
+                        (None, format!("job {}", self.job_number_of(id, front)))
+                    }
+                    _ => return None,
+                };
+                let its = indexed
+                    .switched
+                    .filter(|name| self.server.project(name).is_some())
+                    .or(indexed.home)?;
+                match project {
+                    Some(wanted) if wanted != its => return None,
+                    None if !readable(&its) => return None,
+                    _ => {}
+                }
+                Some(JobRow {
+                    id,
+                    issue,
+                    what,
+                    project: its,
+                    state: None,
+                    cost_usd: None,
+                })
+            })
+            .collect();
+        // Newest first, as the id is time-ordered and minted when the run
+        // starts.
+        rows.sort_unstable_by_key(|r| std::cmp::Reverse(r.id));
+        Ok(rows)
+    }
+
+    /// One row as `/threads` shows it (issue #86): `summarise`'s log
+    /// summary, plus the workspace naming its project and what the
+    /// thread is. `front` is the caller's own front thread, so another
+    /// person's front thread is an ordinary one.
+    fn row(&self, id: Ulid, project: &str, dir: &Path, front: Option<Ulid>) -> ThreadInfo {
+        let mut info = summarise(dir, id, project);
+        info.workspace = self.workspace_label(project);
+        info.kind = if Some(id) == front {
+            ThreadKind::Front
+        } else {
+            match self.lookup(id).and_then(|entry| entry.run.wire()) {
+                Some(run) => ThreadKind::Run(run),
+                None => ThreadKind::Thread,
+            }
+        };
+        info
+    }
+
+    /// A thread's listing row, from its log alone (issue #84): what
+    /// `Front`'s resumed answer carries. `None` for a thread this daemon
+    /// cannot place.
+    pub fn info(&self, thread: Ulid) -> Option<ThreadInfo> {
+        let project = self.project_of(thread)?;
+        let dir = self.dir_of(thread)?;
+        Some(summarise(&dir, thread, &project))
     }
 
     /// A new thread in `project`: its log starts with `thread_started`.
-    pub async fn create(&self, project: &str, by: Author) -> Result<ThreadInfo, ThreadError> {
+    /// It is written flat, and entered in the index. `front` makes it
+    /// the person's front thread (issue #84); only `Front`'s and
+    /// `NewFront`'s handlers set it.
+    pub async fn create(
+        &self,
+        project: &str,
+        by: Author,
+        front: bool,
+    ) -> Result<ThreadInfo, ThreadError> {
         let root = self.root_of(project)?;
         std::fs::create_dir_all(&root.threads_dir).map_err(BuildError::from)?;
-        let id = Ulid::generate();
-        let mut log = ThreadLog::open(&root.threads_dir, id)?;
-        log.append(NewEvent {
-            kind: EventKind::ThreadStarted,
-            author: by.clone(),
-            payload: serde_json::to_value(ThreadStartedPayload {
+        let id = self.ids().next();
+        // The creator, for the index and for the log (issue #81): only a
+        // person counts, so a lead a build starts through `create` gets
+        // none.
+        let creator = match &by {
+            Author::User(user) => Some(user.clone()),
+            Author::Agent(_) | Author::System => None,
+        };
+        self.masthead(
+            id,
+            &root,
+            by.clone(),
+            ThreadStartedPayload {
                 project: Some(project.to_owned()),
                 root: root.root.clone(),
                 created_by: by,
-            })
-            .expect("serialisable"),
-            parent_event: None,
-        })?;
-        drop(log);
+                parent_thread: None,
+                step: None,
+                front,
+                job: false,
+            },
+        )?;
+        self.index.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id,
+            Indexed {
+                dir: root.threads_dir.clone(),
+                home: Some(project.to_owned()),
+                switched: None,
+                switched_root: None,
+                root: Some(root.root.clone()),
+                creator,
+                run: RunThread::No,
+                torn_run: false,
+                front,
+            },
+        );
         Ok(summarise(&root.threads_dir, id, project))
     }
 
+    /// Write `thread`'s `thread_started` into `root`'s threads directory,
+    /// and nothing else. `author` is who the event is by.
+    fn masthead(
+        &self,
+        thread: Ulid,
+        root: &Root,
+        author: Author,
+        payload: ThreadStartedPayload,
+    ) -> Result<(), ThreadError> {
+        let mut log = ThreadLog::open(&root.threads_dir, thread)?;
+        log.append(NewEvent {
+            kind: EventKind::ThreadStarted,
+            author,
+            payload: serde_json::to_value(payload).expect("thread_started serialises"),
+            parent_event: None,
+        })?;
+        drop(log);
+        Ok(())
+    }
+
+    /// A job's own thread: `front`'s project and root, the person who
+    /// approved it as its author, and a masthead that says it is a job.
+    /// Its id is new, so the file holds no `thread_started` yet; the
+    /// check is what stops a second one being written over an id already
+    /// on disk.
+    pub fn create_job(
+        &self,
+        front: Ulid,
+        project: &str,
+        root: &Path,
+        by: Author,
+    ) -> Result<Ulid, ThreadError> {
+        // The log sits with every other thread's; `root` is where the
+        // job works.
+        let root = Root {
+            root: root.to_path_buf(),
+            ..self.root_of(project)?
+        };
+        std::fs::create_dir_all(&root.threads_dir).map_err(BuildError::from)?;
+        let id = self.ids().next();
+        let (log, _cut) = ThreadLog::open_with(&root.threads_dir, id, Repair::TruncateTornTail)?;
+        if log
+            .events()
+            .iter()
+            .any(|event| event.kind == EventKind::ThreadStarted)
+        {
+            return Err(ThreadError::Refused(format!(
+                "thread {id} already has a masthead"
+            )));
+        }
+        drop(log);
+        self.masthead(
+            id,
+            &root,
+            by.clone(),
+            ThreadStartedPayload {
+                project: Some(project.to_owned()),
+                root: root.root.clone(),
+                created_by: by,
+                parent_thread: Some(front),
+                step: None,
+                front: false,
+                job: true,
+            },
+        )?;
+        self.index.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id,
+            Indexed {
+                dir: root.threads_dir.clone(),
+                home: Some(project.to_owned()),
+                switched: None,
+                switched_root: None,
+                root: Some(root.root.clone()),
+                creator: None,
+                run: RunThread::Job { front },
+                torn_run: false,
+                front: false,
+            },
+        );
+        Ok(id)
+    }
+
     /// The mailbox of a thread, starting its actor when it is not open.
-    /// Counts one more open session on it.
-    pub async fn open(&self, thread: Ulid) -> Result<(Mailbox, String), ThreadError> {
+    /// Counts one more open session on it. A job's thread opened this way
+    /// is built read-only and in `manual`: its approval is not in its log,
+    /// so the narrowest reading of it is the one a stray open gets.
+    pub async fn open(self: &Arc<Self>, thread: Ulid) -> Result<(Mailbox, String), ThreadError> {
+        let job = match self.run_thread(thread) {
+            RunThread::Job { front } => Some(JobSpec {
+                front,
+                read_only: true,
+                mode: Mode::Manual,
+            }),
+            _ => None,
+        };
+        self.open_as(thread, job).await
+    }
+
+    /// Open a job's own thread with the approval it runs under: `spec`
+    /// sets its mode and its limits, and a read-only job's registry holds
+    /// no write tool. Counts one more open session, as `open` does.
+    pub async fn open_job(
+        self: &Arc<Self>,
+        thread: Ulid,
+        spec: JobSpec,
+    ) -> Result<(Mailbox, String), ThreadError> {
+        self.open_as(thread, Some(spec)).await
+    }
+
+    async fn open_as(
+        self: &Arc<Self>,
+        thread: Ulid,
+        job: Option<JobSpec>,
+    ) -> Result<(Mailbox, String), ThreadError> {
         {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(e) = entries.get_mut(&thread) {
@@ -287,31 +1292,62 @@ impl ThreadTable {
                 return Ok((e.mailbox.clone(), e.project.clone()));
             }
         }
-        // The log lives under the project it was created in; the thread
-        // is built in the project it last switched to.
-        let home = self
+        // Where the log is and which project the thread is now in: both
+        // from the log, not from a directory (issue #9). A thread whose
+        // log names no project, or whose name another project holds at a
+        // different root, cannot be built and is refused.
+        let project = self
             .project_of(thread)
             .ok_or(ThreadError::NoThread(thread))?;
-        let home_root = self.root_of(&home)?;
-        let project = last_switch(&home_root.threads_dir, thread)
-            .filter(|p| self.server.project(p).is_some())
-            .unwrap_or_else(|| home.clone());
+        let dir = self.dir_of(thread).ok_or(ThreadError::NoThread(thread))?;
+        // The creator, once, from the log: the listing is theirs for as
+        // long as the thread lives (#81).
+        let creator = self.creator_of(thread);
         let root = Root {
-            threads_dir: home_root.threads_dir,
+            threads_dir: dir,
             ..self.root_of(&project)?
         };
+        let reach = self.reach(creator.as_ref(), Some(&project));
         let built = build_thread(
             &self.config,
             &self.config_dir,
+            self.server.owner(),
             &*self.providers,
             &root,
             &self.workspaces,
             thread,
             self.profile_override.as_deref(),
+            reach,
         )
         .await?;
-        let (actor, mailbox) = ThreadActor::new(built.runtime, built.torn, self.reports.clone())?;
-        let actor = actor.with_keep_awake(self.guard.clone());
+        let mut runtime = built.runtime;
+        if let Some(spec) = job {
+            let read_only = spec.read_only;
+            runtime = runtime
+                .with_job(spec)
+                .map_err(|e| ThreadError::Refused(e.to_string()))?;
+            if read_only {
+                let writers: Vec<String> = runtime
+                    .registry()
+                    .iter()
+                    .filter(|tool| tool.risk_class() == RiskClass::Write)
+                    .map(|tool| tool.name().to_owned())
+                    .collect();
+                for name in writers {
+                    runtime.registry_mut().remove(&name);
+                }
+            }
+        }
+        let (actor, mailbox) = ThreadActor::new(
+            runtime,
+            built.torn,
+            self.reports.clone(),
+            self.labels(),
+            self.runs().working(),
+        )?;
+        let actor = actor
+            .with_keep_awake(self.guard())
+            .with_store(Arc::downgrade(self));
         tokio::spawn(actor.run());
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         // Two sessions may have raced to build it; the first in wins and
@@ -319,6 +1355,7 @@ impl ThreadTable {
         let e = entries.entry(thread).or_insert_with(|| Entry {
             mailbox,
             project: project.clone(),
+            creator,
             open: 0,
             idle_since: Instant::now(),
         });
@@ -380,9 +1417,881 @@ impl ThreadTable {
     pub fn open_count(&self) -> usize {
         self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
+
+    // -- runs (issue #58) ----------------------------------------------------
+
+    /// What a run's task needs of the daemon for `project`: the config,
+    /// the providers, the seams, the guard, and the project's root. No
+    /// handle on this table comes with it.
+    ///
+    /// `threads_dir` is where the run writes: its lead's log and its
+    /// children live there (issue #9), which is `<base>` for a lead
+    /// written since the move and `<base>/<project>` for one the
+    /// migration held back.
+    pub fn run_world(&self, project: &str, threads_dir: PathBuf) -> Result<RunWorld, ThreadError> {
+        let mut root = self.root_of(project)?;
+        root.threads_dir = threads_dir;
+        let bundled = SkillPaths::new(
+            &root.root,
+            &self.config_dir,
+            self.config.bundled_dir.as_deref(),
+        )
+        .bundled;
+        Ok(RunWorld {
+            config: self.config.clone(),
+            config_dir: self.config_dir.clone(),
+            owner: self.server.owner().map(str::to_owned),
+            providers: self.providers.clone(),
+            deps: self.run_deps(),
+            guard: self.guard(),
+            ids: self.ids(),
+            root,
+            project: project.to_owned(),
+            workspaces: self.workspaces.clone(),
+            bundled,
+            working: self.runs.working(),
+        })
+    }
+
+    /// The world of the run whose lead is `lead`: its children are
+    /// written beside its log, wherever that is (issue #9).
+    pub fn run_world_for(&self, project: &str, lead: Ulid) -> Result<RunWorld, ThreadError> {
+        let dir = self.dir_of(lead).ok_or(ThreadError::NoThread(lead))?;
+        self.run_world(project, dir)
+    }
+
+    /// The lead of the unfinished run for `(project, issue)`: a thread
+    /// whose log holds `run_started { issue }` and no `run_finished`.
+    /// Read with repair, because a `kill -9` leaves a torn tail.
+    ///
+    /// A lead log that cannot be read is **not** "no unfinished run"
+    /// (issue #58 fix 2): a corrupt log read as nothing would start a
+    /// second lead over a run that is still there, so this reports it —
+    /// a note naming the file and the error — and refuses, which stops
+    /// the project's next `Build` until a person has looked.
+    pub fn unfinished_run(&self, project: &str, issue: u64) -> Result<Option<Ulid>, ThreadError> {
+        self.root_of(project)?;
+        // The index's leads for the project, newest first: a run that was
+        // restarted has one lead per issue, and the newest is the one the
+        // last `Build` made (issue #9).
+        //
+        // The ids are the index's plus every log file on disk: a lead
+        // another daemon created a moment ago is not in this daemon's
+        // index yet, and a `Build` must find it rather than write a
+        // second lead (t15c). A file already indexed costs no read.
+        let mut ids = self.known_ids();
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        for id in ids {
+            if self.project_of(id).as_deref() != Some(project) {
+                continue;
+            }
+            let Some(indexed) = self.lookup(id) else {
+                continue;
+            };
+            // A torn log that is not a lead no longer refuses a `Build`
+            // for its project (issue #9): the index knows whether the log
+            // claims a `run_started` at all.
+            if indexed.run == RunThread::No && !indexed.torn_run {
+                continue;
+            }
+            let dir = indexed.dir.clone();
+            let path = dir.join(format!("{id}.jsonl"));
+            let refuse = |error: String| -> Result<Option<Ulid>, ThreadError> {
+                self.runs.broadcast(
+                    id,
+                    Notice::Note {
+                        thread: id,
+                        text: format!("cannot read {}: {error}", path.display()),
+                    },
+                );
+                Err(ThreadError::Refused(format!(
+                    "cannot read {}: {error} — fix or remove it before starting a run in {project}",
+                    path.display()
+                )))
+            };
+            if indexed.torn_run {
+                // A line promised a `run_started` and did not parse: the
+                // log says it is a lead, and its issue is unreadable.
+                // Reading it with `Refuse` gives the error's own words.
+                let why = match ThreadLog::open_with(&dir, id, Repair::Refuse) {
+                    Err(e) => e.to_string(),
+                    Ok(_) => "a line that promised a `run_started` cannot be read".to_owned(),
+                };
+                return refuse(why);
+            }
+            let (log, _cut) = match ThreadLog::open_with(&dir, id, Repair::TruncateTornTail) {
+                Ok(opened) => opened,
+                Err(e) => return refuse(e.to_string()),
+            };
+            if crate::runs::unfinished(&log, issue).is_some() {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `job`'s place among `front`'s jobs, counted from 1 in the order
+    /// they were made, as the front thread numbers them.
+    fn job_number_of(&self, job: Ulid, front: Ulid) -> usize {
+        self.job_threads()
+            .into_iter()
+            .filter(|(id, of)| *of == front && *id <= job)
+            .count()
+    }
+
+    /// Every job thread the index knows, with the front thread it reports
+    /// to.
+    pub fn job_threads(&self) -> Vec<(Ulid, Ulid)> {
+        self.index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|(id, indexed)| match indexed.run {
+                RunThread::Job { front } => Some((*id, front)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Which kind of run-owned thread `thread` is, from its own log,
+    /// wherever that log lives.
+    pub fn run_thread(&self, thread: Ulid) -> RunThread {
+        let Some(dir) = self.dir_of(thread) else {
+            return RunThread::No;
+        };
+        // Repair: a torn tail is not a reason to start an actor over a
+        // run-owned thread.
+        let Ok((log, _cut)) = ThreadLog::open_with(&dir, thread, Repair::TruncateTornTail) else {
+            return RunThread::No;
+        };
+        if let Ok(started) = crate::runs::run_started_of(&log) {
+            return RunThread::Lead {
+                issue: started.issue,
+            };
+        }
+        let child = log
+            .events()
+            .iter()
+            .filter(|event| event.kind == EventKind::ThreadStarted)
+            .filter_map(|event| {
+                serde_json::from_value::<ThreadStartedPayload>(event.payload.clone()).ok()
+            })
+            .find_map(|p| p.parent_thread);
+        match child {
+            Some(front) => {
+                let header = log
+                    .events()
+                    .iter()
+                    .filter(|event| event.kind == EventKind::ThreadStarted)
+                    .filter_map(|event| {
+                        serde_json::from_value::<ThreadStartedPayload>(event.payload.clone()).ok()
+                    })
+                    .next();
+                // A job's header is a daemon's, not a runner's: it is read
+                // before `step`, so a job never reads as a stepless step
+                // child.
+                if header.as_ref().is_some_and(|p| p.job) {
+                    return RunThread::Job { front };
+                }
+                RunThread::Child {
+                    lead: front,
+                    step: header.and_then(|p| p.step),
+                }
+            }
+            None => RunThread::No,
+        }
+    }
+
+    /// The events of `thread` from `from_seq`, oldest first, read with
+    /// repair. No actor is started and nothing is written.
+    pub fn events_from(&self, thread: Ulid, from_seq: u64) -> Result<Vec<Event>, ThreadError> {
+        let dir = self.dir_of(thread).ok_or(ThreadError::NoThread(thread))?;
+        let (log, _cut) = ThreadLog::open_with(&dir, thread, Repair::TruncateTornTail)?;
+        Ok(log
+            .events()
+            .iter()
+            .filter(|event| event.seq >= from_seq)
+            .cloned()
+            .collect())
+    }
+
+    /// A report for a run-owned thread (issue #58, rule 5c). A run's
+    /// thread has no actor, so `Report`, which only reads, is served from
+    /// its log here: `build_thread` opens the log and assembles the
+    /// runtime, nothing is appended and no turn runs. The log is the
+    /// source of truth and the renderer projects it.
+    pub async fn report_of(&self, thread: Ulid, kind: ReportKind) -> Result<String, ThreadError> {
+        let project = self
+            .project_of(thread)
+            .ok_or(ThreadError::NoThread(thread))?;
+        let root = Root {
+            threads_dir: self.dir_of(thread).ok_or(ThreadError::NoThread(thread))?,
+            ..self.root_of(&project)?
+        };
+        let events = self.events_from(thread, 0)?;
+        // The same lock a build takes: assembling a runtime touches the
+        // log and the project, and never happens beside a `Build`.
+        let _serial = self.build_lock.lock().await;
+        let built = build_thread(
+            &self.config,
+            &self.config_dir,
+            self.server.owner(),
+            &*self.providers,
+            &root,
+            &self.workspaces,
+            thread,
+            self.profile_override.as_deref(),
+            // A report renders events; it builds no prompt, so the
+            // listing would go nowhere (#81).
+            None,
+        )
+        .await?;
+        Ok(self.reports.render(&built.runtime, &events, kind))
+    }
+
+    /// The start-up scan (issue #58, rule 8): every unfinished run in
+    /// every project is claimed, so a daemon killed mid-run picks the runs
+    /// up again. A served daemon does this; an embedded one
+    /// (`resume_runs: false`) does not - opening the REPL must not
+    /// silently resume someone's build and push. It is the one scan: a
+    /// session no longer repeats it per connection (#58 fix 5).
+    ///
+    /// A lead waiting at a checkpoint gets a task that waits; one left
+    /// mid-child continues it. A finished lead is ignored, and so is a
+    /// lead holding only `thread_started`.
+    pub fn resume_unfinished_runs(&self) {
+        if !self.server.resume_runs {
+            return;
+        }
+        // The index's leads, grouped by their project (issue #9): a lead
+        // never switches, so its project is its home. A group the daemon
+        // does not know is skipped, as the old `root_of` guard skipped it.
+        // The ids come out under the lock, then `project_of` takes it
+        // again: iterating the guard while asking it deadlocks.
+        let ids: Vec<Ulid> = self
+            .index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, indexed)| matches!(indexed.run, RunThread::Lead { .. }))
+            .map(|(id, _)| *id)
+            .collect();
+        let mut groups: BTreeMap<String, Vec<Ulid>> = BTreeMap::new();
+        for id in ids {
+            let Some(project) = self.project_of(id) else {
+                continue;
+            };
+            if self.server.project(&project).is_none() {
+                continue;
+            }
+            groups.entry(project).or_default().push(id);
+        }
+        for (project, mut ids) in groups {
+            // Oldest first, so a restarted run's newest lead is claimed
+            // last and stays the claimed one.
+            ids.sort_unstable();
+            for id in ids {
+                // The world is the lead's own: a lead the migration held
+                // back still writes in its legacy directory (issue #9).
+                let Some(dir) = self.dir_of(id) else {
+                    continue;
+                };
+                let Ok(world) = self.run_world(&project, dir) else {
+                    continue;
+                };
+                // Repair, like every other read here: a `kill -9` mid-write
+                // leaves a half line that was never an event.
+                let Ok((log, _cut)) =
+                    ThreadLog::open_with(&world.root.threads_dir, id, Repair::TruncateTornTail)
+                else {
+                    continue;
+                };
+                let Some(started) = crate::runs::run_started_of(&log).ok() else {
+                    continue;
+                };
+                if crate::runs::unfinished(&log, started.issue).is_none() {
+                    continue;
+                }
+                // A lead another aigentic process drives is left to it:
+                // this daemon must not write the same log.
+                let _ = self.claim_or_attach(id, &world);
+            }
+        }
+    }
+
+    /// Start a run for `(project, issue)`, or resume the one already
+    /// there, and answer with its lead. `resumed` says which happened.
+    ///
+    /// The whole check-and-create runs under the table's lock and the
+    /// issue's OS lock, so two concurrent `Build`s for one issue, in one
+    /// process or in two, cannot both find no run and both create one.
+    /// Exactly one task ever drives a lead: [`Runs::claim`] decides it.
+    pub async fn build_run(
+        &self,
+        project: &str,
+        issue: u64,
+        workflow: Option<String>,
+        by: Author,
+    ) -> Result<(Ulid, bool), ThreadError> {
+        let _serial = self.build_lock.lock().await;
+        let base = self.threads_base.clone();
+        // Held until the lead exists and is claimed: another process's
+        // `Build` for this issue then finds the lead instead of making
+        // a second one. The lock names the project (issue #9), so two
+        // projects' issue 7 do not wait on each other.
+        let _issue = IssueLock::take(&base, project, issue)
+            .await
+            .map_err(ThreadError::Refused)?;
+        if let Some(lead) = self.unfinished_run(project, issue)? {
+            // The run continues where its lead's log is (issue #9): in
+            // the flat base, or in a legacy subdirectory the migration
+            // held back.
+            let world = self.run_world_for(project, lead)?;
+            self.claim_or_attach(lead, &world)?;
+            return Ok((lead, true));
+        }
+        // A new run is written flat.
+        let world = self.run_world(project, base)?;
+        // The workflow defaults to `build`, the name the acceptance uses
+        // (issue #58, rule 4).
+        let name = workflow.unwrap_or_else(|| DEFAULT_WORKFLOW.to_owned());
+        let loaded = WorkflowFile::load(&name, &world.workflow_roots())?;
+        let info = self.create(project, by.clone(), false).await?;
+        let lead = info.id;
+        // The lead's log starts `thread_started`, then `run_started`: the
+        // runner insists on it, and this is the last write before a task
+        // owns the log.
+        let (mut log, _cut) =
+            ThreadLog::open_with(&world.root.threads_dir, lead, Repair::TruncateTornTail)?;
+        if !log
+            .events()
+            .iter()
+            .any(|event| event.kind == EventKind::RunStarted)
+        {
+            log.append(NewEvent {
+                kind: EventKind::RunStarted,
+                author: by,
+                payload: serde_json::to_value(RunStartedPayload {
+                    issue,
+                    workflow: name,
+                    version: loaded.workflow.version,
+                    content_hash: loaded.content_hash,
+                    budget_usd: loaded.workflow.budget.full,
+                })
+                .expect("run_started serialises"),
+                parent_event: None,
+            })?;
+        }
+        self.note_lead(lead, issue, &world.root.threads_dir, project);
+        self.claim_or_attach(lead, &world)?;
+        Ok((lead, false))
+    }
+
+    /// Tell the index that `thread` is a lead of `issue` whose log is in
+    /// `dir` (issue #9). A fresh lead's `run_started` is appended after
+    /// `create` indexed it, so its own daemon has to be told; a scanned
+    /// lead is already a lead and this only refreshes its directory.
+    fn note_lead(&self, thread: Ulid, issue: u64, dir: &Path, project: &str) {
+        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = index.entry(thread).or_insert_with(|| Indexed {
+            dir: dir.to_path_buf(),
+            home: Some(project.to_owned()),
+            switched: None,
+            switched_root: None,
+            root: None,
+            creator: None,
+            run: RunThread::No,
+            torn_run: false,
+            // A lead is never front (issue #84).
+            front: false,
+        });
+        entry.dir = dir.to_path_buf();
+        entry.run = RunThread::Lead { issue };
+        if entry.home.is_none() {
+            entry.home = Some(project.to_owned());
+        }
+    }
+
+    /// Send one answer to the task that drives `lead`, starting that task
+    /// when nobody holds the lead — the start-up scan may not have
+    /// reached it, or its task may have ended. Blocks until the task has
+    /// appended the answer or refused it.
+    ///
+    /// Nothing is written here: the task owns the lead log and checks the
+    /// gate immediately before appending, so a second answer to one gate
+    /// and an answer to a gate the run is not asking at are both refused.
+    pub async fn answer_checkpoint(
+        &self,
+        lead: Ulid,
+        gate: String,
+        answer: CheckpointAnswer,
+        amendment: Option<String>,
+        by: Author,
+    ) -> Result<(), ThreadError> {
+        let RunThread::Lead { .. } = self.run_thread(lead) else {
+            return Err(ThreadError::NotARun(lead));
+        };
+        let project = self.project_of(lead).ok_or(ThreadError::NoThread(lead))?;
+        // The open gate is the run's, not the answerer's: check it here,
+        // so a wrong gate, a run that is not waiting and a run that has
+        // already finished are refused before a task is started over it.
+        // The runner checks again, immediately before it appends.
+        let root = Root {
+            threads_dir: self.dir_of(lead).ok_or(ThreadError::NoThread(lead))?,
+            ..self.root_of(&project)?
+        };
+        let (log, _cut) = ThreadLog::open_with(&root.threads_dir, lead, Repair::TruncateTornTail)?;
+        match aigentic_runtime::aigentic_log::run_state(log.events())?.next_move() {
+            aigentic_runtime::aigentic_log::NextMove::AwaitingCheckpoint { gate: asked }
+                if asked == gate => {}
+            aigentic_runtime::aigentic_log::NextMove::AwaitingCheckpoint { gate: asked } => {
+                return Err(ThreadError::Refused(format!(
+                    "the run waits at `{asked}`, not `{gate}`"
+                )));
+            }
+            _ => {
+                return Err(ThreadError::Refused(format!(
+                    "the run is not waiting at a gate, so `{gate}` cannot be answered"
+                )));
+            }
+        }
+        // A gate takes only the answers its ask offered: a checkpoint step
+        // offers go, amend and stop; a gate the runner raised offers stop,
+        // or retry at checks_failed.
+        let word = match answer {
+            CheckpointAnswer::Go => "go",
+            CheckpointAnswer::Amend => "amend",
+            CheckpointAnswer::Retry => "retry",
+            CheckpointAnswer::Stop => "stop",
+            CheckpointAnswer::Raise => "raise",
+        };
+        let offered: Vec<String> = log
+            .events()
+            .iter()
+            .rev()
+            .find(|event| event.kind == aigentic_runtime::aigentic_core::EventKind::CheckpointAsked)
+            .and_then(|event| {
+                serde_json::from_value::<aigentic_runtime::aigentic_log::CheckpointAskedPayload>(
+                    event.payload.clone(),
+                )
+                .ok()
+            })
+            .map(|asked| asked.options)
+            .unwrap_or_default();
+        if !offered.iter().any(|option| option == word) {
+            return Err(ThreadError::Refused(format!(
+                "`{gate}` takes {}, not `{word}`",
+                offered.join(" or ")
+            )));
+        }
+        if answer == CheckpointAnswer::Amend
+            && amendment
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty())
+        {
+            return Err(ThreadError::Refused(
+                "`amend` needs the amendment's text".into(),
+            ));
+        }
+        drop(log);
+        let world = self.run_world_for(&project, lead)?;
+        let tx = self.claim_or_attach(lead, &world)?;
+        let (reply, rx) = oneshot::channel();
+        tx.send(Answer {
+            gate,
+            answer,
+            amendment,
+            by,
+            reply,
+        })
+        .map_err(|_| ThreadError::Gone)?;
+        match rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => Err(ThreadError::Refused(reason)),
+            Err(_) => Err(ThreadError::Gone),
+        }
+    }
+
+    /// Claim `lead` for this caller, starting a task over it when nobody
+    /// holds it, and return where to send its answers. An [`Claim::Attached`]
+    /// lead gets no second runner, and a lead another process drives is
+    /// refused (issue #58 fix 2) rather than written a second time.
+    fn claim_or_attach(
+        &self,
+        lead: Ulid,
+        world: &RunWorld,
+    ) -> Result<mpsc::UnboundedSender<Answer>, ThreadError> {
+        match self.runs.claim(lead, world) {
+            Claim::Attached(tx) => Ok(tx),
+            Claim::Claimed(lock, rx, tx) => {
+                let runs = self.runs.clone();
+                let world = world.clone();
+                // The lock travels into the task, which holds it until it
+                // ends: no path leaves a claimed lead unlocked or a
+                // released lead locked.
+                let task = tokio::spawn(async move { drive(runs, world, lead, rx, lock).await });
+                self.runs.remember(lead, task);
+                Ok(tx)
+            }
+            Claim::Elsewhere { reason } => Err(ThreadError::Refused(reason)),
+        }
+    }
 }
 
-/// A listing row from the log alone.
+/// What a thread is to a run (issue #58, rule 5): a lead, a step child,
+/// or an ordinary thread the daemon may run an actor for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunThread {
+    /// Not part of a run: an ordinary thread.
+    No,
+    /// A run's lead; the run is for `issue`.
+    Lead {
+        /// The issue the run was started for.
+        issue: u64,
+    },
+    /// A step's child thread, written by a run's runner: `lead` is the
+    /// run it belongs to, `step` the step it works when the header names
+    /// one.
+    Child { lead: Ulid, step: Option<String> },
+    /// A job's own thread: `front` is the thread whose person approved it
+    /// and whose permission mode it runs under.
+    Job { front: Ulid },
+}
+
+impl RunThread {
+    /// This thread on the wire (issue #58): `None` for a thread no run
+    /// owns.
+    pub fn wire(&self) -> Option<aigentic_api::RunThread> {
+        match self {
+            RunThread::No => None,
+            RunThread::Lead { issue } => Some(aigentic_api::RunThread::Lead { issue: *issue }),
+            RunThread::Child { lead, step } => Some(aigentic_api::RunThread::Child {
+                lead: *lead,
+                step: step.clone(),
+            }),
+            // The wire carries no job variant yet; a job is a daemon-driven
+            // child of its front thread.
+            RunThread::Job { front } => Some(aigentic_api::RunThread::Child {
+                lead: *front,
+                step: None,
+            }),
+        }
+    }
+}
+
+/// Every log file in `dir`, sorted: `<dir>/<ulid>.jsonl`. An unreadable
+/// directory is empty, not an error.
+fn log_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .filter(|path| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.parse::<Ulid>().is_ok())
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// The legacy `<base>/<project>` directories: every subdirectory of
+/// `base` whose name does not start with `.` (issue #9). A dot-named
+/// directory is left alone, logs and all.
+fn legacy_dirs(base: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter(|path| {
+            !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'))
+        })
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// Is `a` the same root as `b`? Both sides are canonicalised when they
+/// exist, so `/tmp` and `/private/tmp` match on macOS (issue #9).
+pub(crate) fn same_root(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// The project a `thread_started` gives a thread (issue #9): its own
+/// `project`.
+///
+/// A pre-phase-6 log wrote [`LEGACY_NONE_PROJECT`] for a root with no
+/// project file, because the per-project directory was the index. That
+/// stand-in name is gone, so such a thread belongs to
+/// `project_name_at(root)` — and to no project at all when that name is
+/// another project's, at a different canonical root.
+fn home_of(
+    server: &ServerConfig,
+    project: Option<&str>,
+    root: Option<&Path>,
+    memo: &mut HashMap<PathBuf, Option<String>>,
+) -> Option<String> {
+    let name = project?;
+    if name != LEGACY_NONE_PROJECT {
+        return Some(name.to_owned());
+    }
+    let root = root?;
+    // Canonicalising is memoised per distinct root: a scan of 456 logs
+    // must not canonicalise one path 456 times.
+    if let Some(known) = memo.get(root) {
+        return known.clone();
+    }
+    // The root's project file name if one exists now, else the root's
+    // own basename: the rule the embedded daemon names a bare root by,
+    // minus its hex suffix. A configured project at a different root
+    // claims that name, so the thread has no project it can be built in.
+    let candidate = crate::workspaces::project_name(root);
+    let home = match server.project(&candidate) {
+        Some(p) if !same_root(&p.root, root) => None,
+        _ => Some(candidate),
+    };
+    memo.insert(root.to_path_buf(), home.clone());
+    home
+}
+
+/// Read one log into its index entry (issue #9): the `thread_started`,
+/// the last `project_switched` and the `run_started` are the only lines
+/// that carry it. Nothing is validated and no line ends the read, since
+/// a switch can come anywhere.
+fn scan_log(
+    path: &Path,
+    server: &ServerConfig,
+    memo: &mut HashMap<PathBuf, Option<String>>,
+) -> Option<(Ulid, Indexed)> {
+    let id: Ulid = path.file_stem()?.to_str()?.parse().ok()?;
+    let dir = path.parent()?.to_path_buf();
+    let file = std::fs::File::open(path).ok()?;
+    let mut entry = Indexed {
+        dir,
+        home: None,
+        switched: None,
+        switched_root: None,
+        root: None,
+        creator: None,
+        run: RunThread::No,
+        torn_run: false,
+        front: false,
+    };
+    let mut parent: Option<Ulid> = None;
+    let mut step: Option<String> = None;
+    let mut job = false;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        let wants_started = line.contains("\"kind\":\"thread_started\"");
+        let wants_switch = line.contains("\"kind\":\"project_switched\"");
+        let wants_run = line.contains("\"kind\":\"run_started\"");
+        if !(wants_started || wants_switch || wants_run) {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Event>(&line) else {
+            // A line that promised a `run_started` and did not parse:
+            // the log says it is a lead and its issue cannot be read.
+            if wants_run {
+                entry.torn_run = true;
+            }
+            continue;
+        };
+        match event.kind {
+            EventKind::ThreadStarted if wants_started => {
+                let Ok(p) = serde_json::from_value::<ThreadStartedPayload>(event.payload.clone())
+                else {
+                    continue;
+                };
+                entry.home = home_of(server, p.project.as_deref(), Some(&p.root), memo);
+                entry.root = Some(p.root.clone());
+                // Only a person counts (issue #81): an agent's thread (a
+                // build's or a step's child) gets no projects block.
+                entry.creator = match p.created_by {
+                    Author::User(user) => Some(user),
+                    Author::Agent(_) | Author::System => None,
+                };
+                // The person's front thread (issue #84); a line written
+                // before the field reads as `false`.
+                entry.front = p.front;
+                job = p.job;
+                parent = p.parent_thread;
+                step = p.step.clone();
+            }
+            EventKind::ProjectSwitched if wants_switch => {
+                if let Ok(p) = serde_json::from_value::<
+                    aigentic_runtime::aigentic_log::ProjectSwitchedPayload,
+                >(event.payload.clone())
+                {
+                    // The root too (issue #88): the last switch's root,
+                    // whatever its `to` is, so `switched` and
+                    // `switched_root` never disagree.
+                    entry.switched_root = p.to.as_ref().map(|_| p.root.clone());
+                    entry.switched = p.to;
+                }
+            }
+            EventKind::RunStarted if wants_run => {
+                if let Ok(p) = serde_json::from_value::<RunStartedPayload>(event.payload.clone()) {
+                    entry.run = RunThread::Lead { issue: p.issue };
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(front) = parent {
+        entry.run = if job {
+            RunThread::Job { front }
+        } else {
+            RunThread::Child { lead: front, step }
+        };
+    }
+    Some((id, entry))
+}
+
+/// The index: every thread the threads directory holds, read from the
+/// logs once, at start-up (issue #9). The flat directory is read first,
+/// then each legacy subdirectory; if an id is in both, the flat one wins.
+fn scan_index(base: &Path, server: &ServerConfig) -> HashMap<Ulid, Indexed> {
+    let mut memo: HashMap<PathBuf, Option<String>> = HashMap::new();
+    let mut index: HashMap<Ulid, Indexed> = HashMap::new();
+    for path in log_files(base) {
+        if let Some((id, entry)) = scan_log(&path, server, &mut memo) {
+            index.insert(id, entry);
+        }
+    }
+    for sub in legacy_dirs(base) {
+        for path in log_files(&sub) {
+            if let Some((id, entry)) = scan_log(&path, server, &mut memo) {
+                index.entry(id).or_insert(entry);
+            }
+        }
+    }
+    index
+}
+
+/// The order `/threads` shows across projects (issue #86), as a pure
+/// function over the rows, so the rule is tested without a daemon:
+///
+/// 1. the caller's front thread — the row whose kind is `Front` — once,
+///    first, and not again in its workspace group;
+/// 2. the builds (`Run(..)`), as a forest: a root is a lead, or a child
+///    whose lead is not among the listed rows (an unreadable lead, a
+///    log gone, or a run started inside a step child, which the log
+///    makes a child of that step). Roots newest first, each followed by
+///    the rows whose lead is it, oldest first, recursively, so a
+///    grandchild follows its own parent;
+/// 3. everything else, grouped by workspace: newest first inside a
+///    group, groups by their newest row, newest first. A row in no
+///    workspace is a group like any other.
+///
+/// A torn lead is not here at all: `scan_log` leaves its kind `Thread`,
+/// so it sorts as a plain thread — its issue is unknown.
+fn order_across_projects(rows: Vec<ThreadInfo>) -> Vec<ThreadInfo> {
+    let mut ordered: Vec<ThreadInfo> = Vec::with_capacity(rows.len());
+    let mut builds: Vec<ThreadInfo> = Vec::new();
+    let mut rest: Vec<ThreadInfo> = Vec::new();
+    let mut front: Option<ThreadInfo> = None;
+    for row in rows {
+        if row.kind == ThreadKind::Front {
+            front = Some(row);
+        } else if matches!(row.kind, ThreadKind::Run(_)) {
+            builds.push(row);
+        } else {
+            rest.push(row);
+        }
+    }
+    if let Some(row) = front {
+        ordered.push(row);
+    }
+
+    if !builds.is_empty() {
+        let listed: HashSet<Ulid> = builds.iter().map(|row| row.id).collect();
+        let mut children: HashMap<Ulid, Vec<Ulid>> = HashMap::new();
+        let mut roots: Vec<Ulid> = Vec::new();
+        for row in &builds {
+            match row.kind {
+                ThreadKind::Run(aigentic_api::RunThread::Child { lead, .. })
+                    if listed.contains(&lead) =>
+                {
+                    children.entry(lead).or_default().push(row.id);
+                }
+                // A lead, and a child whose lead is nowhere here.
+                _ => roots.push(row.id),
+            }
+        }
+        // Roots newest first, each row's children oldest first.
+        roots.sort_unstable_by(|a, b| b.cmp(a));
+        for kids in children.values_mut() {
+            kids.sort_unstable();
+        }
+        let mut by_id: HashMap<Ulid, ThreadInfo> =
+            builds.into_iter().map(|row| (row.id, row)).collect();
+        for root in roots {
+            emit_build(root, &mut by_id, &children, &mut ordered);
+        }
+        // Nothing should be left — the tree is a forest — but a cycle a
+        // damaged log could describe must not drop rows.
+        let mut left: Vec<ThreadInfo> = by_id.into_values().collect();
+        left.sort_unstable_by_key(|r| std::cmp::Reverse(r.id));
+        ordered.extend(left);
+    }
+
+    // Newest first, so the first row of each workspace group is the
+    // group's newest and the groups come out by it.
+    rest.sort_unstable_by_key(|r| std::cmp::Reverse(r.id));
+    let mut groups: Vec<(Option<String>, Vec<ThreadInfo>)> = Vec::new();
+    for row in rest {
+        match groups
+            .iter_mut()
+            .find(|(workspace, _)| *workspace == row.workspace)
+        {
+            Some((_, group)) => group.push(row),
+            None => groups.push((row.workspace.clone(), vec![row])),
+        }
+    }
+    for (_, group) in groups {
+        ordered.extend(group);
+    }
+    ordered
+}
+
+/// A build root and its descendants, in order: the row, then the rows
+/// whose lead it is, oldest first, each of them the same way. A row is
+/// taken out of `by_id` as it is emitted, so a cycle cannot loop.
+fn emit_build(
+    id: Ulid,
+    by_id: &mut HashMap<Ulid, ThreadInfo>,
+    children: &HashMap<Ulid, Vec<Ulid>>,
+    out: &mut Vec<ThreadInfo>,
+) {
+    let Some(row) = by_id.remove(&id) else {
+        return;
+    };
+    out.push(row);
+    if let Some(kids) = children.get(&id) {
+        for kid in kids {
+            emit_build(*kid, by_id, children, out);
+        }
+    }
+}
+
+/// A listing row from the log alone. What the row is and which
+/// workspace groups it is the caller's to fill (issue #86), since a
+/// summary cannot know either.
 fn summarise(dir: &Path, id: Ulid, project: &str) -> ThreadInfo {
     let fallback_date = || {
         time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(id.timestamp_ms()) * 1_000_000)
@@ -401,6 +2310,8 @@ fn summarise(dir: &Path, id: Ulid, project: &str) -> ThreadInfo {
             first_line: String::new(),
             state: ThreadState::Idle,
             title: None,
+            workspace: None,
+            kind: ThreadKind::Thread,
         };
     };
     let date = events
@@ -408,11 +2319,6 @@ fn summarise(dir: &Path, id: Ulid, project: &str) -> ThreadInfo {
         .and_then(|e| e.created_at.format(&Rfc3339).ok())
         .map(|s| s[..10].to_owned())
         .unwrap_or_else(fallback_date);
-    let recorded_project = events
-        .first()
-        .filter(|e| e.kind == EventKind::ThreadStarted)
-        .and_then(|e| serde_json::from_value::<ThreadStartedPayload>(e.payload.clone()).ok())
-        .and_then(|p| p.project);
     let first_line = events
         .iter()
         .find(|e| e.kind == EventKind::UserMessage)
@@ -427,34 +2333,20 @@ fn summarise(dir: &Path, id: Ulid, project: &str) -> ThreadInfo {
         .unwrap_or_default();
     ThreadInfo {
         id,
-        project: recorded_project.or_else(|| Some(project.to_owned())),
+        project: Some(project.to_owned()),
         date,
         events: events.len() as u64,
         first_line,
         state: ThreadState::Idle,
         title: aigentic_runtime::title::title_of(&events),
+        workspace: None,
+        kind: ThreadKind::Thread,
     }
-}
-
-/// The project a thread last switched to, from its log.
-fn last_switch(dir: &Path, id: Ulid) -> Option<String> {
-    let events = ThreadLog::open(dir, id).ok()?.read_all().ok()?;
-    events
-        .iter()
-        .rev()
-        .filter(|e| e.kind == EventKind::ProjectSwitched)
-        .find_map(|e| {
-            serde_json::from_value::<aigentic_runtime::aigentic_log::ProjectSwitchedPayload>(
-                e.payload.clone(),
-            )
-            .ok()
-        })
-        .and_then(|p| p.to)
 }
 
 const FIRST_LINE_CHARS: usize = 72;
 
-fn first_line_of(text: &str) -> String {
+pub(crate) fn first_line_of(text: &str) -> String {
     let line = text
         .lines()
         .find(|l| !l.trim().is_empty())
@@ -473,13 +2365,609 @@ pub fn has_project_file(root: &Path) -> bool {
     root.join(aigentic_runtime::project::FILE_NAME).is_file()
 }
 
-/// The project name a root would have: its file's, else `_none`.
-pub fn project_name_at(root: &Path) -> String {
-    if has_project_file(root) {
-        Project::open_root(root)
-            .map(|p| p.name)
-            .unwrap_or_else(|_| NO_PROJECT_DIR.into())
+/// The project name a root has, for the embedded daemon and for the
+/// index: the project file's name, else the root's own file name — a
+/// bare root *is* the project (issue #9).
+///
+/// A bare root whose name a workspace project already has at another
+/// root takes `<name>-<8 hex>` instead, so the two never collide: the
+/// hex is FNV-1a 32 over the canonical root path's bytes, written out
+/// here rather than taken from `DefaultHasher`, which is not stable
+/// across Rust versions.
+pub fn project_name_at(root: &Path, workspaces: &[Workspace]) -> String {
+    let name = crate::workspaces::project_name(root);
+    if has_project_file(root) || !name_clashes(&name, root, workspaces) {
+        return name;
+    }
+    format!(
+        "{name}-{:08x}",
+        fnv1a_32(canonical(root).to_string_lossy().as_bytes())
+    )
+}
+
+/// Is `name` a workspace project's, at a root that is not `root`?
+///
+/// Public so a local reader — `aigentic stats`, `aigentic threads` — can
+/// apply the same rule the daemon's `home_of` does (#83).
+pub fn name_clashes(name: &str, root: &Path, workspaces: &[Workspace]) -> bool {
+    workspaces
+        .iter()
+        .flat_map(|w| w.projects.iter())
+        .any(|p| crate::workspaces::project_name(p) == name && !same_root(p, root))
+}
+
+/// The front thread's current project and its root, read from the logs
+/// without a table (issue #88): the built-in daemon learns where the
+/// person's front thread lives before it fixes its project list.
+///
+/// Walks the flat directory and every legacy one, reads the first line
+/// of each log — a daemon-made log starts with `thread_started` — keeps
+/// the ones whose `thread_started` is a person's front thread, and takes
+/// the largest id. The largest is the newest because thread ids come
+/// from one strictly increasing source ([`Ids`]). `None` when there is
+/// no front thread, when its project is `None`, or when it is the
+/// legacy `_none` a front thread can never have.
+pub fn front_root(base: &Path, user: &str) -> Option<(String, PathBuf)> {
+    let mut newest: Option<(Ulid, PathBuf)> = None;
+    for path in log_files(base).into_iter().chain(
+        legacy_dirs(base)
+            .into_iter()
+            .flat_map(|sub| log_files(&sub)),
+    ) {
+        let Some((id, front)) = front_head(&path, user) else {
+            continue;
+        };
+        if front && newest.as_ref().is_none_or(|(best, _)| id > *best) {
+            newest = Some((id, path));
+        }
+    }
+    let (_, path) = newest?;
+    front_project_of(&path)
+}
+
+/// The rule behind `root_of_thread` (issue #88), pure so the pre-#88
+/// index — `switched` set, no root — can be tested on an entry no table
+/// would build: when the name `project_of` answers is the log's last
+/// switch, the switch's root, **never** the home root when that root is
+/// unrecorded; else the entry's own root.
+fn root_of_indexed(indexed: &Indexed, project: Option<&str>) -> Option<PathBuf> {
+    if indexed.switched.is_some() && indexed.switched.as_deref() == project {
+        indexed.switched_root.clone()
     } else {
-        NO_PROJECT_DIR.into()
+        indexed.root.clone()
+    }
+}
+
+/// The id and the `front` flag in a log's first line, when that line is
+/// a `thread_started` this person made (issue #88). Reads one line.
+fn front_head(path: &Path, user: &str) -> Option<(Ulid, bool)> {
+    let id: Ulid = path.file_stem()?.to_str()?.parse().ok()?;
+    let file = std::fs::File::open(path).ok()?;
+    let first = BufReader::new(file).lines().next()?.ok()?;
+    if !first.contains("\"kind\":\"thread_started\"") {
+        return None;
+    }
+    let event: Event = serde_json::from_str(&first).ok()?;
+    if event.kind != EventKind::ThreadStarted {
+        return None;
+    }
+    let p: ThreadStartedPayload = serde_json::from_value(event.payload).ok()?;
+    if p.created_by != Author::User(UserId(user.to_owned())) {
+        return None;
+    }
+    Some((id, p.front))
+}
+
+/// The project and root a log names now (issue #88), mirroring
+/// `scan_log`'s reading of the same two lines: the last
+/// `project_switched` with `to` as the log has it, else the
+/// `thread_started`'s own project. A last switch with `to: None` clears
+/// the switch, exactly as it does in the index.
+fn front_project_of(path: &Path) -> Option<(String, PathBuf)> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut started: Option<(Option<String>, PathBuf)> = None;
+    let mut switched: Option<(Option<String>, PathBuf)> = None;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        let wants_started = line.contains("\"kind\":\"thread_started\"");
+        let wants_switch = line.contains("\"kind\":\"project_switched\"");
+        if !(wants_started || wants_switch) {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Event>(&line) else {
+            continue;
+        };
+        match event.kind {
+            EventKind::ThreadStarted if wants_started => {
+                let Ok(p) = serde_json::from_value::<ThreadStartedPayload>(event.payload) else {
+                    continue;
+                };
+                started = Some((p.project, p.root));
+            }
+            EventKind::ProjectSwitched if wants_switch => {
+                let Ok(p) = serde_json::from_value::<ProjectSwitchedPayload>(event.payload) else {
+                    continue;
+                };
+                switched = Some((p.to, p.root));
+            }
+            _ => {}
+        }
+    }
+    // Only the last switch counts, and only when it named a project.
+    let (project, root) = match switched {
+        Some((to @ Some(_), root)) => (to, root),
+        _ => started?,
+    };
+    let name = project?;
+    if name == LEGACY_NONE_PROJECT {
+        return None;
+    }
+    Some((name, root))
+}
+
+/// `root` as it really is, or as given when it does not exist.
+fn canonical(root: &Path) -> PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+/// FNV-1a, 32 bits: the hash the `-<8 hex>` suffix uses, written inline
+/// so it stays the same across Rust versions (issue #9).
+fn fnv1a_32(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A factory the classification tests never reach: they read logs, and
+    /// no thread of theirs is opened.
+    struct Unused;
+
+    impl crate::build::ProviderFactory for Unused {
+        fn build(
+            &self,
+            _: &str,
+        ) -> Result<
+            (Box<dyn aigentic_runtime::aigentic_core::Provider>, String),
+            crate::build::BuildError,
+        > {
+            Err(crate::build::BuildError::Config("no build".into()))
+        }
+    }
+
+    /// A table over `threads`, in one project `p` at `root`.
+    fn table(dir: &Path, root: &Path) -> ThreadTable {
+        let server = Arc::new(ServerConfig {
+            listen: "unix".into(),
+            idle_unload_secs: 3600,
+            users: Vec::new(),
+            projects: vec![crate::config::ProjectConfig {
+                name: "p".into(),
+                root: root.to_path_buf(),
+            }],
+            resume_runs: false,
+        });
+        ThreadTable::new(
+            Arc::new(
+                Config::parse(
+                    "default_profile = \"a\"\n[profiles.a]\nbase_url = \"u\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
+                )
+                .unwrap(),
+            ),
+            dir.join("cfg"),
+            server,
+            Arc::new(Unused),
+            Arc::new(crate::actor::NoReports),
+            dir.join("threads"),
+            crate::awake::detect(false),
+        )
+    }
+
+    /// Write `id`'s `thread_started` into `threads` with `parent`, `step`
+    /// and `job` as given, the shapes a runner's and a daemon's mastheads
+    /// have.
+    fn masthead(threads: &Path, id: Ulid, parent: Option<Ulid>, step: Option<&str>, job: bool) {
+        let (mut log, _cut) = ThreadLog::open_with(threads, id, Repair::TruncateTornTail).unwrap();
+        log.append(NewEvent {
+            kind: EventKind::ThreadStarted,
+            author: Author::System,
+            payload: serde_json::to_value(ThreadStartedPayload {
+                project: Some("p".into()),
+                root: "/tmp/p".into(),
+                created_by: Author::System,
+                parent_thread: parent,
+                step: step.map(str::to_owned),
+                front: false,
+                job,
+            })
+            .unwrap(),
+            parent_event: None,
+        })
+        .unwrap();
+    }
+
+    /// A workspace `name` listing `roots`, for the resolver tests.
+    fn workspace(name: &str, roots: &[&Path]) -> Workspace {
+        Workspace {
+            name: name.to_owned(),
+            shared: None,
+            projects: roots.iter().map(|r| r.to_path_buf()).collect(),
+        }
+    }
+
+    /// A project root folder `name` under `dir`, with a `[project] name`
+    /// when `named` and the given `[participants]` lines.
+    fn root(dir: &Path, name: &str, text: Option<&str>) -> PathBuf {
+        let root = dir.join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        if let Some(text) = text {
+            std::fs::write(root.join("aigentic.toml"), text).unwrap();
+        }
+        root
+    }
+
+    /// A daemon-driven thread and a runner's child have the same parent
+    /// field, so the `job` flag in `thread_started` tells them apart: a job
+    /// read as a stepless step child would be refused writes by rule 5
+    /// that its driver must make, and a step child would lose its step.
+    #[test]
+    fn a_jobs_masthead_reads_as_a_job_and_a_steps_as_a_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = root(dir.path(), "p", None);
+        let threads = dir.path().join("threads");
+        std::fs::create_dir_all(&threads).unwrap();
+        let front = Ulid::generate();
+        masthead(&threads, front, None, None, false);
+        let job = Ulid::generate();
+        masthead(&threads, job, Some(front), None, true);
+        let step = Ulid::generate();
+        masthead(&threads, step, Some(front), Some("implement"), false);
+        let plain_child = Ulid::generate();
+        masthead(&threads, plain_child, Some(front), None, false);
+
+        let table = table(dir.path(), &project);
+        assert_eq!(table.run_thread(job), RunThread::Job { front });
+        assert_eq!(
+            table.run_thread(step),
+            RunThread::Child {
+                lead: front,
+                step: Some("implement".into())
+            }
+        );
+        assert_eq!(
+            table.run_thread(plain_child),
+            RunThread::Child {
+                lead: front,
+                step: None
+            }
+        );
+        assert_eq!(table.run_thread(front), RunThread::No);
+
+        // The wire has no job variant yet: a job travels as a child of the
+        // thread that started it, which is what it is.
+        assert_eq!(
+            table.run_thread(job).wire(),
+            Some(aigentic_api::RunThread::Child {
+                lead: front,
+                step: None
+            })
+        );
+    }
+
+    /// T9: an entry that does not resolve adds no row and warns once,
+    /// naming the entry and the reason; the rest of the list still
+    /// resolves, in entry order.
+    #[test]
+    fn an_entry_that_does_not_resolve_warns_and_adds_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = root(dir.path(), "r", None);
+        let bad = root(dir.path(), "bad", Some("not valid = ["));
+        let spaces = [workspace("v", &[good.as_path(), bad.as_path()])];
+
+        // An unknown workspace, a project the workspace does not list,
+        // and a malformed project file at a listed root: no row each,
+        // one warning each.
+        for entry in ["nope/r", "v/q", "v/bad"] {
+            let (added, warnings) = related_in_reach(
+                &[],
+                &spaces,
+                &[entry.to_owned()],
+                None,
+                None,
+                "u",
+                Some("u"),
+            );
+            assert!(added.is_empty(), "{entry} added {}", added.len());
+            assert_eq!(warnings.len(), 1, "{entry}: {warnings:?}");
+            assert!(warnings[0].contains(entry), "{}", warnings[0]);
+        }
+
+        // A valid entry beside a broken one: only the valid row, and the
+        // rows come in entry order.
+        let broken = root(dir.path(), "broken", Some("not valid = ["));
+        let spaces = [workspace("v", &[good.as_path(), broken.as_path()])];
+        let (added, warnings) = related_in_reach(
+            &[],
+            &spaces,
+            &["v/broken".to_owned(), "v/r".to_owned()],
+            None,
+            None,
+            "u",
+            Some("u"),
+        );
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].name, "v/r");
+        assert_eq!(added[0].root, good);
+        assert!(added[0].understood);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("v/broken"), "{}", warnings[0]);
+    }
+
+    /// T10: an entry naming a root the thread already understands is
+    /// skipped with a warning, so that project keeps its plain name; the
+    /// same entries with no home workspace resolve the other-workspace
+    /// one, named `<ws>/<project>`.
+    #[test]
+    fn an_entry_already_understood_is_skipped_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = root(dir.path(), "own", None);
+        let other = root(dir.path(), "other", None);
+        let spaces = [workspace("w", &[own.as_path(), other.as_path()])];
+        let entries = ["w/own".to_owned(), "w/other".to_owned()];
+
+        // The thread is in `w`, its own project `own`: both entries name
+        // something #125 already understands.
+        let (added, warnings) = related_in_reach(
+            &[],
+            &spaces,
+            &entries,
+            Some(own.as_path()),
+            Some("w"),
+            "u",
+            Some("u"),
+        );
+        assert!(added.is_empty(), "{added:?}");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().all(|w| w.contains("understood")),
+            "{warnings:?}"
+        );
+
+        // The same entries with no home workspace: the own root is still
+        // skipped, the other resolves under its address.
+        let (added, warnings) = related_in_reach(
+            &[],
+            &spaces,
+            &entries,
+            Some(own.as_path()),
+            None,
+            "u",
+            Some("u"),
+        );
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert_eq!(added[0].name, "w/other");
+        assert_eq!(added[0].root, other);
+        assert_eq!(added[0].one_line, None);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("w/own"), "{}", warnings[0]);
+    }
+
+    /// T11: nothing declared and no workspace file — no row, no warning.
+    /// The fail-closed case: an absent key reaches nothing.
+    #[test]
+    fn no_related_and_no_workspaces_add_no_row_and_no_warning() {
+        let (added, warnings) = related_in_reach(&[], &[], &[], None, None, "u", Some("u"));
+        assert!(added.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    /// T12: the role is read from the root the workspace lists, not from
+    /// a project of the same name elsewhere — the collision a name-based
+    /// read (`merge`, `root_of`) walks into.
+    #[test]
+    fn the_role_is_read_from_the_resolved_root_not_a_shadowing_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // The listed root has no participants: `u` is not the owner, so
+        // no role.
+        let listed = root(dir.path(), "r", None);
+        // A same-named project that does grant `u` a role.
+        let shadow = root(
+            dir.path(),
+            "shadow-r",
+            Some("[project]\nname = \"r\"\n\n[participants]\nu = \"admin\"\n"),
+        );
+        // The guard: this root would have resolved, so a row proves the
+        // listed one was used.
+        let file = aigentic_runtime::ProjectFile::load(&shadow.join("aigentic.toml")).unwrap();
+        assert!(
+            auth::role_in("u", Some("boss"), &file.participants).is_some(),
+            "the shadowing root must grant the role for the test to bite"
+        );
+
+        let spaces = [workspace("v", &[listed.as_path()])];
+        let (added, warnings) = related_in_reach(
+            &[],
+            &spaces,
+            &["v/r".to_owned()],
+            None,
+            None,
+            "u",
+            Some("boss"),
+        );
+        assert!(added.is_empty(), "{added:?}");
+        assert_eq!(warnings.len(), 1);
+        // The role reason, not merely the entry: a read by name would
+        // have found the granted role and added a row.
+        assert!(warnings[0].contains("holds no role"), "{}", warnings[0]);
+    }
+
+    fn indexed(switched: Option<&str>, switched_root: Option<&str>, root: Option<&str>) -> Indexed {
+        Indexed {
+            dir: PathBuf::from("/threads"),
+            home: Some("a".to_owned()),
+            switched: switched.map(str::to_owned),
+            switched_root: switched_root.map(PathBuf::from),
+            root: root.map(PathBuf::from),
+            creator: None,
+            run: RunThread::No,
+            torn_run: false,
+            front: false,
+        }
+    }
+
+    /// T5(d): an index from before #88 has `switched` and no
+    /// `switched_root`. It must give `None` — never the home root, which
+    /// belongs to another project.
+    #[test]
+    fn a_switch_with_no_recorded_root_is_never_the_home_root() {
+        let old = indexed(Some("c"), None, Some("/a"));
+        assert_eq!(root_of_indexed(&old, Some("c")), None);
+        // A name `project_of` does not answer as the switch falls back to
+        // the entry's own root.
+        assert_eq!(root_of_indexed(&old, Some("a")), Some(PathBuf::from("/a")));
+        // A switch whose root the log recorded gives it.
+        let new = indexed(Some("c"), Some("/c"), Some("/a"));
+        assert_eq!(root_of_indexed(&new, Some("c")), Some(PathBuf::from("/c")));
+    }
+
+    /// The rows under `lead`, oldest first, each the same way — the
+    /// rule's forest, over the fixture.
+    fn under(rows: &[ThreadInfo], lead: Ulid, out: &mut Vec<Ulid>) {
+        let mut kids: Vec<Ulid> = rows
+            .iter()
+            .filter(
+                |r| matches!(r.kind, ThreadKind::Run(aigentic_api::RunThread::Child { lead: l, .. }) if l == lead),
+            )
+            .map(|r| r.id)
+            .collect();
+        kids.sort_unstable();
+        for kid in kids {
+            out.push(kid);
+            under(rows, kid, out);
+        }
+    }
+
+    /// T3 (issue #86): the order across projects, as a pure function.
+    /// The fixture is a front row in a workspace group of its own (so it
+    /// must not appear in that group again), two leads, a run started
+    /// inside a step child, a child whose lead is unreadable (a child
+    /// root with a child of its own), the row of a torn lead — its kind
+    /// is `Thread` — and plain threads in two workspaces and none. The
+    /// expected order is built here from the fixture's own ids, by the
+    /// rule, not typed out.
+    #[test]
+    fn the_order_across_projects_is_built_from_the_rows() {
+        let id = |n: u64| Ulid::from_parts(1_000 + n, 0);
+        let row = |id: Ulid, workspace: Option<&str>, kind: ThreadKind| ThreadInfo {
+            id,
+            project: Some("p".to_owned()),
+            date: "2026-10-06".to_owned(),
+            events: 1,
+            first_line: String::new(),
+            state: ThreadState::Idle,
+            title: None,
+            workspace: workspace.map(str::to_owned),
+            kind,
+        };
+        let lead = |issue: u64| ThreadKind::Run(aigentic_api::RunThread::Lead { issue });
+        let step =
+            |lead: Ulid| ThreadKind::Run(aigentic_api::RunThread::Child { lead, step: None });
+
+        let lead_a = id(1);
+        let (child_a1, child_a2) = (id(2), id(3));
+        let (inner_lead, inner_child) = (id(4), id(5));
+        let (plain_alpha, lead_b, child_b1) = (id(6), id(7), id(8));
+        let (child_root, child_roots_child) = (id(9), id(10));
+        let (plain_none, front) = (id(11), id(12));
+        // A lead no row here holds: a log gone, or a lead in a project
+        // the caller cannot read.
+        let gone = id(99);
+        let rows = vec![
+            row(lead_a, Some("alpha"), lead(1)),
+            row(child_a1, Some("alpha"), step(lead_a)),
+            row(child_a2, Some("alpha"), step(lead_a)),
+            row(inner_lead, Some("alpha"), step(child_a2)),
+            row(inner_child, Some("alpha"), step(inner_lead)),
+            row(plain_alpha, Some("alpha"), ThreadKind::Thread),
+            row(lead_b, Some("beta"), lead(2)),
+            row(child_b1, Some("beta"), step(lead_b)),
+            row(child_root, Some("beta"), step(gone)),
+            row(child_roots_child, Some("beta"), step(child_root)),
+            row(plain_none, None, ThreadKind::Thread),
+            row(front, Some("beta"), ThreadKind::Front),
+        ];
+
+        // The rule, over the fixture: the front row, the forest, then
+        // the rest grouped by workspace.
+        let mut expected = vec![front];
+        let mut roots: Vec<Ulid> = rows
+            .iter()
+            .filter(|r| match r.kind {
+                ThreadKind::Run(aigentic_api::RunThread::Lead { .. }) => true,
+                ThreadKind::Run(aigentic_api::RunThread::Child { lead, .. }) => !rows
+                    .iter()
+                    .any(|o| o.id == lead && matches!(o.kind, ThreadKind::Run(_))),
+                _ => false,
+            })
+            .map(|r| r.id)
+            .collect();
+        roots.sort_unstable_by(|a, b| b.cmp(a));
+        for root in roots {
+            expected.push(root);
+            under(&rows, root, &mut expected);
+        }
+        let workspace_of = |tid: Ulid| -> Option<String> {
+            rows.iter()
+                .find(|r| r.id == tid)
+                .and_then(|r| r.workspace.clone())
+        };
+        let mut rest: Vec<Ulid> = rows
+            .iter()
+            .filter(|r| !matches!(r.kind, ThreadKind::Run(_) | ThreadKind::Front))
+            .map(|r| r.id)
+            .collect();
+        rest.sort_unstable_by(|a, b| b.cmp(a));
+        let mut groups: Vec<Option<String>> = Vec::new();
+        for tid in &rest {
+            let workspace = workspace_of(*tid);
+            if !groups.contains(&workspace) {
+                groups.push(workspace);
+            }
+        }
+        for group in groups {
+            expected.extend(rest.iter().filter(|tid| workspace_of(**tid) == group));
+        }
+
+        let got: Vec<Ulid> = order_across_projects(rows.clone())
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(got, expected);
+        // The front row is first and nowhere else; a child root leads
+        // its own child.
+        assert_eq!(got.iter().filter(|tid| **tid == front).count(), 1);
+        let at = |tid: Ulid| got.iter().position(|t| *t == tid).unwrap();
+        assert_eq!(at(child_root) + 1, at(child_roots_child));
+        assert!(at(lead_b) < at(child_b1));
+        assert!(at(child_a2) < at(inner_lead));
+        assert!(at(inner_lead) < at(inner_child));
+    }
+
+    /// Thread ids from one source come out in the order they were made,
+    /// so a base's greatest id is its newest thread — which front thread
+    /// resumes is decided by that order.
+    #[test]
+    fn ids_are_strictly_increasing() {
+        let ids = Ids::live();
+        let made: Vec<Ulid> = (0..1000).map(|_| ids.next()).collect();
+        assert!(made.windows(2).all(|w| w[1] > w[0]), "{made:?}");
     }
 }

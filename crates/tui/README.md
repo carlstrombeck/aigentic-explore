@@ -44,9 +44,10 @@ api_key_env = "ANTHROPIC_API_KEY"
 # keep_turns = 8                          # verbatim tail after a summary
 # max_result_bytes = 4096                 # truncation target for old tool results
 # summary_max_output_tokens = 2048
-# context_ceiling_tokens = 128000         # what one call's context may cost; 0 = no ceiling
+# working_set_tokens = 120000             # what one call's context may cost; 0 = no target
+# context_ceiling_tokens = 120000         # its old name, still read
 # evict_above_tokens = 64000              # sweep only above this line; 0 = sweep on call count alone
-# evict_min_free_percent = 25             # share of the ceiling a sweep must free; 0 = sweep as soon as the floor advances
+# evict_min_free_percent = 25             # share of the target a sweep must free; 0 = sweep as soon as the floor advances
 
 # utility_profile = "flash"               # side jobs: thread titles, memory extraction
 # keep_awake = true                      # hold off idle sleep while a turn works (default);
@@ -74,15 +75,16 @@ any non-empty value.
 ## Usage
 
 ```bash
-cargo run -p aigentic-tui --                                     # new thread over a daemon embedded for this directory
+cargo run -p aigentic-tui --                                     # resume the front thread over a daemon embedded for this directory; make a new one with /new
 cargo run -p aigentic-tui -- --server tcp:vm:7420 --project vendela   # the same client against a remote daemon; token in AIGENTIC_TOKEN
 cargo run -p aigentic-tui -- --thread <ULID>                     # resume by replaying the log
 cargo run -p aigentic-tui -- --thread <ULID> --profile anthropic # same thread, other backend (embedded daemon only)
-cargo run -p aigentic-tui -- project init                        # aigentic.toml + .aigentic/{knowledge,memory}
+cargo run -p aigentic-tui -- project init [--workspace <name|none>]   # aigentic.toml + .aigentic/{knowledge,memory}; asks which workspace at a terminal
 cargo run -p aigentic-tui -- project setup                       # render docs/agents/*.md from [pocock]
 cargo run -p aigentic-tui -- project show                        # layers, knowledge mode, every tool's fate; over the API with --server
+cargo run -p aigentic-tui -- workspace new <name> [--shared <dir>]   # an empty workspace; also add <path> [--workspace <name>], remove <project>, list
 cargo run -p aigentic-tui -- threads                             # this project's threads, newest first; over the API with --server
-cargo run -p aigentic-tui -- doctor [--probe]                    # config, keys, threads dir, project, participants, skills, gh; exit 1 on a fail
+cargo run -p aigentic-tui -- doctor [--probe]                    # config, keys, threads dir, workspaces, project, participants, skills, gh; exit 1 on a fail
 cargo run -p aigentic-tui -- init                                # guided setup: config, project, GitHub, knowledge links
 cargo run -p aigentic-tui -- serve [--listen unix:/path|tcp:host:port]   # the daemon (phase 5): server.toml's users and projects
 cargo run -p aigentic-tui -- serve --new-token magnus            # a fresh token for a user, printed once, never stored
@@ -92,7 +94,7 @@ cargo run -p aigentic-tui -- exec "prompt" [--json] [-o FILE]    # one turn, no 
 At a terminal the client is an inline shell (phase 6 step 3): it draws only
 the rows it needs, right under the transcript, growing for a popup or a
 prompt and shrinking back when the turn is over (the streaming reply, the composer, a status
-line with mode, project, context fill, the turn's clock and the queue), and
+line with mode, project, `working 48k · thread 2.1M` (what the model sees this call, and the whole thread), the turn's clock and the queue), and
 every finished line goes into the terminal's own scrollback, so the
 transcript scrolls, searches and copies like any other output and stays
 after quitting. Enter sends; Shift-Enter or Ctrl-J adds a line; a paste over
@@ -147,13 +149,33 @@ shared = "~/Projects/aigentic-marketing"   # its workspace/ folder: instructions
 projects = ["~/Projects/aigentic", "~/Projects/aigentic-site", "~/Projects/aigentic-marketing"]
 ```
 
+`aigentic workspace` manages them without a prompt: `new <name> [--shared
+<dir>]` creates one; `add <path> [--workspace <name>]` lists an existing
+folder (relative to the current directory, no `aigentic.toml` needed;
+`--workspace` may be left out while there is only one workspace); `remove
+<project> [--workspace <name>]` drops a project by name or path from the
+list and touches nothing on disk; `list` prints each workspace's shared
+folder and projects, marking a folder that is not on this machine
+`(missing)`, and exits 1 when a file does not parse. Editing a file by hand
+works too.
+
+`aigentic project init` asks at a terminal which workspace the folder
+joins: an existing one, `none`, or `new` (a name, then the shared folder).
+The default is the workspace already beside the folder. `--workspace
+<name|none>` answers without asking; with neither a terminal nor the flag
+the folder joins none, as a script expects. A folder with no `.git` at or
+above it gets `kind = "notes"`.
+
 The daemon reads them all, so it knows every project's root; a project's
 name is its `aigentic.toml`'s, or its folder's. Every project in a workspace
 gets the workspace's instructions and memory between the global and project
 layers. `/project use <name>` moves the thread to another project: the
 conversation stays, the instructions, knowledge, memory, skills, policy,
 tools and working directory become the new project's, the model is told,
-and a restart resumes the thread there.
+and a restart resumes the thread there. A bare `/project use` lists the
+projects as the start-up ask does, grouped by workspace with the last-used
+first: Enter moves the thread to the selected one, Esc keeps it where it
+is. A pipe gets the list printed instead, to answer with a name.
 
 `utility_profile = "<profile>"` at the top of `config.toml` names a profile
 for side jobs: thread titles and memory extraction. Without it there are no
@@ -196,13 +218,20 @@ user when that file is beside `config.toml`, else the config's `user`):
 an empty table is fine, and a table that names anyone but the owner
 fails, since the owner then has no role. `--probe` adds one
 completion per profile with a one-token cap and reports the model and
-latency; it is the only check that uses the network.
+latency; it is the only check that uses the network. An endpoint that
+answers `400` or `422` is asked once more with the profile's effort left
+out: when that answers, the line names the parameter and the value it was
+sent and the doctor fails, so a refused effort is one line rather than a
+body to decode.
 
 The profile is `--profile`, else the project's `[model] profile`, else the
 config's `default_profile`; with `--server` the flag is refused, since the
 daemon picks each thread's profile from its project. The banner names the project, the layers it
 loaded (global, project, knowledge with its mode, memory), the skill and
-tool counts and how many threads the project has.
+tool counts and how many threads the project has, and its second line says
+which thread you are in: the front thread and its title, or the id you
+resumed with `--thread`. A plain run resumes the front thread; `/new`
+starts a new one and stays in the REPL.
 
 Since phase 5 the REPL is a client of the daemon: with no `--server` it
 starts one in the process for this directory over a private socket, so a
@@ -236,8 +265,10 @@ mode, and the session grants with who gave them), `/memory` (the memory
 files with line counts, the `through_seq` of the last extraction, and
 the block as the prefix carries it), `/skills` (the enabled set), `/project`
 (the same report as `project show`, over the live registry so MCP tools are
-included), `/project use <name>` (move the thread to another project),
-`/threads`, `/<skill> [args]` for every enabled user-invoked
+included), `/project use <name>` (move the thread to another project;
+bare, a picker of every project),
+`/threads`, `/new` (start a new front thread; the old one stays listed),
+`/<skill> [args]` for every enabled user-invoked
 skill, `/help`, `/quit`. Anything else starting with `/` prints `unknown
 command`. Ctrl-D quits; Ctrl-C clears the line.
 
@@ -414,7 +445,9 @@ adapter change.
 
 1. `cd` into a Rust repository with tests. Ensure the config and the key's
    environment variable are set.
-2. Start a new thread and note the id it prints:
+2. Start the client and read the second line. A plain run resumes the front
+   thread — the first time, it starts one and says so. `/threads` lists it
+   and prints the id:
 
    ```bash
    cargo run -p aigentic-tui --

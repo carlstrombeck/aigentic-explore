@@ -13,11 +13,12 @@ use aigentic_runtime::aigentic_core::{
     UserId,
 };
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
-use aigentic_runtime::project::{DOT_DIR, FILE_NAME, INSTRUCTIONS_FILE};
-use aigentic_runtime::{GlobalLayer, Knowledge, KnowledgeMode, Layers, Project};
+use aigentic_runtime::project::{DOT_DIR, FILE_NAME, INSTRUCTIONS_FILE, person_memory_dir};
+use aigentic_runtime::{GlobalLayer, Knowledge, KnowledgeMode, Layers, Project, ProjectKind};
 use futures_util::StreamExt;
 
 use aigentic_server::awake::KeepAwake;
+use aigentic_server::workspaces::{self, Workspace};
 
 use crate::config::{Config, Profile, ProviderKind};
 use crate::skills_cmd::{SkillPaths, load_enabled};
@@ -252,8 +253,12 @@ pub fn check_window(name: &str, profile: &Profile) -> Check {
 }
 
 /// A project's `.env` is gitignored when the project is a repository:
-/// it holds the model key next to the app's secrets.
-pub fn check_env_ignored(root: &Path) -> Check {
+/// it holds the model key next to the app's secrets. `skip` for a notes
+/// project, which has no repository to leak it from.
+pub fn check_env_ignored(root: &Path, kind: ProjectKind) -> Check {
+    if kind == ProjectKind::Notes {
+        return Check::skip("env", "a notes project");
+    }
     let env = root.join(".env");
     if !env.is_file() {
         return Check::skip("env", "no .env here");
@@ -313,6 +318,117 @@ pub fn check_threads_dir(dir: &Path) -> Check {
     match std::fs::create_dir_all(dir) {
         Ok(()) => Check::ok("threads", format!("{} created", dir.display())),
         Err(e) => Check::fail("threads", format!("cannot create {}: {e}", dir.display())),
+    }
+}
+
+/// The workspace files in `<config_dir>/workspaces/`, read on their own so
+/// a broken one is reported here rather than swallowed as at start-up.
+/// `fail` for a file that does not parse, a project in two workspaces or
+/// two workspaces with one name; `warn` for a folder missing on this
+/// machine, two projects with one name (the later is shadowed) or a file
+/// not named after its workspace. `skip` with no workspace directory.
+pub fn check_workspaces(config_dir: &Path) -> Check {
+    const NAME: &str = "workspaces";
+    let dir = workspaces::dir(config_dir);
+    if !dir.is_dir() {
+        return Check::skip(NAME, format!("no {}", dir.display()));
+    }
+    let each = match workspaces::load_each(config_dir) {
+        Ok(each) => each,
+        Err(e) => return Check::fail(NAME, e.to_string()),
+    };
+    let mut fails: Vec<String> = Vec::new();
+    let mut warns: Vec<String> = Vec::new();
+    let mut loaded: Vec<Workspace> = Vec::new();
+    for (file, w) in each {
+        match w {
+            Ok(w) => {
+                let expected = workspaces::file_name(&w.name);
+                let actual = file.file_name().map(|n| n.to_string_lossy().into_owned());
+                if expected != actual {
+                    warns.push(format!(
+                        "{} holds {:?}, whose file would be {}",
+                        file.display(),
+                        w.name,
+                        expected.as_deref().unwrap_or("(none)")
+                    ));
+                }
+                loaded.push(w);
+            }
+            Err(e) => fails.push(one_line(&e.to_string())),
+        }
+    }
+    loaded.sort_by(|a, b| a.name.cmp(&b.name));
+
+    for (i, w) in loaded.iter().enumerate() {
+        if loaded[..i]
+            .iter()
+            .any(|o| o.name.to_lowercase() == w.name.to_lowercase())
+        {
+            fails.push(format!("two workspaces are named {:?}", w.name));
+        }
+        if let Some(shared) = w.shared.as_deref().filter(|s| !s.exists()) {
+            warns.push(format!(
+                "{}: shared {} is missing",
+                w.name,
+                shared.display()
+            ));
+        }
+    }
+    // Every listed project in the daemon's order, which decides who
+    // shadows whom.
+    let listed: Vec<(&Workspace, &Path)> = loaded
+        .iter()
+        .flat_map(|w| w.projects.iter().map(move |p| (w, p.as_path())))
+        .collect();
+    let mut named: Vec<(String, &Path)> = Vec::new();
+    for (i, (w, root)) in listed.iter().enumerate() {
+        if !root.exists() {
+            warns.push(format!("{}: {} is missing", w.name, root.display()));
+        }
+        if let Some((first, _)) = listed[..i].iter().find(|(_, r)| r == root) {
+            if first.name != w.name {
+                fails.push(format!(
+                    "{} is in two workspaces: {}, {}",
+                    root.display(),
+                    first.name,
+                    w.name
+                ));
+            }
+            continue;
+        }
+        let name = workspaces::project_name(root);
+        if let Some((_, earlier)) = named.iter().find(|(n, _)| *n == name) {
+            warns.push(format!(
+                "two projects are named {name:?}: {} shadows {}",
+                earlier.display(),
+                root.display()
+            ));
+        }
+        named.push((name, root));
+    }
+
+    if !fails.is_empty() {
+        fails.extend(warns);
+        return Check::fail(NAME, fails.join("; "));
+    }
+    if !warns.is_empty() {
+        return Check::new(NAME, Status::Warn, warns.join("; "));
+    }
+    Check::ok(
+        NAME,
+        format!("{} workspaces, {} projects", loaded.len(), listed.len()),
+    )
+}
+
+/// A TOML error's first line and its last, the cause, without the
+/// source excerpt between them, so the report stays one line a check.
+fn one_line(error: &str) -> String {
+    let mut lines = error.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next().unwrap_or_default();
+    match lines.next_back() {
+        Some(last) => format!("{first}: {last}"),
+        None => first.to_string(),
     }
 }
 
@@ -411,6 +527,8 @@ fn instructions_source(p: &Project) -> String {
 pub fn check_skills(
     project: Option<&Project>,
     config: &Config,
+    config_dir: &Path,
+    owner: Option<&str>,
     global_instructions: &Path,
     paths: &SkillPaths,
     cwd: &Path,
@@ -423,6 +541,8 @@ pub fn check_skills(
     }
     let global = match GlobalLayer::load(
         global_instructions,
+        Some(&person_memory_dir(config_dir)),
+        owner,
         config.denied_tools.clone(),
         config.denied_skills.clone(),
     ) {
@@ -459,8 +579,11 @@ pub fn check_skills(
 
 /// With `[pocock] issue_tracker = "github"`: `gh auth status` succeeds and
 /// `remote` (the origin URL, `None` when there is none) is on GitHub.
-/// `skip` for any other tracker or no project.
+/// `skip` for any other tracker, no project or a notes project.
 pub fn check_github(project: Option<&Project>, gh: &dyn Gh, remote: Option<&str>) -> Check {
+    if project.is_some_and(|p| p.kind() == ProjectKind::Notes) {
+        return Check::skip("github", "a notes project");
+    }
     let tracker = project
         .and_then(|p| p.file.pocock.as_ref())
         .map(|p| p.issue_tracker.as_str());
@@ -509,6 +632,12 @@ pub fn origin_url(root: &Path) -> Option<String> {
 /// this profile. The only check that uses the network. The key is taken
 /// from the environment and handed to the adapter; it never appears in
 /// the report.
+///
+/// The probe never retries: a doctor reports the endpoint as it is, now,
+/// rather than sitting out a retry window before it answers. A `400` or
+/// `422` costs one more one-token request per optional parameter, left
+/// out one at a time, so a refusal that clears names the parameter it
+/// was about instead of leaving the body to be guessed at.
 pub async fn check_probe(name: &str, profile: &Profile) -> Check {
     let check_name = format!("probe {name}");
     let key = match profile.api_key() {
@@ -517,7 +646,7 @@ pub async fn check_probe(name: &str, profile: &Profile) -> Check {
             return Check::skip(&check_name, format!("{} is not set", profile.api_key_env));
         }
     };
-    let provider = profile.build_provider(key);
+    let provider = profile.build_provider_no_retries(key.clone());
     let messages = [Message {
         role: Role::User,
         author: Author::User(UserId("doctor".into())),
@@ -529,34 +658,100 @@ pub async fn check_probe(name: &str, profile: &Profile) -> Check {
         max_output_tokens: Some(1),
     };
     let started = Instant::now();
-    let mut stream = provider.complete(&request);
+    match probe_once(&*provider, &request).await {
+        Ok(finish) => {
+            let ms = started.elapsed().as_millis();
+            match finish {
+                Some(reason) => Check::ok(
+                    &check_name,
+                    format!("{} answered in {ms} ms (finish {reason})", profile.model),
+                ),
+                None => Check::fail(
+                    &check_name,
+                    format!(
+                        "{} · stream ended without a done event after {ms} ms",
+                        profile.model
+                    ),
+                ),
+            }
+        }
+        Err(e) => {
+            // A status about the body is worth a comparison; the others
+            // are about the request's credentials, path or rate, which
+            // leaving a parameter out cannot clear.
+            let body_status = match &e {
+                ProviderError::Http { status, .. } if matches!(*status, 400 | 422) => Some(*status),
+                _ => None,
+            };
+            if let Some(status) = body_status {
+                for param in optional_params(profile) {
+                    let variant = param.without.build_provider_no_retries(key.clone());
+                    let asked = Instant::now();
+                    if let Ok(Some(reason)) = probe_once(&*variant, &request).await {
+                        let ms = asked.elapsed().as_millis();
+                        return Check::fail(
+                            &check_name,
+                            format!(
+                                "{} · http {status} when it sends `{}` = {}; without it the \
+                                 endpoint answered in {ms} ms (finish {reason})",
+                                profile.model, param.name, param.value
+                            ),
+                        );
+                    }
+                }
+            }
+            if let Some(note) = warn_note(profile, &e) {
+                return Check::new(&check_name, Status::Warn, note);
+            }
+            Check::fail(&check_name, format!("{} · {e}", profile.model))
+        }
+    }
+}
+
+/// One optional parameter a probe can leave out, and the profile that
+/// leaves it out: `name` is the field's path in the request body and
+/// `value` what the profile sends there.
+struct ProbeParam {
+    name: String,
+    value: String,
+    without: Profile,
+}
+
+/// The parameters `--probe` can drop to find out which one a refused
+/// request was about. Today one: the effort, under the param name the
+/// profile chooses. A profile with no effort has none, which leaves its
+/// `4xx` reported as it always is.
+fn optional_params(profile: &Profile) -> Vec<ProbeParam> {
+    let (Some(name), Some(value)) = (profile.effort_param(), profile.effort_label()) else {
+        return Vec::new();
+    };
+    let mut without = profile.clone();
+    without.reasoning_effort = None;
+    without.reasoning_effort_param = None;
+    vec![ProbeParam {
+        name: name.to_owned(),
+        value,
+        without,
+    }]
+}
+
+/// One probe request: the finish reason when the endpoint completed an
+/// answer, `None` when the stream ended without a done event, and the
+/// adapter's failure when the call failed.
+async fn probe_once(
+    provider: &dyn Provider,
+    request: &CompletionRequest<'_>,
+) -> Result<Option<String>, ProviderError> {
+    let mut stream = provider.complete(request);
     let mut finish = None;
     while let Some(event) = stream.next().await {
         match event {
             ProviderEvent::Done { finish_reason } => finish = Some(finish_reason),
-            ProviderEvent::Error(e) => {
-                if let Some(note) = warn_note(profile, &e) {
-                    return Check::new(&check_name, Status::Warn, note);
-                }
-                return Check::fail(&check_name, format!("{} · {e}", profile.model));
-            }
+            ProviderEvent::Error(e) => return Err(e),
             _ => {}
         }
     }
-    let ms = started.elapsed().as_millis();
-    match finish {
-        Some(reason) => Check::ok(
-            &check_name,
-            format!("{} answered in {ms} ms (finish {reason})", profile.model),
-        ),
-        None => Check::fail(
-            &check_name,
-            format!(
-                "{} · stream ended without a done event after {ms} ms",
-                profile.model
-            ),
-        ),
-    }
+    Ok(finish)
 }
 
 /// Issue #44: an endpoint that rejects the configured effort still
@@ -667,7 +862,8 @@ pub async fn compare_efforts(
     for effort in efforts {
         let label = effort.label();
         for attempt in 1..=SAMPLES {
-            let provider = profile.build_provider_with_effort(key.clone(), Some(effort.clone()));
+            let provider =
+                profile.build_provider_with_effort_no_retries(key.clone(), Some(effort.clone()));
             let messages = [Message {
                 role: Role::User,
                 author: Author::User(UserId("doctor".into())),
@@ -717,7 +913,7 @@ pub async fn compare_efforts(
 const PROMPT: &str = "Name the capital of France in one word. Answer with the word only.";
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use aigentic_runtime::aigentic_core::Capabilities;
     use aigentic_server::awake::detect_with;
@@ -772,7 +968,7 @@ mod tests {
     /// A `400` is not retried (`retryable` excludes it), so one
     /// connection is one call; the loop still accepts more than one so a
     /// test that expects a retry cannot hang the stub thread.
-    fn stub_endpoint(
+    pub(crate) fn stub_endpoint(
         status: u16,
         body: &'static str,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
@@ -800,6 +996,62 @@ mod tests {
                         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
                          content-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (format!("http://{addr}/v1"), seen)
+    }
+
+    /// The streamed answer `openai_compat` reads as a finished reply: one
+    /// text delta with its reason, then the end marker.
+    const ANSWERED_SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\
+        \"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+
+    /// A stub endpoint that refuses one request shape and answers any
+    /// other: a request whose body carries `rejected` is answered
+    /// `status`, everything else `200` with a streamed reply. Every
+    /// connection carrying the same body is refused, so a probe that
+    /// re-sent the parameter it had dropped is refused again rather than
+    /// passing by accident. Returns the base URL and the shared request
+    /// slot.
+    pub(crate) fn stub_rejecting(
+        rejected: &'static str,
+        status: u16,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { break };
+                let mut buf = [0u8; 65536];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let asked = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                let refused = asked.contains(rejected);
+                recorded.lock().unwrap().push(request);
+                let (status, answer) = if refused {
+                    let message =
+                        format!(r#"{{"error":{{"message":"unknown field: {rejected}"}}}}"#);
+                    (status, message)
+                } else {
+                    (200, ANSWERED_SSE.to_owned())
+                };
+                let reason = match status {
+                    400 => "Bad Request",
+                    401 => "Unauthorized",
+                    422 => "Unprocessable Entity",
+                    _ => "OK",
+                };
+                let _ = conn.write_all(
+                    format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{answer}",
+                        answer.len()
                     )
                     .as_bytes(),
                 );
@@ -1130,13 +1382,21 @@ mod tests {
         let config = Config::parse(GOOD).unwrap();
         let global = dir.path().join("instructions.md");
         assert_eq!(
-            check_skills(None, &config, &global, &paths, dir.path()).status,
+            check_skills(None, &config, dir.path(), None, &global, &paths, dir.path()).status,
             Status::Skip
         );
 
         std::fs::write(dir.path().join(FILE_NAME), "[project]\nname = \"p\"\n").unwrap();
         let p = Project::open_root(dir.path()).unwrap();
-        let c = check_skills(Some(&p), &config, &global, &paths, dir.path());
+        let c = check_skills(
+            Some(&p),
+            &config,
+            dir.path(),
+            None,
+            &global,
+            &paths,
+            dir.path(),
+        );
         assert_eq!(c.status, Status::Skip);
         assert_eq!(c.message, "none enabled");
 
@@ -1147,7 +1407,15 @@ mod tests {
         )
         .unwrap();
         let p = Project::open_root(dir.path()).unwrap();
-        let c = check_skills(Some(&p), &config, &global, &paths, dir.path());
+        let c = check_skills(
+            Some(&p),
+            &config,
+            dir.path(),
+            None,
+            &global,
+            &paths,
+            dir.path(),
+        );
         assert_eq!(c.status, Status::Fail);
         assert!(c.message.contains("ghost"), "{}", c.message);
 
@@ -1173,14 +1441,30 @@ mod tests {
         lock.save(&dir.path().join(crate::skills_cmd::LOCK_FILE))
             .unwrap();
         let p = Project::open_root(dir.path()).unwrap();
-        let c = check_skills(Some(&p), &config, &global, &paths, dir.path());
+        let c = check_skills(
+            Some(&p),
+            &config,
+            dir.path(),
+            None,
+            &global,
+            &paths,
+            dir.path(),
+        );
         assert_eq!(c.status, Status::Ok, "{}", c.message);
         assert_eq!(c.message, "1 loaded");
 
         // A global denial hides it: zero loaded, one denied.
         let mut denied = config.clone();
         denied.denied_skills = vec!["hello".into()];
-        let c = check_skills(Some(&p), &denied, &global, &paths, dir.path());
+        let c = check_skills(
+            Some(&p),
+            &denied,
+            dir.path(),
+            None,
+            &global,
+            &paths,
+            dir.path(),
+        );
         assert_eq!(c.status, Status::Ok, "{}", c.message);
         assert_eq!(c.message, "0 loaded, 1 denied by global");
     }
@@ -1235,13 +1519,194 @@ mod tests {
         assert!(c.message.contains("AIGENTIC_DOCTOR_TEST_KEY"));
     }
 
-    /// Issue #44, T12 (amendment 1.3): a stub endpoint answers `400` with
-    /// a body naming the configured param, and `check_probe` reports
-    /// `Status::Warn` — the profile still runs at the provider's
-    /// default. The fixture sets `api_key_env = "PATH"`, which is set in
-    /// any process, so the probe reaches the stub instead of skipping;
-    /// the note names the param and never the response body, so no
-    /// request or secret can leak through it.
+    /// The table the subtraction walks: one entry, the effort, named by
+    /// the path it takes in the body, and a variant that keeps the
+    /// provider, URL and model so the two requests differ only in that
+    /// field. A profile the field cannot apply to has no entry.
+    #[test]
+    fn the_effort_is_the_only_optional_param_a_probe_can_drop() {
+        let labelled = Config::parse(
+            "[profiles.a]\nbase_url = \"http://127.0.0.1:1/v1\"\nmodel = \"m\"\n\
+             api_key_env = \"PATH\"\nreasoning_effort = \"medium\"\n",
+        )
+        .unwrap();
+        let labelled = labelled.profiles["a"].clone();
+        let params = optional_params(&labelled);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, labelled.effort_param().unwrap());
+        assert_eq!(params[0].value, labelled.effort_label().unwrap());
+        assert!(params[0].without.effort_param().is_none());
+        assert_eq!(params[0].without.provider, labelled.provider);
+        assert_eq!(params[0].without.base_url, labelled.base_url);
+        assert_eq!(params[0].without.model, labelled.model);
+
+        // A dotted param is the field's path in the body, so it is the
+        // name the endpoint is asked about.
+        let nested = Config::parse(
+            "[profiles.a]\nbase_url = \"http://127.0.0.1:1/v1\"\nmodel = \"m\"\n\
+             api_key_env = \"PATH\"\nreasoning_effort = \"medium\"\n\
+             reasoning_effort_param = \"thinking.effort\"\n",
+        )
+        .unwrap();
+        let nested = nested.profiles["a"].clone();
+        let params = optional_params(&nested);
+        assert_eq!(params.len(), 1);
+        assert_eq!(
+            params[0].name,
+            nested.reasoning_effort_param.clone().unwrap()
+        );
+
+        // Anthropic's effort is a config field with no wire path here, and
+        // a profile with no effort sends no such field at all.
+        let anthropic = Config::parse(
+            "[profiles.a]\nprovider = \"anthropic\"\nmodel = \"m\"\n\
+             api_key_env = \"PATH\"\neffort = \"high\"\n",
+        )
+        .unwrap();
+        let anthropic = anthropic.profiles["a"].clone();
+        assert!(anthropic.effort_label().is_some());
+        assert!(optional_params(&anthropic).is_empty());
+
+        let plain = Config::parse(GOOD).unwrap();
+        assert!(optional_params(&plain.profiles["a"]).is_empty());
+    }
+
+    /// An endpoint that refuses a body carrying the effort and answers one
+    /// without it makes the probe name the parameter and the value. The
+    /// message quotes nothing the endpoint said, so it can only know the
+    /// param by having found it by omission.
+    #[tokio::test]
+    async fn a_400_cleared_by_dropping_the_effort_names_it() {
+        const REJECTED: &str = "reasoning_effort";
+        const STATUS: u16 = 400;
+        let (base, seen) = stub_rejecting(REJECTED, STATUS);
+        let config = Config::parse(&format!(
+            "[profiles.a]\nbase_url = \"{base}\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n\
+             reasoning_effort = \"medium\"\n"
+        ))
+        .unwrap();
+        let profile = config.profiles["a"].clone();
+        assert_eq!(profile.effort_param(), Some(REJECTED));
+        let label = profile.effort_label().unwrap();
+
+        let c = check_probe("a", &profile).await;
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains(REJECTED), "{}", c.message);
+        assert!(c.message.contains(&label), "{}", c.message);
+        assert!(
+            c.message.contains(&format!("http {STATUS}")),
+            "{}",
+            c.message
+        );
+        // The note the fall-through writes instead says the profile runs
+        // at the provider default; this message came from the subtraction.
+        assert!(!c.message.contains("provider default"), "{}", c.message);
+        // A fragment only the stub's body carries, so the body cannot be
+        // where the param name came from.
+        assert!(!c.message.contains("unknown field"), "{}", c.message);
+
+        let asked = seen.lock().unwrap();
+        assert_eq!(
+            asked.len(),
+            1 + optional_params(&profile).len(),
+            "{asked:?}"
+        );
+        let second = asked[1].split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(!second.contains(REJECTED), "{second}");
+    }
+
+    /// The same subtraction on `422`, the status a schema-validating
+    /// endpoint uses for a body it will not accept.
+    #[tokio::test]
+    async fn a_422_cleared_by_dropping_the_effort_names_it() {
+        const REJECTED: &str = "reasoning_effort";
+        const STATUS: u16 = 422;
+        let (base, seen) = stub_rejecting(REJECTED, STATUS);
+        let config = Config::parse(&format!(
+            "[profiles.a]\nbase_url = \"{base}\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n\
+             reasoning_effort = \"medium\"\n"
+        ))
+        .unwrap();
+        let profile = config.profiles["a"].clone();
+        assert_eq!(profile.effort_param(), Some(REJECTED));
+        let label = profile.effort_label().unwrap();
+
+        let c = check_probe("a", &profile).await;
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains(REJECTED), "{}", c.message);
+        assert!(c.message.contains(&label), "{}", c.message);
+        assert!(
+            c.message.contains(&format!("http {STATUS}")),
+            "{}",
+            c.message
+        );
+        assert!(!c.message.contains("provider default"), "{}", c.message);
+        assert!(!c.message.contains("unknown field"), "{}", c.message);
+
+        let asked = seen.lock().unwrap();
+        assert_eq!(
+            asked.len(),
+            1 + optional_params(&profile).len(),
+            "{asked:?}"
+        );
+        let second = asked[1].split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(!second.contains(REJECTED), "{second}");
+    }
+
+    /// A status about credentials is not about the body: no parameter is
+    /// left out, so the report is one request and never names the effort.
+    /// The stub's body names no parameter, so the message can only be the
+    /// one the fall-through writes.
+    #[tokio::test]
+    async fn an_unauthorised_probe_is_not_blamed_on_the_effort() {
+        let (base, seen) = stub_endpoint(401, "denied");
+        let config = Config::parse(&format!(
+            "[profiles.a]\nbase_url = \"{base}\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n\
+             reasoning_effort = \"medium\"\n"
+        ))
+        .unwrap();
+        let profile = config.profiles["a"].clone();
+        let param = profile.effort_param().unwrap().to_owned();
+
+        let c = check_probe("a", &profile).await;
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("http 401"), "{}", c.message);
+        assert!(!c.message.contains(&param), "{}", c.message);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// An endpoint that answers costs the one request, and the effort goes
+    /// out under its param, so no subtraction runs.
+    #[tokio::test]
+    async fn an_accepted_probe_asks_once_and_carries_the_effort() {
+        let (base, seen) = stub_endpoint(200, ANSWERED_SSE);
+        let config = Config::parse(&format!(
+            "[profiles.a]\nbase_url = \"{base}\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n\
+             reasoning_effort = \"medium\"\n"
+        ))
+        .unwrap();
+        let profile = config.profiles["a"].clone();
+        let field = format!(
+            "\"{}\":\"{}\"",
+            profile.effort_param().unwrap(),
+            profile.effort_label().unwrap()
+        );
+
+        let c = check_probe("a", &profile).await;
+        assert_eq!(c.status, Status::Ok, "{}", c.message);
+
+        let asked = seen.lock().unwrap();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        let body = asked[0].split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(body.contains(&field), "{body}");
+    }
+
+    /// A stub that refuses every request, the subtraction included, leaves
+    /// the fall-through's note standing: `Warn`, because the profile still
+    /// runs at the provider's default. The note names the param and never
+    /// the response body, so nothing the endpoint said can leak through
+    /// it. The fixture keys on `PATH`, which is set in any process, so the
+    /// probe reaches the stub instead of skipping.
     #[tokio::test]
     async fn a_rejected_reasoning_effort_probe_is_a_warning() {
         let (base, seen) = stub_endpoint(
@@ -1264,12 +1729,19 @@ mod tests {
         // said can reach the report.
         assert!(!c.message.contains("unknown field"), "{}", c.message);
 
-        // The stub saw the effort the profile configured, under the
-        // param the profile named.
+        // The stub refuses every request, so the subtraction ends where
+        // it began: the refusal, then the same request without the
+        // effort, which is refused too.
         let asked = seen.lock().unwrap();
-        assert_eq!(asked.len(), 1, "a 400 is not retried: {asked:?}");
+        assert_eq!(
+            asked.len(),
+            1 + optional_params(&profile).len(),
+            "the refusal, then the subtraction: {asked:?}"
+        );
         let body = asked[0].split("\r\n\r\n").nth(1).unwrap_or_default();
         assert!(body.contains("\"reasoning_effort\":50"), "{body}");
+        let without = asked[1].split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(!without.contains("reasoning_effort"), "{without}");
     }
 
     /// The direct matrix behind the note: only a `400` whose body names
@@ -1348,6 +1820,47 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
+    /// Issue #90 (T7): neither probe path waits out a retry window. The
+    /// stub answers every request 503, while the profile's window is ten
+    /// minutes: with a window's worth of backoff either call would sit
+    /// there, so the bounded wait below is the whole proof. Both are the
+    /// doctor's own entry points, not a config-level stand-in.
+    #[tokio::test]
+    async fn the_probes_report_the_first_failure_without_waiting_a_window() {
+        let (base, seen) = stub_endpoint(503, "busy");
+        let config = Config::parse(&format!(
+            "[profiles.a]\nbase_url = \"{base}\"\nmodel = \"m\"\napi_key_env = \"PATH\"\n\
+             retry_window_secs = 600\n"
+        ))
+        .unwrap();
+        let profile = config.profiles["a"].clone();
+
+        let c = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            check_probe("a", &profile),
+        )
+        .await
+        .expect("the probe reported at once, not after a window");
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("http 503"), "{}", c.message);
+
+        let efforts = [
+            aigentic_runtime::aigentic_providers::ReasoningEffort::Label("low".into()),
+            aigentic_runtime::aigentic_providers::ReasoningEffort::Label("high".into()),
+        ];
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            compare_efforts(&profile, efforts),
+        )
+        .await
+        .expect("the comparison failed at once, not after a window")
+        .unwrap_err();
+        assert!(err.contains("attempt 1"), "{err}");
+
+        // One request each: the first failure is the answer.
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
     /// Issue #44: an openai_compat profile may nest its effort
     /// (`reasoning_effort_param = "thinking.effort"`); amendment 2.1's
     /// aside claimed Anthropic does the same. It does not — the
@@ -1400,9 +1913,16 @@ mod tests {
     fn an_env_file_outside_gitignore_warns() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        assert_eq!(check_env_ignored(root).status, Status::Skip);
+        assert_eq!(
+            check_env_ignored(root, ProjectKind::Code).status,
+            Status::Skip
+        );
         std::fs::write(root.join(".env"), "K=v\n").unwrap();
-        assert_eq!(check_env_ignored(root).status, Status::Ok, "no repository");
+        assert_eq!(
+            check_env_ignored(root, ProjectKind::Code).status,
+            Status::Ok,
+            "no repository"
+        );
         let git = |args: &[&str]| {
             std::process::Command::new("git")
                 .args(args)
@@ -1414,9 +1934,15 @@ mod tests {
         // A local rule wins over a global excludes file that may ignore
         // .env on the machine running the test.
         std::fs::write(root.join(".gitignore"), "!.env\n").unwrap();
-        assert_eq!(check_env_ignored(root).status, Status::Warn);
+        assert_eq!(
+            check_env_ignored(root, ProjectKind::Code).status,
+            Status::Warn
+        );
         std::fs::write(root.join(".gitignore"), ".env\n").unwrap();
-        assert_eq!(check_env_ignored(root).status, Status::Ok);
+        assert_eq!(
+            check_env_ignored(root, ProjectKind::Code).status,
+            Status::Ok
+        );
     }
 
     /// T16 (issue #47): the doctor's keep-awake line follows the config
@@ -1593,5 +2119,213 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(code, 2);
+    }
+
+    /// A config dir under `dir` with `files` written into its
+    /// `workspaces/`, `{root}` in each replaced by `dir`.
+    fn workspace_files(dir: &Path, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let cfg = dir.join("cfg");
+        std::fs::create_dir_all(cfg.join("workspaces")).unwrap();
+        for (name, text) in files {
+            let text = text.replace("{root}", &dir.display().to_string());
+            std::fs::write(cfg.join("workspaces").join(name), text).unwrap();
+        }
+        cfg
+    }
+
+    #[test]
+    fn workspaces_skip_without_a_directory_and_count_when_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(check_workspaces(dir.path()).status, Status::Skip);
+        for p in ["a", "b", "notes"] {
+            std::fs::create_dir_all(dir.path().join(p)).unwrap();
+        }
+        let cfg = workspace_files(
+            dir.path(),
+            &[
+                (
+                    "one.toml",
+                    "name = \"one\"\nshared = \"{root}/notes\"\nprojects = [\"{root}/a\", \"{root}/b\"]\n",
+                ),
+                ("two.toml", "name = \"two\"\n"),
+            ],
+        );
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Ok, "{}", c.message);
+        assert_eq!(c.message, "2 workspaces, 2 projects");
+        assert_eq!(c.name, "workspaces");
+    }
+
+    #[test]
+    fn a_workspace_file_that_does_not_parse_fails_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = workspace_files(
+            dir.path(),
+            &[
+                ("good.toml", "name = \"good\"\n"),
+                ("bad.toml", "nope = 1\n"),
+            ],
+        );
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Fail);
+        assert!(
+            c.message
+                .starts_with(&cfg.join("workspaces/bad.toml").display().to_string()),
+            "{}",
+            c.message
+        );
+        assert!(!c.message.contains('\n'), "one line: {}", c.message);
+        assert!(c.message.contains("nope"), "the cause: {}", c.message);
+    }
+
+    #[test]
+    fn a_project_in_two_workspaces_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        let cfg = workspace_files(
+            dir.path(),
+            &[
+                ("one.toml", "name = \"one\"\nprojects = [\"{root}/a\"]\n"),
+                ("two.toml", "name = \"two\"\nprojects = [\"{root}/a\"]\n"),
+            ],
+        );
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Fail);
+        assert_eq!(
+            c.message,
+            format!(
+                "{} is in two workspaces: one, two",
+                dir.path().join("a").display()
+            )
+        );
+    }
+
+    #[test]
+    fn two_workspaces_with_one_name_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = workspace_files(
+            dir.path(),
+            &[
+                ("work.toml", "name = \"work\"\n"),
+                ("work-2.toml", "name = \"Work\"\n"),
+            ],
+        );
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Fail);
+        assert!(
+            c.message.contains("two workspaces are named"),
+            "{}",
+            c.message
+        );
+    }
+
+    #[test]
+    fn a_missing_shared_or_project_folder_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = workspace_files(
+            dir.path(),
+            &[(
+                "one.toml",
+                "name = \"one\"\nshared = \"{root}/gone-notes\"\nprojects = [\"{root}/gone\"]\n",
+            )],
+        );
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(
+            c.message,
+            format!(
+                "one: shared {} is missing; one: {} is missing",
+                dir.path().join("gone-notes").display(),
+                dir.path().join("gone").display()
+            )
+        );
+    }
+
+    #[test]
+    fn two_projects_with_one_name_warn_that_the_later_is_shadowed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("x/app")).unwrap();
+        std::fs::create_dir_all(dir.path().join("y/app")).unwrap();
+        let cfg = workspace_files(
+            dir.path(),
+            &[
+                (
+                    "one.toml",
+                    "name = \"one\"\nprojects = [\"{root}/x/app\"]\n",
+                ),
+                (
+                    "two.toml",
+                    "name = \"two\"\nprojects = [\"{root}/y/app\"]\n",
+                ),
+            ],
+        );
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(
+            c.message,
+            format!(
+                "two projects are named \"app\": {} shadows {}",
+                dir.path().join("x/app").display(),
+                dir.path().join("y/app").display()
+            )
+        );
+    }
+
+    #[test]
+    fn a_file_not_named_after_its_workspace_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = workspace_files(dir.path(), &[("old.toml", "name = \"My Work\"\n")]);
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Warn);
+        assert!(
+            c.message.ends_with("whose file would be my-work.toml"),
+            "{}",
+            c.message
+        );
+    }
+
+    #[test]
+    fn a_fail_outranks_a_warning_and_keeps_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = workspace_files(
+            dir.path(),
+            &[("bad.toml", "nope = 1\n"), ("old.toml", "name = \"x\"\n")],
+        );
+        let c = check_workspaces(&cfg);
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.message.contains("; "), "{}", c.message);
+        assert!(c.message.contains("x.toml"), "{}", c.message);
+    }
+
+    #[test]
+    fn a_notes_project_skips_the_env_and_github_checks_and_a_code_project_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".env"), "K=v\n").unwrap();
+        let ok = ScriptedGh {
+            auth: Ok("Logged in".into()),
+        };
+        let file = |kind: &str| {
+            format!("[project]\nname = \"p\"\n{kind}[pocock]\nissue_tracker = \"github\"\n")
+        };
+
+        std::fs::write(root.join(FILE_NAME), file("kind = \"notes\"\n")).unwrap();
+        let notes = Project::open_root(root).unwrap();
+        let env = check_env_ignored(root, notes.kind());
+        assert_eq!(
+            (env.status, env.message.as_str()),
+            (Status::Skip, "a notes project")
+        );
+        let gh = check_github(Some(&notes), &ok, None);
+        assert_eq!(
+            (gh.status, gh.message.as_str()),
+            (Status::Skip, "a notes project")
+        );
+
+        std::fs::write(root.join(FILE_NAME), file("")).unwrap();
+        let code = Project::open_root(root).unwrap();
+        assert_eq!(code.kind(), ProjectKind::Code);
+        assert_eq!(check_env_ignored(root, code.kind()).status, Status::Ok);
+        assert_eq!(check_github(Some(&code), &ok, None).status, Status::Fail);
     }
 }

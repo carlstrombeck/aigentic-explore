@@ -8,9 +8,12 @@ use std::sync::Arc;
 
 use aigentic_runtime::aigentic_core::{AgentId, Provider};
 use aigentic_runtime::aigentic_log::{Repair, ThreadLog};
+use aigentic_runtime::aigentic_skills::SkillSet;
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
+use aigentic_runtime::project::person_memory_dir;
 use aigentic_runtime::{
-    GlobalLayer, Layers, Project, ProjectContext, ProjectFile, Runtime, WorkspaceLayer,
+    DEFAULT_COMPACTION, GlobalLayer, Layers, Project, ProjectContext, ProjectFile, ProjectRow,
+    Runtime, WorkspaceLayer, memory_homes_of,
 };
 use ulid::Ulid;
 
@@ -74,6 +77,7 @@ pub struct Built {
 
 /// The daemon's view of one project root: the checkout and where its
 /// threads live.
+#[derive(Debug, Clone)]
 pub struct Root {
     pub name: String,
     pub root: PathBuf,
@@ -94,6 +98,7 @@ pub struct Context {
 pub async fn project_context(
     config: &Config,
     config_dir: &Path,
+    owner: Option<&str>,
     providers: &dyn ProviderFactory,
     root: &Root,
     workspaces: &[Workspace],
@@ -133,6 +138,8 @@ pub async fn project_context(
         .unwrap_or_else(|| config_dir.join("instructions.md"));
     let global = GlobalLayer::load(
         &global_instructions,
+        Some(&person_memory_dir(config_dir)),
+        owner,
         config.denied_tools.clone(),
         config.denied_skills.clone(),
     )?;
@@ -162,7 +169,9 @@ pub async fn project_context(
     let policy = file
         .policy()
         .with_root(&root.root, &root.root)
-        .with_rules_file(&rules_file);
+        .with_boundary_roots(boundary_roots(&file, &root.root, &skills))
+        .with_rules_file(&rules_file)
+        .with_memory_homes(memory_homes_of(&layers));
     Ok(Context {
         ctx: ProjectContext {
             name: opened.as_ref().map(|p| p.name.clone()),
@@ -174,6 +183,10 @@ pub async fn project_context(
             registry: tools,
             provider,
             model_label: model,
+            // The listing is the table's to render (issue #81), never
+            // `project_context`'s: it has no creator and no home.
+            projects: None,
+            project_rows: Vec::new(),
             profile: Some(profile_name.clone()),
             effort: config
                 .profiles
@@ -190,16 +203,48 @@ pub async fn project_context(
     })
 }
 
+/// The folders the file tools may reach without asking (issue #124),
+/// beyond the project root `with_root` installs: the temp dir (both
+/// names of it — on macOS `/tmp` is a symlink to `/private/tmp`, and a
+/// model writes through either), the folders of the thread's *loaded*
+/// skills (never all the skill roots, which would widen the boundary to
+/// the whole bundled `skills/` and every `~/.config/aigentic/skills/`
+/// entry), and the project's `[policy] allow_paths`. `policy`
+/// canonicalises every one of them. An `allow_paths` entry that is
+/// refused — one naming a user's home — warns on stderr, where the
+/// daemon's log keeps it.
+fn boundary_roots(file: &ProjectFile, root: &Path, skills: &SkillSet) -> Vec<PathBuf> {
+    let mut roots = vec![std::env::temp_dir()];
+    #[cfg(unix)]
+    roots.push(PathBuf::from("/tmp"));
+    roots.extend(skills.iter().map(|manifest| manifest.path.clone()));
+    let (allowed, warnings) = file.allow_paths(root);
+    for warning in warnings {
+        eprintln!("warn  {warning}");
+    }
+    roots.extend(allowed);
+    roots
+}
+
 /// Open or create a thread's log in `root.threads_dir` and build its
-/// runtime from the project at `root.root`.
+/// runtime from the project at `root.root`. `reach` is the daemon's
+/// listing of the projects in reach for this thread (issue #81), with
+/// each row's brief one-liner and root (issue #123): the block is what
+/// `ThreadTable::shown_projects` renders, the rows are what `read_brief`
+/// looks a sibling up in. `None` leaves the prefix exactly as it was.
+// The reach is one argument beside the project's own (issue #81);
+// clippy counts eight, one past its threshold.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_thread(
     config: &Config,
     config_dir: &Path,
+    owner: Option<&str>,
     providers: &dyn ProviderFactory,
     root: &Root,
     workspaces: &[Workspace],
     thread: Ulid,
     profile_override: Option<&str>,
+    reach: Option<(Option<String>, Vec<ProjectRow>)>,
 ) -> Result<Built, BuildError> {
     let Context {
         ctx,
@@ -208,6 +253,7 @@ pub async fn build_thread(
     } = project_context(
         config,
         config_dir,
+        owner,
         providers,
         root,
         workspaces,
@@ -215,6 +261,17 @@ pub async fn build_thread(
     )
     .await?;
     let profile: Option<&Profile> = config.profiles.get(&profile_name);
+    let profile_compaction = profile
+        .map(Profile::compaction_settings)
+        .unwrap_or(DEFAULT_COMPACTION);
+    let compaction = ctx
+        .layers
+        .project
+        .as_ref()
+        .and_then(|project| project.file.compaction.as_ref())
+        .map_or(profile_compaction, |project| {
+            project.over(profile_compaction)
+        });
 
     std::fs::create_dir_all(&root.threads_dir)?;
     let (log, torn) = ThreadLog::open_with(&root.threads_dir, thread, Repair::TruncateTornTail)?;
@@ -229,7 +286,12 @@ pub async fn build_thread(
         .with_effort(ctx.effort)
         .with_policy(ctx.policy)
         .with_skills(ctx.skills)
-        .with_harness_instructions();
+        .with_projects(
+            reach.as_ref().and_then(|(block, _)| block.clone()),
+            reach.map(|(_, rows)| rows).unwrap_or_default(),
+        )
+        .with_harness_instructions()
+        .with_compaction(compaction);
     if let Some(utility) = &config.utility_profile
         && *utility != profile_name
     {
@@ -247,9 +309,7 @@ pub async fn build_thread(
         }
     }
     if let Some(p) = profile {
-        runtime = runtime
-            .with_compaction(p.compaction_settings())
-            .with_budget(p.budget());
+        runtime = runtime.with_budget(p.budget());
     }
     Ok(Built {
         runtime,
@@ -326,6 +386,7 @@ mod tests {
         let with_effort = project_context(
             &config,
             dir.path(),
+            None,
             &Stub,
             &root_of(&root),
             &[],
@@ -343,6 +404,7 @@ mod tests {
         let openai = project_context(
             &config,
             dir.path(),
+            None,
             &Stub,
             &root_of(&root),
             &[],
@@ -361,7 +423,7 @@ mod tests {
         );
 
         // The default profile sets no effort, and names none.
-        let plain = project_context(&config, dir.path(), &Stub, &root_of(&root), &[], None)
+        let plain = project_context(&config, dir.path(), None, &Stub, &root_of(&root), &[], None)
             .await
             .unwrap();
         assert_eq!(plain.ctx.effort, None);
@@ -398,11 +460,13 @@ mod tests {
             let built = build_thread(
                 &config,
                 dir.path(),
+                None,
                 &Stub,
                 &root,
                 &[],
                 Ulid::from_datetime(std::time::SystemTime::now()),
                 Some(profile),
+                None,
             )
             .await
             .unwrap();
@@ -415,15 +479,117 @@ mod tests {
         let plain = build_thread(
             &config,
             dir.path(),
+            None,
             &Stub,
             &root,
             &[],
             Ulid::from_datetime(std::time::SystemTime::now()),
             Some("plain"),
+            None,
         )
         .await
         .unwrap();
         assert_eq!(plain.runtime.identity().2, None);
+    }
+
+    #[tokio::test]
+    async fn a_built_thread_overlays_project_compaction_on_profile_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::parse(
+            "default_profile = \"main\"\n\
+             [profiles.main]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\n\
+             [profiles.main.compaction]\ntrigger_fraction = 0.8\nkeep_turns = 4\n\
+             max_result_bytes = 2048\nsummary_max_output_tokens = 4096\nkeep_last_calls = 8\n\
+             working_set_tokens = 65536\nevict_above_tokens = 48000\nevict_min_free_percent = 50\n",
+        )
+        .unwrap();
+        let profile_settings = config.select(Some("main")).unwrap().1.compaction_settings();
+
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join(aigentic_runtime::project::FILE_NAME),
+            "[project]\nname = \"project\"\n[compaction]\ntrigger_fraction = 0.6\n\
+             summary_max_output_tokens = 256\n\
+             keep_last_calls = 3\nworking_set_tokens = 32768\n\
+             evict_above_tokens = 12000\nevict_min_free_percent = 30\n",
+        )
+        .unwrap();
+        let project_root = Root {
+            name: "project".into(),
+            root: project_dir,
+            threads_dir: dir.path().join("threads"),
+        };
+        let project = build_thread(
+            &config,
+            dir.path(),
+            None,
+            &Stub,
+            &project_root,
+            &[],
+            Ulid::from_datetime(std::time::SystemTime::now()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let settings = project.runtime.compaction();
+        assert_eq!(settings.trigger_fraction, 0.6);
+        assert_eq!(settings.keep_turns, profile_settings.keep_turns);
+        assert_eq!(settings.max_result_bytes, 2048);
+        assert_eq!(settings.summary_max_output_tokens, 256);
+        assert_eq!(settings.keep_last_calls, 3);
+        assert_eq!(settings.working_set_tokens, 32768);
+        assert_eq!(settings.evict_above_tokens, 12000);
+        assert_eq!(settings.evict_min_free_percent, 30);
+
+        let profile_only_dir = dir.path().join("profile-only");
+        std::fs::create_dir_all(&profile_only_dir).unwrap();
+        std::fs::write(
+            profile_only_dir.join(aigentic_runtime::project::FILE_NAME),
+            "[project]\nname = \"profile-only\"\n",
+        )
+        .unwrap();
+        let profile_only_root = Root {
+            name: "profile-only".into(),
+            root: profile_only_dir,
+            threads_dir: dir.path().join("threads"),
+        };
+        let profile_only = build_thread(
+            &config,
+            dir.path(),
+            None,
+            &Stub,
+            &profile_only_root,
+            &[],
+            Ulid::from_datetime(std::time::SystemTime::now()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(profile_only.runtime.compaction(), &profile_settings);
+
+        let bare_root = Root {
+            name: "bare".into(),
+            root: dir.path().join("bare"),
+            threads_dir: dir.path().join("threads"),
+        };
+        std::fs::create_dir_all(&bare_root.root).unwrap();
+        let bare = build_thread(
+            &config,
+            dir.path(),
+            None,
+            &Stub,
+            &bare_root,
+            &[],
+            Ulid::from_datetime(std::time::SystemTime::now()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(bare.runtime.compaction(), &profile_settings);
     }
 
     /// Names each profile's model after the profile, so a test can tell
@@ -461,11 +627,13 @@ mod tests {
         let built = build_thread(
             &config,
             dir.path(),
+            None,
             &PerProfile,
             &root,
             &[],
             Ulid::from_datetime(std::time::SystemTime::now()),
             Some("main"),
+            None,
         )
         .await
         .unwrap();
@@ -476,14 +644,141 @@ mod tests {
         let plain = build_thread(
             &bare,
             dir.path(),
+            None,
             &PerProfile,
             &root,
             &[],
             Ulid::from_datetime(std::time::SystemTime::now()),
             Some("main"),
+            None,
         )
         .await
         .unwrap();
         assert_eq!(plain.runtime.utility_label(), None);
+    }
+
+    /// A daemon thread's policy carries the memory homes its layers name,
+    /// and only the ones it has: the person's folder with an owner, the
+    /// workspace's with a shared dir. A write under either is refused, so
+    /// the model cannot edit the memory it will be handed next turn.
+    #[tokio::test]
+    async fn a_built_thread_denies_writes_under_its_memory_homes() {
+        use aigentic_runtime::aigentic_policy::{MEMORY_HOME_RULE, MEMORY_REASON, Outcome};
+        use aigentic_runtime::project::{MEMORY_DIR, person_memory_dir};
+        use aigentic_runtime::{WorkspaceLayer, aigentic_core::RiskClass, aigentic_core::ToolCall};
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let config_dir = base.join("config");
+        let shared = base.join("shared");
+        let project = base.join("project");
+        for d in [&config_dir, &shared, &project] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::create_dir_all(person_memory_dir(&config_dir)).unwrap();
+        let config = Config::parse(
+            "default_profile = \"plain\"\n[profiles.plain]\nprovider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"K\"\n",
+        )
+        .unwrap();
+        let root = |root: &Path| Root {
+            name: "project".into(),
+            root: root.to_path_buf(),
+            threads_dir: base.join("threads"),
+        };
+        let workspaces = [Workspace {
+            name: "ws".into(),
+            shared: Some(shared.clone()),
+            projects: vec![project.clone()],
+        }];
+        /// One thread, built the way the daemon builds one.
+        async fn thread(
+            config: &Config,
+            config_dir: &Path,
+            owner: Option<&str>,
+            root: &Root,
+            workspaces: &[Workspace],
+        ) -> Built {
+            build_thread(
+                config,
+                config_dir,
+                owner,
+                &Stub,
+                root,
+                workspaces,
+                Ulid::from_datetime(std::time::SystemTime::now()),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+        }
+
+        let built = thread(
+            &config,
+            &config_dir,
+            Some("steve"),
+            &root(&project),
+            &workspaces,
+        )
+        .await;
+        let expected = vec![
+            person_memory_dir(&config_dir),
+            WorkspaceLayer::dir(&shared).join(MEMORY_DIR),
+        ];
+        assert_eq!(built.runtime.policy().memory_homes(), expected);
+        for home in &expected {
+            for tool in ["write_file", "edit_file"] {
+                let call = ToolCall {
+                    id: "c1".into(),
+                    name: tool.into(),
+                    args: serde_json::json!({ "path": home.join("facts.md").to_str().unwrap() }),
+                };
+                let outcome = built.runtime.policy().decide(&call, RiskClass::Write, None);
+                assert_eq!(
+                    outcome,
+                    Outcome::Deny {
+                        rule: MEMORY_HOME_RULE.to_owned(),
+                        reason: format!("{MEMORY_REASON}: {}", home.display()),
+                    },
+                    "{tool} under {} is a write under a home",
+                    home.display()
+                );
+            }
+        }
+
+        // No owner, and a workspace with no shared dir: no home, so the
+        // policy is the one a thread without memory gets.
+        let bare_workspaces = [Workspace {
+            name: "ws".into(),
+            shared: None,
+            projects: vec![project.clone()],
+        }];
+        let bare = thread(
+            &config,
+            &config_dir,
+            None,
+            &root(&project),
+            &bare_workspaces,
+        )
+        .await;
+        assert!(bare.runtime.policy().memory_homes().is_empty());
+        for home in &expected {
+            for tool in ["write_file", "edit_file"] {
+                let call = ToolCall {
+                    id: "c1".into(),
+                    name: tool.into(),
+                    args: serde_json::json!({ "path": home.join("facts.md").to_str().unwrap() }),
+                };
+                let outcome = bare.runtime.policy().decide(&call, RiskClass::Write, None);
+                assert!(
+                    !matches!(&outcome, Outcome::Deny { rule, .. } if rule == MEMORY_HOME_RULE),
+                    "{tool} with no home is not the memory deny, got {outcome:?}"
+                );
+                assert!(
+                    matches!(&outcome, Outcome::Ask { .. } | Outcome::AskBoundary { .. }),
+                    "{tool} outside the project still asks, got {outcome:?}"
+                );
+            }
+        }
     }
 }

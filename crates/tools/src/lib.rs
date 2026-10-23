@@ -3,7 +3,9 @@
 //!
 //! All of them share a [`Workdir`]: `bash` keeps its current directory across
 //! calls (a `cd` in one call is seen by the next), and the file tools resolve
-//! relative paths against it. Every tool caps what it returns with
+//! relative paths against it. A call whose directory no longer exists runs in
+//! the session's own directory instead, and its result says so on the first
+//! line. Every tool caps what it returns with
 //! [`truncate_output`], keeping the head and the tail and noting what was
 //! omitted, so a single call can never flood the context.
 
@@ -21,7 +23,8 @@ pub use bash::{BashArgs, BashTool, DEFAULT_TIMEOUT, MAX_TIMEOUT_SECS};
 pub use files::{ReadFileTool, WriteFileTool};
 pub use fs::{DEFAULT_GREP_MATCHES, EditFileTool, GrepTool, ListDirTool};
 pub use knowledge::{
-    KnowledgeSnapshot, SEARCH_KNOWLEDGE, SearchKnowledgeTool, Section, search, split_sections,
+    KnowledgeSnapshot, KnowledgeSources, SEARCH_KNOWLEDGE, SearchKnowledgeTool, Section, search,
+    split_sections,
 };
 pub use mcp::{McpError, McpServer, McpServerConfig, McpTool, McpTransport};
 pub use registry::{RegistryError, ToolRegistry};

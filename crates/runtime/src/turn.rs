@@ -4,8 +4,8 @@
 use std::time::Instant;
 
 use aigentic_core::{
-    Author, CompletionRequest, ContentBlock, EventKind, ProviderEvent, ToolCall, ToolResult,
-    ToolSpec,
+    Author, CUT_STREAM, CompletionRequest, ContentBlock, EventKind, Message, ProviderError,
+    ProviderEvent, RiskClass, Role, ToolCall, ToolResult, ToolSpec,
 };
 use aigentic_log::{
     AssistantMessagePayload, InterruptedPayload, ProviderRetriedPayload, ToolResultPayload, Usage,
@@ -16,10 +16,14 @@ use futures_util::StreamExt;
 use aigentic_log::{Invoker, NewEvent, PolicyRecord};
 
 use crate::decisions::{CancelToken, Inbox, Queued};
-use crate::harness_tools::{ASK_HUMAN, HARNESS_CLASS, harness_specs, is_harness_tool};
-use crate::runtime::{ASKED_HUMAN, INTERRUPTED};
+use crate::harness_tools::{
+    ASK_HUMAN, FINISH_STEP, HARNESS_CLASS, NOT_RUN_JOB_SIBLING, NOT_RUN_JOB_SOLO, NOT_RUN_LENGTH,
+    NOT_RUN_OVER_LIMIT, NOT_RUN_SIBLING, NOT_RUN_SOLO, READ_BRIEF, START_JOB, SUGGEST_PROJECT,
+    harness_specs_with, is_harness_tool, stale_tasks_reminder, start_job_spec,
+};
+use crate::runtime::{ASKED_HUMAN, INTERRUPTED, LENGTH_STOP, MAX_TOKENS_STOP, STEP_REPORTED};
 use crate::seams::{Verdict, author_name, denial_text};
-use crate::support::{Spent, append_queued, block_start, flush_text};
+use crate::support::{Spent, append_queued, block_start, flush_text, recoverable_fault};
 use crate::{Runtime, RuntimeError, Signal, TurnOutcome, build_context};
 
 impl Runtime {
@@ -69,7 +73,14 @@ impl Runtime {
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<(), RuntimeError> {
         for queued in inbox.drain() {
-            append_queued(&mut self.log, queued, observe, true)?;
+            append_queued(
+                &*self.provider,
+                &mut self.log,
+                &mut self.thread_raw,
+                queued,
+                observe,
+                true,
+            )?;
         }
         Ok(())
     }
@@ -155,9 +166,11 @@ impl Runtime {
             wall_waited: std::time::Duration::ZERO,
             iterations: 0,
             tokens: 0,
+            usd: 0.0,
         };
         self.refresh_knowledge()?;
         self.refresh_memory()?;
+        self.refresh_brief();
         let specs: Vec<ToolSpec> = self.tool_specs();
         // What the request's schemas cost on the wire, at the estimator's
         // own rate, read here so a registry change between turns is
@@ -193,14 +206,51 @@ impl Runtime {
             // promised `steer` to a call that never happens, and nothing
             // below can lose it.
             for queued in std::mem::take(&mut held) {
-                append_queued(&mut self.log, queued, observe, true)?;
+                append_queued(
+                    &*self.provider,
+                    &mut self.log,
+                    &mut self.thread_raw,
+                    queued,
+                    observe,
+                    true,
+                )?;
             }
             // Compaction, at an iteration boundary only: every tool call
             // already has its result, so no summary range splits a turn.
             // Eviction runs at the same boundary, and first: stubbing is
             // free where a summary costs a call (issue #30).
-            self.evict_stale(observe)?;
-            if let Err(e) = self.compact(observe).await {
+            //
+            // The closed-turn batch comes before both, and only at a
+            // turn's first iteration (issue #76). A batch iteration does
+            // nothing else except its link (issue #98): the batch has
+            // already rewritten the history, so a sweep or a nested
+            // summary in the same iteration would either price the stale
+            // one or append a second cache break for no reason. The
+            // batch's own continuous summary carries the same break, so
+            // it rides along in the same iteration, before the first
+            // model call.
+            if self.at_turn_start() {
+                match self.batch_stale(observe)? {
+                    Some(Some((from, to))) => {
+                        // Best effort and never fatal: only the log
+                        // append inside can fail the turn, nothing else
+                        // can (issue #98, design 3).
+                        self.summarise_link(from, to, cancel, observe).await?;
+                    }
+                    Some(None) => {}
+                    None => {
+                        self.evict_stale(observe)?;
+                    }
+                }
+            } else {
+                self.evict_stale(observe)?;
+            }
+            // The emergency net (issue #98, design 5), in every
+            // iteration and outside the batch's arm, so a batch whose
+            // link was skipped is still covered once the context nears
+            // the model's real window. Its error still ends the turn, as
+            // compaction's always did.
+            if let Err(e) = self.emergency_compact(observe).await {
                 if let RuntimeError::Provider(p) = &e {
                     self.end_turn(
                         &format!("provider_error: {p}"),
@@ -212,128 +262,250 @@ impl Runtime {
                 }
                 return Err(e);
             }
-            let context = build_context(&self.prefix(), self.log.events())?;
+            let mut context = build_context(&self.prefix(), self.log.events())?;
+            // The stale-checklist reminder (issue #102) rides at the very
+            // end of this call's context and nowhere else: no event is
+            // appended, so the log, the projection, replay and the cached
+            // prefix are unchanged, and the next call's context is this
+            // one without the reminder, which is what keeps it cached.
+            // `Role::User` with `Author::System`, because Anthropic keeps
+            // only the leading system run as the system prompt and would
+            // drop a later one.
+            //
+            // The reminder stays part of `context` for `measured`, the
+            // ratio, `window_usage` and the no-usage fallback
+            // `estimate_usage` below, so all of them price what was
+            // actually sent: a call whose provider reports no usage
+            // estimates about 30-40 tokens more while the reminder is
+            // present, and the eviction probes, which call `build_context`
+            // directly, are a few tokens off. Both are accepted.
+            if let Some(text) = stale_tasks_reminder(self.log.events()) {
+                context.push(Message {
+                    role: Role::User,
+                    author: Author::System,
+                    blocks: vec![ContentBlock::Text(text)],
+                });
+            }
             let request = CompletionRequest {
                 messages: &context,
                 tools: &specs,
                 max_output_tokens: None,
             };
 
-            let (mut blocks, mut text, mut usage, mut error) =
-                (Vec::new(), String::new(), None, None);
+            // Per attempt (issue #114): every one of these is re-assigned
+            // at the top of the attempt loop, so a retry discards all the
+            // previous attempt collected before anything is appended,
+            // run or trusted.
+            let mut blocks;
+            let mut text;
+            let mut raw_usage;
+            let mut error;
+            // `finish_reason` is the provider's own reason the reply ended
+            // (issue #96): the difference between a reply that finished and
+            // one that was cut off or ran out of output tokens.
+            let mut finish_reason;
+            // Whether any content has arrived on the attempt now running
+            // (issue #114): a delta, a tool call or a blob, the same
+            // predicate the time-to-first-token below uses. Only a failure
+            // after content is asked again.
+            let mut content;
             // Issue #31: the call's waiting time, stamped on its usage
             // line. `ttft_ms` is the first streamed block, so a slow
             // model (thinking before any delta) reads separately from a
-            // slow transport.
-            let requested = Instant::now();
-            let mut ttft_ms = None;
-            let mut stream = self.provider.complete(&request);
-            let mut interrupted_by = None;
+            // slow transport. Both are re-stamped per attempt (issue
+            // #114) so the successful attempt's usage line spans only
+            // itself.
+            let mut requested;
+            let mut ttft_ms;
+            // Issue #114: a reply cut off after content is asked again,
+            // once, inside this same model call. The outer loop is not
+            // re-entered: the request is built once, so no compaction,
+            // inbox drain or budget check runs between the two attempts
+            // and the call costs one iteration either way.
+            let mut retried_once = false;
+            // The usage of the attempt that is not retried, carried out of
+            // the attempt loop (issue #114): the raw `raw_usage` slot is
+            // shadowed by the finalised `Usage` inside the loop.
+            let settled_usage;
+            let agent = Author::Agent(self.agent.clone());
             loop {
-                let event = tokio::select! {
-                    biased;
-                    by = cancel.cancelled() => {
-                        interrupted_by = Some(by);
-                        break;
+                blocks = Vec::new();
+                text = String::new();
+                raw_usage = None;
+                error = None;
+                finish_reason = None;
+                content = false;
+                requested = Instant::now();
+                ttft_ms = None;
+                let mut stream = self.provider.complete(&request);
+                let mut interrupted_by = None;
+                loop {
+                    let event = tokio::select! {
+                        biased;
+                        by = cancel.cancelled() => {
+                            interrupted_by = Some(by);
+                            break;
+                        }
+                        // A message posted mid-call is held, not appended:
+                        // the stream borrows the provider, the log is
+                        // another field, and this call is already out, so
+                        // nothing can show the message to it. It leaves
+                        // `held` at the next safe point — after that reply's
+                        // last tool result and before the call that reads it
+                        // (`steer`), or before `turn_ended` if the turn ends
+                        // first (`steer` unset), so the next turn, which
+                        // the actor starts, picks it up.
+                        queued = inbox.recv() => {
+                            held.push(queued);
+                            continue;
+                        }
+                        event = stream.next() => event,
+                    };
+                    let Some(event) = event else { break };
+                    if block_start(&event) {
+                        content = true;
+                        if ttft_ms.is_none() {
+                            ttft_ms = Some(requested.elapsed().as_millis() as u64);
+                        }
                     }
-                    // A message posted mid-call is held, not appended:
-                    // the stream borrows the provider, the log is
-                    // another field, and this call is already out, so
-                    // nothing can show the message to it. It leaves
-                    // `held` at the next safe point — after that reply's
-                    // last tool result and before the call that reads it
-                    // (`steer`), or before `turn_ended` if the turn ends
-                    // first (`steer` unset), so the next turn, which
-                    // the actor starts, picks it up.
-                    queued = inbox.recv() => {
-                        held.push(queued);
-                        continue;
-                    }
-                    event = stream.next() => event,
-                };
-                let Some(event) = event else { break };
-                if ttft_ms.is_none() && block_start(&event) {
-                    ttft_ms = Some(requested.elapsed().as_millis() as u64);
-                }
-                match event {
-                    // Live retries (issue #31): appended as they arrive,
-                    // so the log and every client see the wait as it
-                    // happens rather than after the call recovers.
-                    ProviderEvent::Retried {
-                        attempt,
-                        retries,
-                        reason,
-                        wait,
-                    } => {
-                        let payload = serde_json::to_value(ProviderRetriedPayload {
+                    match event {
+                        // Live retries (issue #31): appended as they arrive,
+                        // so the log and every client see the wait as it
+                        // happens rather than after the call recovers.
+                        ProviderEvent::Retried {
                             attempt,
                             retries,
-                            reason: self.retry_reason(&reason),
-                            wait_ms: wait.as_millis() as u64,
-                        })
-                        .expect("serialisable");
-                        let event = self.log.append(NewEvent {
-                            kind: EventKind::ProviderRetried,
-                            author: Author::System,
-                            payload,
-                            parent_event: None,
-                        })?;
-                        observe(Signal::Event(&event));
-                    }
-                    ProviderEvent::TextDelta(t) => {
-                        observe(Signal::TextDelta(&t));
-                        text.push_str(&t);
-                    }
-                    ProviderEvent::ToolCall(call) => {
-                        flush_text(&mut text, &mut blocks);
-                        blocks.push(ContentBlock::ToolCall(call));
-                    }
-                    ProviderEvent::Blob(blob) => blocks.push(ContentBlock::ProviderBlob(blob)),
-                    ProviderEvent::Usage(u) => usage = Some(Usage::reported(u)),
-                    ProviderEvent::Done { .. } => {}
-                    ProviderEvent::Error(e) => {
-                        error = Some(e);
-                        break;
+                            reason,
+                            wait,
+                        } => {
+                            let payload = serde_json::to_value(ProviderRetriedPayload {
+                                attempt,
+                                retries,
+                                reason: self.retry_reason(&reason),
+                                wait_ms: wait.as_millis() as u64,
+                            })
+                            .expect("serialisable");
+                            let event = self.log.append(NewEvent {
+                                kind: EventKind::ProviderRetried,
+                                author: Author::System,
+                                payload,
+                                parent_event: None,
+                            })?;
+                            observe(Signal::Event(&event));
+                        }
+                        ProviderEvent::TextDelta(t) => {
+                            observe(Signal::TextDelta(&t));
+                            text.push_str(&t);
+                        }
+                        ProviderEvent::ToolCall(call) => {
+                            flush_text(&mut text, &mut blocks);
+                            blocks.push(ContentBlock::ToolCall(call));
+                        }
+                        ProviderEvent::Blob(blob) => blocks.push(ContentBlock::ProviderBlob(blob)),
+                        ProviderEvent::Usage(u) => raw_usage = Some(Usage::reported(u)),
+                        ProviderEvent::Done {
+                            finish_reason: reason,
+                        } => {
+                            // A stream that ended without a reason was cut
+                            // off mid-reply (issue #96): the text may stop
+                            // mid-sentence and a tool call mid-arguments, so
+                            // nothing about it can be trusted — the existing
+                            // error path below ends the turn, writes no
+                            // assistant message and runs no call.
+                            if reason == CUT_STREAM {
+                                error = Some(ProviderError::Cut);
+                                break;
+                            }
+                            finish_reason = Some(reason);
+                        }
+                        ProviderEvent::Error(e) => {
+                            error = Some(e);
+                            break;
+                        }
                     }
                 }
+                drop(stream);
+                // What arrived in the instants the last polls of the stream
+                // raced past joins what the arm held — same rule, same point
+                // of first sight — rather than landing before the assistant
+                // message of the reply it interrupted.
+                held.extend(inbox.drain());
+                if let Some(by) = interrupted_by {
+                    // Dropped mid-call: no partial message, as a crash would
+                    // leave none.
+                    return self.interrupt_turn(by, Vec::new(), &spent, &mut held, observe);
+                }
+                flush_text(&mut text, &mut blocks);
+                // The one place both numbers exist for the same context
+                // (issue #52): what the provider counted against what the
+                // estimator makes of the same messages. Memory extraction and
+                // titles run on the utility provider and never reach here, so
+                // only the thread's own model teaches the ratio.
+                let prompt = raw_usage
+                    .as_ref()
+                    .map(|u| u.input_tokens + u.cache_read_tokens + u.cache_write_tokens);
+                self.measured = prompt.map(|p| (p, context.len()));
+                if let Some(reported) = prompt {
+                    let estimate = self.provider.count_tokens(&context);
+                    self.ratio =
+                        crate::evict::next_ratio(self.ratio, reported, estimate, self.overhead);
+                }
+                observe(Signal::Usage(self.window_usage(&context)));
+                let mut usage =
+                    raw_usage.unwrap_or_else(|| self.estimate_usage(&context, &agent, &blocks));
+                usage.profile = self.profile.clone();
+                usage.model = Some(self.model_label.clone());
+                usage.effort = self.effort.clone();
+                usage.latency_ms = Some(requested.elapsed().as_millis() as u64);
+                usage.ttft_ms = ttft_ms;
+                usage.cost_usd = self.prices.map(|p| p.cost_usd(&usage));
+                spent.tokens += self.budget.spent_of(&usage.to_core());
+                spent.usd += usage.cost_usd.unwrap_or(0.0);
+                // The attempt failed after content, and the failure is one a
+                // fresh call can get past: a stream cut off with no end marker
+                // (`Cut`), or a transient error such as a dropped mid-stream
+                // connection. `Protocol`, `Unsupported` and a refusal are not
+                // (`ProviderError::is_transient`), so a malformed stream still
+                // ends the turn. The boundary is deliberately narrower than
+                // "any error after content". The adapters' own retries are
+                // untouched: this is the one retry the runtime itself makes,
+                // and the new call gets its own adapter window.
+                let retryable = error.as_ref().is_some_and(recoverable_fault);
+                if content && retryable && !retried_once {
+                    // Not if the person has asked to stop: a retry nobody
+                    // is listening for is a call not wanted.
+                    if let Some(by) = cancel.cancelled_by() {
+                        // The attempt settled, so the call costs its one
+                        // iteration before the turn ends on the interrupt.
+                        spent.iterations += 1;
+                        return self.interrupt_turn(by, Vec::new(), &spent, &mut held, observe);
+                    }
+                    let payload = serde_json::to_value(ProviderRetriedPayload {
+                        attempt: 1,
+                        retries: 1,
+                        reason: self.retry_reason("cut off mid-reply"),
+                        wait_ms: 0,
+                    })
+                    .expect("serialisable");
+                    let event = self.log.append(NewEvent {
+                        kind: EventKind::ProviderRetried,
+                        author: Author::System,
+                        payload,
+                        parent_event: None,
+                    })?;
+                    observe(Signal::Event(&event));
+                    retried_once = true;
+                    continue;
+                }
+                settled_usage = usage;
+                break;
             }
-            drop(stream);
-            // What arrived in the instants the last polls of the stream
-            // raced past joins what the arm held — same rule, same point
-            // of first sight — rather than landing before the assistant
-            // message of the reply it interrupted.
-            held.extend(inbox.drain());
-            if let Some(by) = interrupted_by {
-                // Dropped mid-call: no partial message, as a crash would
-                // leave none.
-                return self.interrupt_turn(by, Vec::new(), &spent, &mut held, observe);
-            }
-            flush_text(&mut text, &mut blocks);
+            let usage = settled_usage;
+            // Issue #114: a model call costs one iteration, however many
+            // attempts it took — once per model call, not once per attempt.
+            // A call that ends the turn on its error counts its one
+            // iteration here too, exactly as it did before #114.
             spent.iterations += 1;
-            let agent = Author::Agent(self.agent.clone());
-            // The one place both numbers exist for the same context
-            // (issue #52): what the provider counted against what the
-            // estimator makes of the same messages. Memory extraction and
-            // titles run on the utility provider and never reach here, so
-            // only the thread's own model teaches the ratio.
-            let prompt = usage
-                .as_ref()
-                .map(|u| u.input_tokens + u.cache_read_tokens + u.cache_write_tokens);
-            self.measured = prompt.map(|p| (p, context.len()));
-            if let Some(reported) = prompt {
-                let estimate = self.provider.count_tokens(&context);
-                self.ratio =
-                    crate::evict::next_ratio(self.ratio, reported, estimate, self.overhead);
-            }
-            observe(Signal::Usage(self.window_usage(&context)));
-            let mut usage = usage.unwrap_or_else(|| self.estimate_usage(&context, &agent, &blocks));
-            usage.profile = self.profile.clone();
-            usage.model = Some(self.model_label.clone());
-            usage.effort = self.effort.clone();
-            usage.latency_ms = Some(requested.elapsed().as_millis() as u64);
-            usage.ttft_ms = ttft_ms;
-            usage.cost_usd = self.prices.map(|p| p.cost_usd(&usage));
-            spent.tokens += self.budget.spent_of(&usage.to_core());
             if let Some(e) = error {
                 self.end_turn(
                     &format!("provider_error: {e}"),
@@ -355,17 +527,57 @@ impl Runtime {
             let payload = serde_json::to_value(AssistantMessagePayload {
                 blocks,
                 usage: Some(usage),
+                finish_reason: finish_reason.clone(),
             })
             .expect("serialisable");
             let assistant =
                 self.append(EventKind::AssistantMessage, agent, payload, None, observe)?;
+            // A reply that hit the model's output limit was cut short by
+            // the model itself (issue #96): its calls were written by a
+            // reply that could not finish thinking, so none runs. Every
+            // call still gets a result — the invariant is that no call in
+            // the log is left unanswered — and the turn ends `length`.
+            let length_stop = finish_reason
+                .as_deref()
+                .is_some_and(|r| r == LENGTH_STOP || r == MAX_TOKENS_STOP);
+            if length_stop && !calls.is_empty() {
+                for call in &calls {
+                    let result = ToolResult {
+                        id: call.id.clone(),
+                        content: NOT_RUN_LENGTH.to_owned(),
+                        is_error: true,
+                    };
+                    let payload = serde_json::to_value(ToolResultPayload::new(
+                        result,
+                        PolicyRecord::rule(NOT_RUN_OVER_LIMIT, "deny"),
+                    ))
+                    .expect("serialisable");
+                    self.append(
+                        EventKind::ToolResult,
+                        Author::System,
+                        payload,
+                        Some(assistant.id),
+                        observe,
+                    )?;
+                }
+                return self.end_turn(LENGTH_STOP, None, &spent, &mut held, observe);
+            }
             if calls.is_empty() {
-                return self.end_turn("done", None, &spent, &mut held, observe);
+                return self.end_turn(
+                    if length_stop { LENGTH_STOP } else { "done" },
+                    None,
+                    &spent,
+                    &mut held,
+                    observe,
+                );
             }
 
             let mut answered = false;
+            // A step's report also ends the turn at once (issue #55): the
+            // runner reads the report, not the rest of the batch.
+            let mut reported = false;
             let mut calls = calls.into_iter();
-            for call in calls.by_ref() {
+            while let Some(call) = calls.next() {
                 self.drain_inbox(inbox, observe)?;
                 observe(Signal::ToolCallStarted(&call));
                 let (result, record, by) = self
@@ -378,7 +590,11 @@ impl Runtime {
                         &mut spent.wall_waited,
                     )
                     .await?;
-                answered |= call.name == ASK_HUMAN && !result.is_error;
+                answered |= (call.name == ASK_HUMAN
+                    || call.name == SUGGEST_PROJECT
+                    || call.name == START_JOB)
+                    && !result.is_error;
+                reported |= call.name == FINISH_STEP && !result.is_error;
                 let payload = serde_json::to_value(ToolResultPayload::new(result, record))
                     .expect("serialisable");
                 // An answered `ask_human` is the human's event, like a
@@ -390,6 +606,40 @@ impl Runtime {
                     Some(assistant.id),
                     observe,
                 )?;
+                if call.name == SUGGEST_PROJECT || call.name == START_JOB {
+                    // A proposal stands alone (issue #7): a call after it
+                    // in the same batch was written before the person had
+                    // answered, and nothing may run in a project they have
+                    // not answered for yet, nor any work the model just
+                    // asked to delegate. The results are written the way
+                    // the interrupt path writes its own. Calls before it
+                    // have already run; the instructions say to call it
+                    // first.
+                    let (not_run, rule) = if call.name == START_JOB {
+                        (NOT_RUN_JOB_SIBLING, NOT_RUN_JOB_SOLO)
+                    } else {
+                        (NOT_RUN_SIBLING, NOT_RUN_SOLO)
+                    };
+                    for rest in calls.by_ref() {
+                        let result = ToolResult {
+                            id: rest.id.clone(),
+                            content: not_run.to_owned(),
+                            is_error: true,
+                        };
+                        let payload = serde_json::to_value(ToolResultPayload::new(
+                            result,
+                            PolicyRecord::rule(rule, "deny"),
+                        ))
+                        .expect("serialisable");
+                        self.append(
+                            EventKind::ToolResult,
+                            Author::System,
+                            payload,
+                            Some(assistant.id),
+                            observe,
+                        )?;
+                    }
+                }
                 if cancel.cancelled_by().is_some() {
                     break;
                 }
@@ -425,6 +675,13 @@ impl Runtime {
                 }
                 return self.interrupt_turn(by, synthetic, &spent, &mut held, observe);
             }
+            // A step reporting is the step ending: the report is written, the
+            // turn's reason says so, and the runner's `step_finished`
+            // follows. Checked before `answered` because a report is the
+            // step's own end, whatever else the batch held.
+            if reported {
+                return self.end_turn(STEP_REPORTED, None, &spent, &mut held, observe);
+            }
             // A human's answer starts a turn: everything after it is new
             // work with its own budget. The client continues at once.
             if answered {
@@ -458,7 +715,9 @@ impl Runtime {
         let out = loop {
             tokio::select! {
                 out = &mut fut => break out,
-                queued = inbox.recv() => append_queued(&mut self.log, queued, observe, true)?,
+                queued = inbox.recv() => append_queued(
+                    &*self.provider, &mut self.log, &mut self.thread_raw, queued, observe, true,
+                )?,
                 by = cancel.cancelled() => {
                     return Ok(ToolResult {
                         id,
@@ -502,7 +761,14 @@ impl Runtime {
         observe: &mut (dyn FnMut(Signal<'_>) + Send),
     ) -> Result<TurnOutcome, RuntimeError> {
         for queued in std::mem::take(held) {
-            append_queued(&mut self.log, queued, observe, false)?;
+            append_queued(
+                &*self.provider,
+                &mut self.log,
+                &mut self.thread_raw,
+                queued,
+                observe,
+                false,
+            )?;
         }
         let after_seq = self.log.len().saturating_sub(1);
         let payload = serde_json::to_value(InterruptedPayload {
@@ -541,6 +807,11 @@ impl Runtime {
         // refusal as a name that was never registered.
         let class = if !self.tool_visible(&call.name) {
             None
+        } else if call.name == READ_BRIEF {
+            // `read_brief` is a harness tool that reads a file, so it
+            // carries `Read` rather than the safe class the others do
+            // (issue #123). The rules allow both by default.
+            Some(RiskClass::Read)
         } else if is_harness_tool(&call.name) {
             Some(HARNESS_CLASS)
         } else {
@@ -570,7 +841,10 @@ impl Runtime {
                 let (result, by) = if is_harness_tool(&call.name) {
                     let (started, started_wall) = (self.clock)();
                     let ran = self.run_harness_tool(call, cancel, observe).await?;
-                    if call.name == ASK_HUMAN {
+                    if call.name == ASK_HUMAN
+                        || call.name == SUGGEST_PROJECT
+                        || call.name == START_JOB
+                    {
                         *waited += started.elapsed();
                         *wall_waited += started_wall.elapsed().unwrap_or_default();
                     }
@@ -608,14 +882,54 @@ impl Runtime {
     /// sorted by name. What the model sees.
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         let mut specs = self.registry.specs();
-        specs.extend(harness_specs(!self.skills.model_invoked().is_empty()));
-        specs.retain(|s| self.layers.decided_tool(&s.name) == crate::Decided::Allowed);
+        specs.extend(harness_specs_with(
+            !self.skills.model_invoked().is_empty(),
+            // Offered exactly in a step thread (issue #55).
+            self.step.is_some(),
+            // A proposal needs a person: offered in an ordinary thread,
+            // never in a step thread, which nobody watches (issue #7).
+            self.step.is_none(),
+            // A sibling's brief to read (issue #123): offered when
+            // some project in reach other than this one has one.
+            self.read_brief_offered(),
+        ));
+        // A proposal needs a person to answer it, so an ordinary thread is
+        // the only kind offered one: a step thread is watched by nobody
+        // and a job cannot start a job.
+        if self.step.is_none() && self.job.is_none() {
+            specs.push(start_job_spec());
+            // A thread with a job to ask about is offered the way to ask;
+            // one that never started a job keeps the list it had.
+            if self.has_approved_job() {
+                specs.push(crate::harness_tools::inspect_job_spec());
+            }
+        }
+        specs.retain(|s| self.tool_visible(&s.name));
+        // A job's thread is never offered a job or a move, and is offered
+        // a question only when an answer can reach it: those calls are
+        // answerable, so hiding is not what keeps a job out of them, but a
+        // job's model should not be invited to make one it cannot.
+        if self.job.is_some() {
+            let asks = self.decisions.is_some();
+            specs.retain(|s| match s.name.as_str() {
+                START_JOB | SUGGEST_PROJECT => false,
+                ASK_HUMAN => asks,
+                _ => true,
+            });
+        }
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         specs
     }
 
-    /// Whether the layers let the model see this tool.
+    /// Whether the layers let the model see this tool. `finish_step` is
+    /// answerable in any thread — the offered list cannot gate a call a
+    /// model can always emit, so the arm decides (## Plan amendment 2
+    /// item 3); its spec is offered in a step thread alone, whatever the
+    /// project's allow list says.
     pub fn tool_visible(&self, name: &str) -> bool {
+        if name == FINISH_STEP {
+            return true;
+        }
         self.layers.decided_tool(name) == crate::Decided::Allowed
     }
 }

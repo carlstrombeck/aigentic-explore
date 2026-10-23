@@ -9,14 +9,16 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use aigentic_api::client::Client;
-use aigentic_api::{Notice, Request, Response, ThreadState};
+use aigentic_api::{Notice, Request, Response, SwitchReply, ThreadState};
 use aigentic_runtime::aigentic_core::{ContentBlock, EventKind};
 use aigentic_runtime::aigentic_log::{
-    AssistantMessagePayload, ToolResultPayload, TurnEndedPayload,
+    AssistantMessagePayload, ProviderRetriedPayload, ToolResultPayload, TurnEndedPayload,
 };
 use anyhow::bail;
 use tokio::sync::mpsc;
 use ulid::Ulid;
+
+use crate::app::engine::{TurnEvents, turn_end_report};
 
 /// The turn ended `done` and nothing was denied.
 pub const EXIT_OK: i32 = 0;
@@ -31,8 +33,18 @@ pub const EXIT_INTERRUPTED: i32 = 130;
 pub const NO_HUMAN: &str = "No human is available: this is a non-interactive run (aigentic exec). Continue without an answer, or stop and say what you needed.";
 
 /// Why a permission request is denied here, told to the model.
+/// What `exec` tells the runtime when a proposal reaches it: nobody is
+/// there to answer, so the proposal is closed rather than left open
+/// (issue #7).
+pub const SWITCH_DECLINED: &str = "exec declines proposals";
+
 pub const NON_INTERACTIVE: &str =
     "this is a non-interactive run (aigentic exec) and nobody can approve";
+
+/// The line `exec` prints when it declines a switch proposal.
+pub fn switch_declined_line(project: &str) -> String {
+    format!("[switch to {project} not answered: non-interactive]")
+}
 
 /// How many result lines the progress on stderr shows per tool call.
 const RESULT_LINES: usize = 3;
@@ -173,6 +185,9 @@ struct Follow {
     /// The last `turn_ended` reason.
     reason: Option<String>,
     last_message: String,
+    /// The open turn's own events, for the turn-end report (issue #113),
+    /// under the same bound the engine keeps (`app::engine::TurnEvents`).
+    turn: TurnEvents,
 }
 
 impl Follow {
@@ -192,6 +207,12 @@ impl Follow {
             // The model a daemon names at attach (issue #43) is for the
             // shell's footer; plain exec prints what the model says.
             Notice::Model { .. } => {}
+            // The followed run's line belongs to the interactive footer;
+            // plain exec already prints the frame as JSON when asked.
+            Notice::RunStatus { .. } => {}
+            // A job's asks go to the person at the front thread's REPL;
+            // exec answers nothing, as it answers no ask of its own.
+            Notice::Job { .. } => {}
             Notice::TextDelta { text, .. } => {
                 if !self.json {
                     write!(err, "{text}")?;
@@ -206,46 +227,79 @@ impl Follow {
                     writeln!(err, "→ {} {args}", call.name)?;
                 }
             }
-            Notice::Event { event, .. } => match event.kind {
-                EventKind::AssistantMessage => {
-                    self.end_line(err)?;
-                    if let Ok(p) =
-                        serde_json::from_value::<AssistantMessagePayload>(event.payload.clone())
-                    {
-                        let text: Vec<&str> = p
-                            .blocks
-                            .iter()
-                            .filter_map(|b| match b {
-                                ContentBlock::Text(t) => Some(t.as_str()),
-                                _ => None,
-                            })
-                            .collect();
-                        if !text.is_empty() {
-                            self.last_message = text.join("\n");
+            Notice::Event { event, .. } => {
+                self.turn.push(&event);
+                match event.kind {
+                    EventKind::AssistantMessage => {
+                        self.end_line(err)?;
+                        if let Ok(p) =
+                            serde_json::from_value::<AssistantMessagePayload>(event.payload.clone())
+                        {
+                            let text: Vec<&str> = p
+                                .blocks
+                                .iter()
+                                .filter_map(|b| match b {
+                                    ContentBlock::Text(t) => Some(t.as_str()),
+                                    _ => None,
+                                })
+                                .collect();
+                            if !text.is_empty() {
+                                self.last_message = text.join("\n");
+                            }
                         }
                     }
-                }
-                EventKind::ToolResult if !self.json => {
-                    if let Ok(ToolResultPayload { result, .. }) =
-                        serde_json::from_value(event.payload.clone())
-                    {
-                        let marker = if result.is_error { "✗" } else { "✓" };
-                        let lines: Vec<&str> = result.content.lines().collect();
-                        for line in lines.iter().take(RESULT_LINES) {
-                            writeln!(err, "  {marker} {line}")?;
-                        }
-                        if lines.len() > RESULT_LINES {
-                            writeln!(err, "  … +{} lines", lines.len() - RESULT_LINES)?;
+                    EventKind::ToolResult if !self.json => {
+                        if let Ok(ToolResultPayload { result, .. }) =
+                            serde_json::from_value(event.payload.clone())
+                        {
+                            let marker = if result.is_error { "✗" } else { "✓" };
+                            let lines: Vec<&str> = result.content.lines().collect();
+                            for line in lines.iter().take(RESULT_LINES) {
+                                writeln!(err, "  {marker} {line}")?;
+                            }
+                            if lines.len() > RESULT_LINES {
+                                writeln!(err, "  … +{} lines", lines.len() - RESULT_LINES)?;
+                            }
                         }
                     }
-                }
-                EventKind::TurnEnded => {
-                    if let Ok(p) = serde_json::from_value::<TurnEndedPayload>(event.payload) {
-                        self.reason = Some(p.reason);
+                    EventKind::TurnEnded => {
+                        if let Ok(p) = serde_json::from_value::<TurnEndedPayload>(event.payload) {
+                            // What the turn did and what is left (issue
+                            // #113), ahead of the final `[exec: …]` line
+                            // and never under `--json`, whose consumers
+                            // read the notices.
+                            if !self.json {
+                                self.end_line(err)?;
+                                for line in turn_end_report(&p, self.turn.as_slice()) {
+                                    writeln!(err, "{line}")?;
+                                }
+                            }
+                            self.reason = Some(p.reason);
+                        }
                     }
+                    // A retry (issue #90): the turn is waiting out a
+                    // provider outage, so a watcher sees it on stderr
+                    // rather than a run that looks hung.
+                    EventKind::ProviderRetried if !self.json => {
+                        self.end_line(err)?;
+                        if let Ok(p) =
+                            serde_json::from_value::<ProviderRetriedPayload>(event.payload)
+                        {
+                            writeln!(
+                                err,
+                                "[retrying {}/{} · {} · next in {}]",
+                                p.attempt,
+                                p.retries,
+                                p.reason,
+                                crate::app::status::elapsed_short(
+                                    std::time::Duration::from_millis(p.wait_ms,)
+                                )
+                            )?;
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             Notice::State { state, .. } => match state {
                 ThreadState::Idle if self.running => {
                     self.end_line(err)?;
@@ -284,6 +338,23 @@ impl Follow {
                         })
                         .await?;
                 }
+                ThreadState::AwaitingSwitch {
+                    call_id, project, ..
+                } => {
+                    self.running = true;
+                    self.end_line(err)?;
+                    self.denied += 1;
+                    writeln!(err, "{}", switch_declined_line(&project))?;
+                    client
+                        .request(Request::AnswerSwitch {
+                            thread,
+                            call_id,
+                            answer: SwitchReply::Withdrawn {
+                                note: SWITCH_DECLINED.into(),
+                            },
+                        })
+                        .await?;
+                }
             },
             Notice::Note { text, .. } => {
                 self.end_line(err)?;
@@ -315,6 +386,7 @@ impl Follow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::cells::summarise_args;
     use std::collections::VecDeque;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
@@ -401,6 +473,7 @@ mod tests {
         let server = ServerConfig {
             listen: "unix".into(),
             idle_unload_secs: 60,
+            resume_runs: false,
             users: vec![UserConfig {
                 name: "steve".into(),
                 token_env: None,
@@ -514,6 +587,33 @@ mod tests {
         assert_eq!(out, "could not fetch\n");
     }
 
+    /// T11: a switch proposal is declined with `withdrawn`, the line is
+    /// printed, the turn continues in place, and the exit code is three.
+    #[tokio::test]
+    async fn a_switch_proposal_is_declined_and_exit_is_three() {
+        let call = ProviderEvent::ToolCall(ToolCall {
+            id: "c1".into(),
+            name: "suggest_project".into(),
+            args: serde_json::json!({"project": "q", "reason": "belongs elsewhere"}),
+        });
+        let (o, out, err) = exec(
+            vec![
+                vec![call, finish("tool_use")],
+                vec![text("staying put"), finish("stop")],
+            ],
+            args(false),
+        )
+        .await;
+        assert_eq!(o.denied, 1, "{err}");
+        assert_eq!(o.code, EXIT_NEEDS_HUMAN, "{err}");
+        assert!(err.contains(&switch_declined_line("q")), "{err}");
+        assert_eq!(
+            out, "staying put\n",
+            "the turn continued in place: nothing waited for a person"
+        );
+        assert_eq!(o.reason.as_deref(), Some("done"), "{err}");
+    }
+
     #[tokio::test]
     async fn json_prints_notices_then_a_summary() {
         let (o, out, _) = exec(vec![vec![text("ok"), finish("stop")]], args(true)).await;
@@ -529,6 +629,110 @@ mod tests {
         assert_eq!(last["denied"], 0);
     }
 
+    /// Issue #90 (T8): a retry reaches a non-interactive watcher's stderr
+    /// as one line, so an `exec` run during an outage reads as waiting
+    /// rather than hung. The line's wait is rendered by the same helper
+    /// the tui's turn line uses.
+    #[tokio::test]
+    async fn a_retry_is_printed_on_stderr() {
+        let wait = Duration::from_secs(8);
+        let retried = ProviderEvent::Retried {
+            attempt: 2,
+            retries: 14,
+            reason: "overloaded".into(),
+            wait,
+        };
+        let (o, out, err) = exec(
+            vec![vec![retried, text("recovered"), finish("stop")]],
+            args(false),
+        )
+        .await;
+        assert_eq!(o.code, EXIT_OK);
+        assert_eq!(out, "recovered\n");
+        let rendered = crate::app::status::elapsed_short(wait);
+        assert!(err.contains("[retrying 2/14 · "), "{err}");
+        assert!(err.contains("overloaded"), "{err}");
+        assert!(err.contains(&format!("next in {rendered}]")), "{err}");
+
+        // `--json` already carries every notice, so the stderr line is
+        // for a person watching, not a parser.
+        let (o, _, err) = exec(
+            vec![vec![
+                ProviderEvent::Retried {
+                    attempt: 2,
+                    retries: 14,
+                    reason: "overloaded".into(),
+                    wait,
+                },
+                text("recovered"),
+                finish("stop"),
+            ]],
+            args(true),
+        )
+        .await;
+        assert_eq!(o.code, EXIT_OK);
+        assert!(!err.contains("[retrying"), "{err}");
+    }
+
+    /// T4 (#113): a scripted provider that makes two tool calls and
+    /// then fails. The report the engine draws reaches `exec`'s stderr
+    /// too, ahead of the final `[exec: …]` line, and never under
+    /// `--json`, whose consumers read the notices.
+    #[tokio::test]
+    async fn a_failed_turn_reports_what_it_did_before_the_exec_line() {
+        let read = ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            args: serde_json::json!({"path": "aigentic.toml"}),
+        };
+        let list = ToolCall {
+            id: "c2".into(),
+            name: "list_dir".into(),
+            args: serde_json::json!({"path": "."}),
+        };
+        let failed = ProviderEvent::Error(
+            aigentic_runtime::aigentic_core::ProviderError::Transport("connection closed".into()),
+        );
+        let script = || {
+            vec![
+                vec![ProviderEvent::ToolCall(read.clone()), finish("tool_use")],
+                vec![ProviderEvent::ToolCall(list.clone()), finish("tool_use")],
+                vec![failed.clone()],
+            ]
+        };
+        let (o, _, err) = exec(script(), args(false)).await;
+        assert_eq!(o.code, EXIT_FAILED, "{err}");
+        let did = format!(
+            "[before that: read_file {} · list_dir {}]",
+            summarise_args(&read),
+            summarise_args(&list)
+        );
+        let stop = err
+            .lines()
+            .position(|l| l.starts_with("[turn ended: the model's reply failed:"))
+            .unwrap_or_else(|| panic!("no stop line in {err}"));
+        assert!(
+            err.lines()
+                .nth(stop)
+                .unwrap()
+                .contains("(/why shows the raw error)")
+        );
+        let tail: Vec<&str> = err.lines().skip(stop).collect();
+        assert_eq!(tail[1], did, "{err}");
+        assert_eq!(tail[2], "[if that wasn't the end, type continue]", "{err}");
+        let last = err.lines().last().unwrap();
+        assert!(last.starts_with("[exec: "), "{err}");
+
+        // `--json` carries every notice already; a person's lines stay off it.
+        let (o, _, err) = exec(script(), args(true)).await;
+        assert_eq!(o.code, EXIT_FAILED, "{err}");
+        assert!(!err.contains("before that:"), "{err}");
+        assert!(!err.contains("turn ended:"), "{err}");
+    }
+
+    /// A budget stop or a provider error at the end of a run reads as a
+    /// failure on stderr; the report lines are printed before that line
+    /// and never change the exit code (issue #113).
     #[tokio::test]
     async fn a_budget_or_provider_stop_is_a_failure() {
         let f = Follow {

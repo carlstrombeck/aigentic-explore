@@ -116,7 +116,13 @@ pub(crate) fn class_name(class: RiskClass) -> &'static str {
 /// The project's memory folder, relative to its root; extraction writes
 /// it after a turn and the model may not (phase 4 step 9).
 pub const MEMORY_PREFIX: &str = ".aigentic/memory/";
+/// Why a write into a memory folder is refused.
 pub const MEMORY_REASON: &str = "memory is written by extraction; edit it outside the thread";
+
+/// The rule name a refusal under the person's or a workspace's memory
+/// folder carries: a home lies outside the project, so no `path_prefix`
+/// row can name it.
+pub const MEMORY_HOME_RULE: &str = "memory home";
 
 /// The default table from `docs/PLAN-phase3.md` section 4, in order,
 /// plus the phase 4 memory rows before the write-ask row.
@@ -170,7 +176,10 @@ pub fn default_bash_allow() -> Vec<String> {
         "git branch",
         "git ls-files",
         "git rev-parse",
+        "git rev-list",
         "git blame",
+        "git grep",
+        "git reflog",
         // Read-only GitHub through the gh CLI; creating, commenting,
         // merging and pushing still ask.
         "gh issue list",

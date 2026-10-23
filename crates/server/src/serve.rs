@@ -112,6 +112,13 @@ impl Bound {
     /// Accept forever, sweeping idle threads on the side.
     pub async fn serve(self) -> Result<(), ServerError> {
         let server = self.server;
+        // A killed daemon's unfinished runs are picked up here, before any
+        // client can ask (issue #58, rule 8). An embedded daemon's
+        // `resume_runs` is false, so it claims nothing on its own.
+        server.threads.resume_unfinished_runs();
+        // A job that ended while no daemon was there to post its return
+        // gets it now; one still mid-turn is left as it is.
+        tokio::spawn(crate::jobs::post_unreturned(server.threads.clone()));
         let sweeper = {
             let server = server.clone();
             tokio::spawn(async move {
@@ -193,6 +200,10 @@ impl Server {
         reports: Arc<dyn Reports>,
         profile: Option<String>,
     ) -> Self {
+        // The listing's day is the person's. The binary reads the zone
+        // before its runtime starts; a daemon embedded some other way reads
+        // it here, and where `time` refuses by then the day is UTC's.
+        crate::runs::read_day_zone();
         // Workspace files name more projects; server.toml wins on a clash.
         // A broken workspace file leaves the daemon on server.toml alone.
         let workspaces = crate::workspaces::load_all(&config_dir).unwrap_or_default();
@@ -208,6 +219,11 @@ impl Server {
             .threads_dir
             .clone()
             .unwrap_or_else(crate::config::default_threads_dir);
+        // Every daemon start moves what is left of the per-project
+        // layout flat, once, before the table reads it (issue #9). An
+        // error never stops the daemon: the table still reads the legacy
+        // directories, so a log nobody moved stays reachable.
+        let migrated = crate::migrate::migrate(&threads_base).map_err(|e| e.to_string());
         let threads = Arc::new(
             ThreadTable::new(
                 config.clone(),
@@ -218,6 +234,7 @@ impl Server {
                 threads_base,
                 guard,
             )
+            .with_migrated(migrated)
             .with_profile(profile)
             .with_workspaces(workspaces),
         );
@@ -231,7 +248,10 @@ impl Server {
 
     /// Production wiring: providers from the config's profiles, every
     /// report rendered.
-    pub fn from_configs(config: Config, config_dir: PathBuf, server: ServerConfig) -> Self {
+    pub fn from_configs(config: Config, config_dir: PathBuf, mut server: ServerConfig) -> Self {
+        // The served daemon is the one that picks up the runs a killed
+        // daemon left behind (issue #58). An embedded daemon does not.
+        server.resume_runs = true;
         let providers: Arc<dyn ProviderFactory> = Arc::new(Profiles(Arc::new(config.clone())));
         let reports = Arc::new(DefaultReports {
             global_instructions: config
@@ -296,10 +316,10 @@ impl Server {
 
     /// A daemon in this process for one user over a private socket:
     /// what `aigentic` does when nothing listens. `root` becomes the one
-    /// project (named by its file, else `_none`); the token is random and
-    /// lives only in memory. `profile` is the client's `--profile`,
-    /// which wins over the project's `[model] profile` for every thread
-    /// this daemon builds.
+    /// project (named by its file, else its basename). The token is
+    /// random and lives only in memory. `profile` is the client's
+    /// `--profile`, which wins over the project's `[model] profile` for
+    /// every thread this daemon builds.
     pub async fn embed(
         config: Config,
         config_dir: PathBuf,
@@ -330,7 +350,40 @@ impl Server {
         let dir = tempfile_dir()?;
         let socket = dir.join("aigentic.sock");
         let token = random_token();
-        let project = project_name_at(&root);
+        // The workspace files of the real config name projects too, and
+        // a bare root must not borrow one of their names when its
+        // basename clashes at another root (issue #9): the embedded
+        // daemon loads them the way `build` does, an error counting as
+        // none, and hands the merged set to `Server::build`.
+        let workspaces = crate::workspaces::load_all(&config_dir).unwrap_or_default();
+        let project = project_name_at(&root, &workspaces);
+        // The person's front thread may live in a project this folder's
+        // daemon does not know (issue #88), and the project list is fixed
+        // once the daemon starts (#87 is live reload). Learn it here, at
+        // start: when the front thread's project is not in the set
+        // `build` will end with, and its folder is still there, register
+        // it. A name already taken is left alone — a different project of
+        // that name must answer `Replaced`, never resume in the wrong
+        // root, and `resumable` sorts the roots out.
+        let threads_base = config
+            .threads_dir
+            .clone()
+            .unwrap_or_else(crate::config::default_threads_dir);
+        let known = crate::workspaces::merge(
+            vec![ProjectConfig {
+                name: project.clone(),
+                root: root.clone(),
+            }],
+            &workspaces,
+        );
+        let front_project = crate::threads::front_root(&threads_base, user)
+            .filter(|(name, front_root)| {
+                !known.iter().any(|p| &p.name == name) && front_root.is_dir()
+            })
+            .map(|(name, front_root)| ProjectConfig {
+                name,
+                root: front_root,
+            });
         let server = ServerConfig {
             listen: format!("unix:{}", socket.display()),
             idle_unload_secs: 24 * 3600,
@@ -339,11 +392,23 @@ impl Server {
                 token_env: None,
                 token: Some(token.clone()),
             }],
-            projects: vec![ProjectConfig {
-                name: project.clone(),
-                root,
-            }],
+            projects: match &front_project {
+                Some(extra) => vec![
+                    ProjectConfig {
+                        name: project.clone(),
+                        root,
+                    },
+                    extra.clone(),
+                ],
+                None => vec![ProjectConfig {
+                    name: project.clone(),
+                    root,
+                }],
+            },
+            // An embedded daemon resumes nothing on its own (issue #58).
+            resume_runs: false,
         };
+        let front_name = front_project.as_ref().map(|p| p.name.clone());
         let server = Arc::new(Self::build(
             config,
             config_dir,
@@ -365,6 +430,7 @@ impl Server {
             socket,
             token,
             project,
+            front_project: front_name,
             server,
             task,
             _dir: dir,
@@ -379,6 +445,11 @@ pub struct Embedded {
     /// Never printed; the client sends it in `Hello`.
     pub token: String,
     pub project: String,
+    /// The front thread's project, when this daemon registered it at
+    /// start (issue #88): `None` when no front thread exists, when its
+    /// root is gone, or when a project already holds its name. For tests
+    /// and a later banner; the client still sends `project`.
+    pub front_project: Option<String>,
     pub server: Arc<Server>,
     task: tokio::task::JoinHandle<Result<(), ServerError>>,
     _dir: PathBuf,

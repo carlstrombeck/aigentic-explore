@@ -34,6 +34,11 @@ pub const MIN_ROWS: u16 = 5;
 /// reads) the viewport shows at most; the rest is in the scrollback.
 pub const MAX_ACTIVE_ROWS: usize = 12;
 
+/// The terminal's title stack: push saves the window's title and sets a new
+/// one, pop restores what was there before.
+pub const PUSH_TITLE: &str = "\u{1b}[22;0t";
+pub const POP_TITLE: &str = "\u{1b}[23;0t";
+
 /// The rows the pane needs: what `layout` draws, the active part
 /// capped, plus the blank row that ends the transcript.
 pub fn needed_rows(pane: &Pane<'_>) -> u16 {
@@ -48,6 +53,15 @@ pub fn needed_rows(pane: &Pane<'_>) -> u16 {
         // The blank row that ends the transcript, and the status line.
         + 2;
     u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+/// The viewport's floor for the next frame (issue #93). While a turn
+/// runs the pane only grows: its rows swing with every think, tool and
+/// write, and each change of height moves the composer, so the floor
+/// keeps the most this turn has needed. Between turns the floor is
+/// gone, and the pane shrinks to fit once.
+pub fn held_rows(held: u16, wanted: u16, turning: bool) -> u16 {
+    if turning { held.max(wanted) } else { 0 }
 }
 
 /// What the bottom pane shows.
@@ -381,6 +395,9 @@ pub struct Shell {
     rows: u16,
     /// The window size the viewport was last fitted to.
     last_size: (u16, u16),
+    /// The title last written to the terminal, so a frame that changes
+    /// nothing writes nothing.
+    title: Option<String>,
 }
 
 impl Shell {
@@ -395,6 +412,11 @@ impl Shell {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )
         .is_ok();
+        // Push the window's title before the viewport draws, so a terminal
+        // that logs it does so on a clean screen. A terminal that refuses
+        // the sequence must not stop the REPL, as the enhancement call
+        // above already allows.
+        let _ = crossterm::execute!(stdout, crossterm::style::Print(PUSH_TITLE));
         let terminal = Terminal::with_options(
             Tracked::new(),
             TerminalOptions {
@@ -407,6 +429,7 @@ impl Shell {
             stopped: false,
             rows: MIN_ROWS,
             last_size: crossterm::terminal::size()?,
+            title: None,
         })
     }
 
@@ -457,6 +480,20 @@ impl Shell {
         // How far the new viewport would run past the bottom of the
         // screen: 0 when it shrinks, or when the old top leaves room.
         let shortfall = old_top.saturating_add(rows).saturating_sub(height);
+        // A shrink on a full screen keeps the live area's bottom on the
+        // last row (issue #95): the composer and the status line stay
+        // where they are. The rows the live area gives up are taken by
+        // the transcript, scrolled down into them inside a scroll region
+        // that ends where the new live area begins, so its last line
+        // sits right above the pane again and the blank rows land at the
+        // top of the screen. Short of a full screen the live area keeps
+        // its top and follows the transcript, as before.
+        let full = old_top.saturating_add(self.rows) >= height;
+        let lowered = (rows < self.rows && full).then(|| self.rows - rows);
+        let new_top = match lowered {
+            Some(d) => old_top + d,
+            None => old_top.saturating_sub(shortfall),
+        };
         let mut backend = self.terminal.backend().rebuild();
         {
             use ratatui::backend::{Backend, ClearType};
@@ -464,7 +501,10 @@ impl Shell {
                 backend.set_cursor_position(Position::new(0, height.saturating_sub(1)))?;
                 backend.append_lines(shortfall)?;
             }
-            backend.set_cursor_position(Position::new(0, old_top.saturating_sub(shortfall)))?;
+            if let Some(d) = lowered {
+                backend.scroll_region_down(0..new_top, d)?;
+            }
+            backend.set_cursor_position(Position::new(0, new_top))?;
             backend.clear_region(ClearType::AfterCursor)?;
             Backend::flush(&mut backend)?;
         }
@@ -489,6 +529,7 @@ impl Shell {
             stopped: false,
             rows: height,
             last_size: (width, height),
+            title: None,
         }
     }
 
@@ -508,6 +549,7 @@ impl Shell {
             stopped: false,
             rows,
             last_size: (width, height),
+            title: None,
         }
     }
 
@@ -547,6 +589,12 @@ impl Shell {
             return;
         }
         self.stopped = true;
+        // Restore the window's own title first, so what the person had is
+        // back before the transcript's last lines land. A test screen has
+        // no title stack to pop.
+        if matches!(self.terminal.backend().inner, Screen::Terminal(_)) {
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::style::Print(POP_TITLE));
+        }
         let _ = self.terminal.draw(|f| f.render_widget(Blank, f.area()));
         let mut out = std::io::stdout();
         if self.enhanced_keys {
@@ -606,6 +654,56 @@ impl Shell {
         };
         let _ = crossterm::execute!(out, LeaveAlternateScreen);
         result
+    }
+
+    /// Fit the viewport and draw the pane as one frame (issue #93): the
+    /// resize's scroll and clear and the redraw that follows go out as a
+    /// single synchronized update, so the terminal shows the finished
+    /// frame instead of the cleared one in between. A terminal without
+    /// synchronized output ignores the markers. `floor` is the height
+    /// the viewport must not shrink below: the turn's high-water mark.
+    pub fn frame(&mut self, pane: &Pane<'_>, floor: u16) -> anyhow::Result<()> {
+        self.sync(true)?;
+        let result = self
+            .fit(needed_rows(pane).max(floor))
+            .and_then(|()| self.draw(pane));
+        // End the update whatever happened, so a failed frame never
+        // leaves the terminal holding its output back.
+        self.sync(false)?;
+        result
+    }
+
+    /// Write `title` as the window's title, and say whether it went out.
+    ///
+    /// A title written on the last frame is not written again: the frame
+    /// block runs several times a second, and a terminal would flicker.
+    /// The write itself goes to a real terminal only, so a test screen
+    /// records the change and emits no escape bytes. An error is the
+    /// write's, which ends the run as a failed frame does.
+    pub fn set_title(&mut self, title: &str) -> std::io::Result<bool> {
+        if self.title.as_deref() == Some(title) {
+            return Ok(false);
+        }
+        self.title = Some(title.to_owned());
+        if matches!(self.terminal.backend().inner, Screen::Terminal(_)) {
+            let mut out = std::io::stdout();
+            crossterm::execute!(out, crossterm::terminal::SetTitle(title))?;
+        }
+        Ok(true)
+    }
+
+    /// Begin or end a synchronized update on the real terminal; a test
+    /// screen has nothing to hold back.
+    fn sync(&mut self, begin: bool) -> std::io::Result<()> {
+        if !matches!(self.terminal.backend().inner, Screen::Terminal(_)) {
+            return Ok(());
+        }
+        let mut out = std::io::stdout();
+        if begin {
+            crossterm::queue!(out, crossterm::terminal::BeginSynchronizedUpdate)
+        } else {
+            crossterm::execute!(out, crossterm::terminal::EndSynchronizedUpdate)
+        }
     }
 
     /// Draw the bottom pane.
@@ -846,6 +944,54 @@ pub fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    /// Issue #93: through a turn's think, tool, think and write cycle
+    /// the viewport never shrinks, and it shrinks once when the turn
+    /// ends.
+    #[test]
+    fn a_turn_holds_the_pane_and_the_end_lets_it_go() {
+        let mut shell = Shell::test_inline(40, 30, MIN_ROWS);
+        // The rows a pane wants, frame by frame: thinking, a tool's
+        // row, thinking again, the two-row writing slot, a tool again.
+        let turn = [7u16, 8, 7, 9, 8, 7];
+        let mut held = 0;
+        let mut heights = Vec::new();
+        for wanted in turn {
+            held = held_rows(held, wanted, true);
+            shell.fit(wanted.max(held)).unwrap();
+            heights.push(shell.rows);
+        }
+        assert!(
+            heights.windows(2).all(|w| w[1] >= w[0]),
+            "the pane never shrinks mid-turn: {heights:?}"
+        );
+        assert_eq!(*heights.last().unwrap(), *turn.iter().max().unwrap());
+        // The turn ends: the floor goes, and the pane fits what it shows.
+        held = held_rows(held, MIN_ROWS, false);
+        assert_eq!(held, 0);
+        shell.fit(MIN_ROWS.max(held)).unwrap();
+        assert_eq!(shell.rows, MIN_ROWS);
+    }
+
+    /// Issue #93: `frame` fits and draws in one go and keeps the floor.
+    #[test]
+    fn a_frame_keeps_the_floor() {
+        let mut shell = Shell::test_inline(40, 30, MIN_ROWS);
+        let composer = Composer::default();
+        let pane = Pane {
+            active: &[],
+            composer: &composer,
+            status: "s",
+            hint: None,
+            block: &[],
+            popup: &[],
+            activity: None,
+        };
+        shell.frame(&pane, 9).unwrap();
+        assert_eq!(shell.rows, 9, "the floor wins over a smaller pane");
+        shell.frame(&pane, 0).unwrap();
+        assert_eq!(shell.rows, needed_rows(&pane).max(MIN_ROWS));
+    }
 
     fn composer_with(text: &str) -> Composer {
         let mut c = Composer::default();
@@ -1169,31 +1315,90 @@ mod tests {
         }
     }
 
+    /// Issue #95: on a full screen a shrink keeps the live area's
+    /// bottom, so the composer and the status line do not move; the
+    /// transcript scrolls down into the rows it gave up, its last line
+    /// right above the pane, and nothing reaches the history.
     #[test]
-    fn a_shrinking_viewport_leaves_the_history_alone() {
+    fn a_shrink_on_a_full_screen_keeps_the_pane_at_the_bottom() {
         let (mut shell, lines, old_top) = anchored_shell(40, 15);
         let d = 2;
         shell.fit(MIN_ROWS + d).expect("a fit");
         let top_before = shell.frame_top();
+        assert_eq!(top_before, old_top - d, "the tall fit grew the live area");
+        let bottom = top_before + MIN_ROWS + d;
         let history_before = shell.history_lines();
 
         shell.fit(MIN_ROWS).expect("a fit");
 
         assert_eq!(shell.rows, MIN_ROWS);
         assert_eq!(
-            shell.frame_top(),
-            top_before,
-            "a shrink keeps the live area's top and pulls its bottom up"
+            shell.frame_top() + MIN_ROWS,
+            bottom,
+            "a shrink keeps the live area's bottom"
+        );
+        assert_eq!(shell.frame_top(), top_before + d);
+        assert_eq!(
+            shell.screen_lines()[usize::from(shell.frame_top()) - 1],
+            lines[lines.len() - 1],
+            "the transcript's last line sits directly above the pane"
         );
         assert_eq!(
             shell.history_lines(),
             history_before,
-            "a shrink scrolls nothing"
+            "the transcript moves down on screen; nothing goes to history"
         );
-        assert_eq!(top_before, old_top - d, "the tall fit grew the live area");
+        // The rows given up are blank at the top of the screen.
+        assert!(
+            shell.screen_lines()[..usize::from(d)]
+                .iter()
+                .all(String::is_empty)
+        );
+    }
+
+    /// Issue #95: short of a full screen a shrink keeps the live area's
+    /// top, as before: the pane follows the transcript.
+    #[test]
+    fn a_shrink_on_a_short_screen_keeps_the_top() {
+        let mut shell = Shell::test_inline(40, 30, MIN_ROWS + 3);
+        shell.commit(Line::raw("only line")).expect("a commit");
+        let top_before = shell.frame_top();
+        shell.fit(MIN_ROWS).expect("a fit");
+        assert_eq!(shell.frame_top(), top_before, "the pane follows the text");
         assert_eq!(
             shell.screen_lines()[usize::from(top_before) - 1],
-            lines[lines.len() - 1]
+            "only line"
         );
+    }
+
+    /// The frame block runs several times a second, so a title already on
+    /// the window is not written again.
+    #[test]
+    fn the_title_is_written_only_when_it_changes() {
+        let mut shell = Shell::test_inline(40, 30, MIN_ROWS);
+        assert!(
+            shell.set_title("aigentic").expect("a title"),
+            "the first write"
+        );
+        assert!(
+            !shell.set_title("aigentic").expect("a title"),
+            "no change, no write"
+        );
+        assert!(
+            shell.set_title("✳ aigentic").expect("a title"),
+            "a change writes"
+        );
+        assert!(
+            !shell.set_title("✳ aigentic").expect("a title"),
+            "the change is what was written"
+        );
+    }
+
+    /// The title stack is addressed by these two sequences: a typo leaves a
+    /// person's own window title un-restored.
+    #[test]
+    fn the_title_push_and_pop_are_the_terminal_ones() {
+        assert_eq!(PUSH_TITLE, "\u{1b}[22;0t");
+        assert_eq!(POP_TITLE, "\u{1b}[23;0t");
     }
 }

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Display;
 use std::pin::Pin;
 
-use aigentic_core::{ProviderBlob, ProviderError, ProviderEvent, ToolCall, Usage};
+use aigentic_core::{CUT_STREAM, ProviderBlob, ProviderError, ProviderEvent, ToolCall, Usage};
 use bytes::Bytes;
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -115,7 +115,22 @@ pub struct Translator {
     reasoning: String,
     finish_reason: Option<String>,
     done: bool,
+    /// Set when the stream closed with a completion marker or a reason,
+    /// so an EOF after it is a clean end rather than a cut (issue #96).
+    saw_end: bool,
+    /// The current line of streamed text while it could still be the
+    /// start of leaked tool-call markup; cleared at each newline.
+    line: String,
+    /// The current line can no longer start with the markup, so the rest
+    /// of it is not collected.
+    line_settled: bool,
 }
+
+/// How DeepSeek's own tool-call syntax begins, in its full-width and ASCII
+/// spellings. A reply that writes it at the start of a line was meant as a
+/// tool call and came out as text: nothing in it can be trusted, and the
+/// call it was writing never arrives.
+const LEAKED_CALL_MARKERS: [&str; 2] = ["<\u{ff5c}DSML\u{ff5c}", "<|DSML|"];
 
 impl Translator {
     pub fn new() -> Self {
@@ -128,6 +143,8 @@ impl Translator {
             return Vec::new();
         }
         if data.trim() == "[DONE]" {
+            // The marker is a clean end even with no reason recorded.
+            self.saw_end = true;
             return self.finish();
         }
         let chunk: Chunk = match serde_json::from_str(data) {
@@ -141,9 +158,14 @@ impl Translator {
         };
         if let Some(err) = chunk.error {
             self.done = true;
-            return vec![ProviderEvent::Error(ProviderError::Protocol(
-                err.to_string(),
-            ))];
+            let error = match status_of(&err) {
+                Some(status) => ProviderError::Http {
+                    status,
+                    body: err.to_string(),
+                },
+                None => ProviderError::Protocol(err.to_string()),
+            };
+            return vec![ProviderEvent::Error(error)];
         }
 
         let mut out = Vec::new();
@@ -151,6 +173,10 @@ impl Translator {
             if let Some(text) = choice.delta.content
                 && !text.is_empty()
             {
+                if self.starts_leaked_markup(&text) {
+                    out.extend(self.cut());
+                    return out;
+                }
                 out.push(ProviderEvent::TextDelta(text));
             }
             if let Some(r) = choice.delta.reasoning_content {
@@ -172,6 +198,9 @@ impl Translator {
                 }
             }
             if let Some(reason) = choice.finish_reason {
+                // A reason counts as an end even if the marker never
+                // arrives: the server said how the reply stopped.
+                self.saw_end = true;
                 out.extend(self.flush_calls());
                 self.finish_reason = Some(reason);
             }
@@ -182,13 +211,26 @@ impl Translator {
         out
     }
 
-    /// End of stream, whether by `[DONE]`, EOF or a transport error.
+    /// End of stream, by `[DONE]` or at EOF; a transport error emits
+    /// `Error` instead (`parse_stream`) and never calls this.
+    ///
+    /// A stream that ended without a reason is a cut (issue #96): the
+    /// reply was still being written, so its open tool calls are dropped
+    /// rather than flushed with half their arguments. A marker gives the
+    /// clean default, and a reason seen earlier is kept. Text already
+    /// streamed is emitted as before.
     pub fn finish(&mut self) -> Vec<ProviderEvent> {
         if self.done {
             return Vec::new();
         }
         self.done = true;
-        let mut out = self.flush_calls();
+        let cut = self.finish_reason.is_none() && !self.saw_end;
+        let mut out = if cut {
+            self.calls.clear();
+            Vec::new()
+        } else {
+            self.flush_calls()
+        };
         if !self.reasoning.is_empty() {
             out.push(ProviderEvent::Blob(ProviderBlob {
                 provider: PROVIDER_NAME.to_owned(),
@@ -196,12 +238,57 @@ impl Translator {
             }));
         }
         out.push(ProviderEvent::Done {
-            finish_reason: self
-                .finish_reason
-                .take()
-                .unwrap_or_else(|| "end_of_stream".to_owned()),
+            finish_reason: self.finish_reason.take().unwrap_or_else(|| {
+                if self.saw_end {
+                    "stop".to_owned()
+                } else {
+                    CUT_STREAM.to_owned()
+                }
+            }),
         });
         out
+    }
+
+    /// Whether `text` completes a line that begins, after its leading
+    /// whitespace, with leaked tool-call markup. The markup may be split
+    /// across chunks; a mention inside a sentence or after a backtick is
+    /// prose and passes.
+    fn starts_leaked_markup(&mut self, text: &str) -> bool {
+        for ch in text.chars() {
+            if ch == '\n' {
+                self.line.clear();
+                self.line_settled = false;
+                continue;
+            }
+            if self.line_settled {
+                continue;
+            }
+            self.line.push(ch);
+            let line = self.line.trim_start();
+            if line.is_empty() {
+                continue;
+            }
+            if LEAKED_CALL_MARKERS.iter().any(|m| line.starts_with(m)) {
+                return true;
+            }
+            if !LEAKED_CALL_MARKERS.iter().any(|m| m.starts_with(line)) {
+                self.line.clear();
+                self.line_settled = true;
+            }
+        }
+        false
+    }
+
+    /// End the reply as cut off: leaked markup means the model's call was
+    /// never sent, so the reply ends the way a dropped stream does. Being
+    /// `done`, the translator ignores whatever the stream sends next and
+    /// never flushes a pending call. The adapter retries a cut before any
+    /// content and the runtime retries one after it.
+    fn cut(&mut self) -> Vec<ProviderEvent> {
+        self.done = true;
+        vec![ProviderEvent::Done {
+            finish_reason: CUT_STREAM.to_owned(),
+        }]
     }
 
     fn flush_calls(&mut self) -> Vec<ProviderEvent> {
@@ -224,6 +311,33 @@ impl Translator {
                 })
             })
             .collect()
+    }
+}
+
+/// The status an in-stream `error` object stands for, or `None` when it
+/// names none that is worth retrying.
+///
+/// A parsed `code` decides, and the `type` table is only a fallback: a
+/// provider sending `code: "404"` beside `type: "server_error"` is
+/// contradicting itself, and retrying its refusal forever would be worse
+/// than trusting the specific field.
+fn status_of(object: &serde_json::Value) -> Option<u16> {
+    let code = match object.get("code") {
+        Some(serde_json::Value::String(text)) => text.trim().parse::<u16>().ok(),
+        Some(serde_json::Value::Number(number)) => {
+            number.as_u64().and_then(|n| u16::try_from(n).ok())
+        }
+        _ => None,
+    };
+    if let Some(code) = code {
+        let transient = code == 429 || (500..600).contains(&code);
+        return transient.then_some(code);
+    }
+    let kind = object.get("type")?.as_str()?.trim().to_ascii_lowercase();
+    match kind.as_str() {
+        "server_error" | "api_error" => Some(500),
+        "overloaded_error" => Some(503),
+        _ => None,
     }
 }
 
@@ -291,6 +405,14 @@ mod tests {
     const TEXT: &str = include_str!("../../fixtures/openai_compat/text.sse");
     const TOOL_CALLS: &str = include_str!("../../fixtures/openai_compat/tool_calls.sse");
     const LENGTH: &str = include_str!("../../fixtures/openai_compat/length.sse");
+
+    /// The fixture's first `lines` lines: the stream dying there, its
+    /// last event left without the blank line that terminates it.
+    fn cut_after(fixture: &str, lines: usize) -> String {
+        let mut out = fixture.lines().take(lines).collect::<Vec<_>>().join("\n");
+        out.push('\n');
+        out
+    }
 
     /// Run a fixture through the parser and translator as one chunk.
     fn translate(fixture: &str) -> Vec<ProviderEvent> {
@@ -414,10 +536,33 @@ mod tests {
     }
 
     #[test]
-    fn eof_without_done_marker_completes_the_same_way() {
-        let cut = LENGTH.rsplit_once("data: [DONE]").unwrap().0;
-        assert!(!cut.contains("[DONE]"));
-        assert_eq!(translate(cut), translate(LENGTH));
+    fn a_reason_without_the_done_marker_is_still_a_clean_end() {
+        // The reason alone ends the reply (issue #96): a server that sends
+        // its `finish_reason` and then drops `[DONE]` is not a cut.
+        let (before_done, _) = LENGTH.rsplit_once("data: [DONE]").unwrap();
+        assert!(!before_done.contains("[DONE]"));
+        assert_eq!(translate(before_done), translate(LENGTH));
+    }
+
+    #[test]
+    fn eof_without_done_marker_is_a_cut_stream() {
+        // The stream died with the calls still open: before the chunk
+        // that spells the reason: no reason, no marker. It used to be
+        // flushed and run as two calls (issue #96).
+        let cut = cut_after(TOOL_CALLS, 35);
+        let events = translate(&cut);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCall(_))),
+            "a cut flushed a tool call: {events:#?}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&ProviderEvent::Done {
+                finish_reason: CUT_STREAM.into()
+            })
+        );
     }
 
     #[test]
@@ -472,12 +617,123 @@ mod tests {
         );
     }
 
+    /// The error one in-stream `error` object comes out as, run through the
+    /// translator the adapter uses for every chunk.
+    fn error_of(object: &serde_json::Value) -> ProviderError {
+        let mut translator = Translator::new();
+        let events = translator.on_data(&json!({ "error": object }).to_string());
+        assert_eq!(events.len(), 1, "{events:?}");
+        match events.into_iter().next().unwrap() {
+            ProviderEvent::Error(error) => error,
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn server_error_object_and_bad_json_become_protocol_errors() {
+    fn a_server_error_object_is_transient_with_its_message_kept() {
+        // The whole payload the provider sent when a step's stream died.
+        let payload = r#"{"error":{"code":"500","message":"An error occurred during generation.","type":"server_error"}}"#;
+        let mut translator = Translator::new();
+        let events = translator.on_data(payload);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let ProviderEvent::Error(error) = &events[0] else {
+            panic!("expected one error, got {events:?}");
+        };
+        let fixture: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let ProviderError::Http { status, body } = error else {
+            panic!("a server error object is the transient class, got {error:?}");
+        };
+        assert_eq!(
+            Some(*status),
+            fixture["error"]["code"].as_str().unwrap().parse().ok(),
+            "{payload}"
+        );
+        assert!(
+            body.contains(fixture["error"]["message"].as_str().unwrap()),
+            "{body}"
+        );
+        assert!(error.is_transient(), "{error:?}");
+    }
+
+    #[test]
+    fn a_code_naming_a_status_decides_the_class() {
+        let transient: [(serde_json::Value, u16); 4] = [
+            (json!({"code": "429"}), 429),
+            (json!({"code": 429}), 429),
+            (json!({"code": "503", "message": "busy"}), 503),
+            (json!({"code": " 529 "}), 529),
+        ];
+        for (object, expected) in transient {
+            let error = error_of(&object);
+            assert!(
+                matches!(&error, ProviderError::Http { status, .. } if *status == expected),
+                "{object}: {error:?}"
+            );
+            assert!(error.is_transient(), "{object}: {error:?}");
+        }
+
+        let refused = json!({"code": "404", "message": "model not found"});
+        let error = error_of(&refused);
+        assert!(!error.is_transient(), "{error:?}");
+        let ProviderError::Protocol(message) = &error else {
+            panic!("a 404 code names no transient class, got {error:?}");
+        };
+        assert!(message.contains("model not found"), "{message}");
+
+        // The code is the specific claim, so a server-side type beside it
+        // does not rescue a client fault.
+        let contradicted = json!({"code": "400", "type": "server_error"});
+        let error = error_of(&contradicted);
+        assert!(matches!(&error, ProviderError::Protocol(_)), "{error:?}");
+        assert!(!error.is_transient(), "{error:?}");
+    }
+
+    #[test]
+    fn a_server_or_overload_type_names_the_status_it_stands_for() {
+        let named: [(serde_json::Value, u16); 6] = [
+            (json!({"type": "server_error"}), 500),
+            (json!({"code": null, "type": "server_error"}), 500),
+            (json!({"code": "server_error", "type": "server_error"}), 500),
+            (json!({"type": " SERVER_ERROR "}), 500),
+            (json!({"type": "api_error", "message": "x"}), 500),
+            (json!({"type": "overloaded_error"}), 503),
+        ];
+        for (object, expected) in named {
+            let error = error_of(&object);
+            assert!(
+                matches!(&error, ProviderError::Http { status, .. } if *status == expected),
+                "{object}: {error:?}"
+            );
+            assert!(error.is_transient(), "{object}: {error:?}");
+        }
+
+        let protocol: [(serde_json::Value, &str); 2] = [
+            (
+                json!({"type": "invalid_request_error", "message": "bad"}),
+                "bad",
+            ),
+            (json!({"message": "model not found"}), "model not found"),
+        ];
+        for (object, text) in protocol {
+            let error = error_of(&object);
+            assert!(!error.is_transient(), "{object}: {error:?}");
+            let ProviderError::Protocol(message) = &error else {
+                panic!("{object} names no transient class, got {error:?}");
+            };
+            assert!(message.contains(text), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_object_and_bad_json_become_protocol_errors() {
         let mut t = Translator::new();
         let out = t.on_data(r#"{"error":{"message":"model not found"}}"#);
         assert!(
             matches!(&out[0], ProviderEvent::Error(ProviderError::Protocol(m)) if m.contains("model not found"))
+        );
+        assert!(
+            matches!(&out[0], ProviderEvent::Error(e) if !e.is_transient()),
+            "an object naming no status is no transient class: {out:?}"
         );
         assert!(
             t.on_data("anything after").is_empty(),
@@ -523,6 +779,115 @@ mod tests {
         assert_eq!(events[0], ProviderEvent::TextDelta("He".into()));
         assert!(
             matches!(&events[1], ProviderEvent::Error(ProviderError::Transport(m)) if m.contains("connection reset"))
+        );
+    }
+
+    /// One streamed chunk per text piece, then a finish reason and the
+    /// end marker, the shape a provider sends for a plain reply.
+    fn reply_in_pieces(pieces: &[&str]) -> Vec<ProviderEvent> {
+        let mut translator = Translator::new();
+        let mut out = Vec::new();
+        for piece in pieces {
+            let chunk = json!({"choices": [{"delta": {"content": piece}}]});
+            out.extend(translator.on_data(&chunk.to_string()));
+        }
+        let end = json!({"choices": [{"delta": {}, "finish_reason": "stop"}]});
+        out.extend(translator.on_data(&end.to_string()));
+        out.extend(translator.on_data("[DONE]"));
+        out.extend(translator.finish());
+        out
+    }
+
+    fn text_of(events: &[ProviderEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The model's own tool-call syntax at the start of a line ends the
+    /// reply as a cut, in either spelling and split anywhere across chunks,
+    /// so the call it meant is retried rather than read as a finished turn.
+    #[test]
+    fn leaked_call_markup_at_a_line_start_cuts_the_reply() {
+        for marker in LEAKED_CALL_MARKERS {
+            let leak = format!("{marker} calls>\n{marker} invoke name=\"update_tasks\">");
+            let whole = format!("Checked.\n\n  {leak}");
+            for split in 1..whole.chars().count() {
+                let at = whole.char_indices().nth(split).unwrap().0;
+                let events = reply_in_pieces(&[&whole[..at], &whole[at..]]);
+                assert_eq!(
+                    events.last(),
+                    Some(&ProviderEvent::Done {
+                        finish_reason: CUT_STREAM.to_owned()
+                    }),
+                    "{marker} split at {split}: {events:?}"
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|e| matches!(e, ProviderEvent::Done { .. }))
+                        .count(),
+                    1,
+                    "{events:?}"
+                );
+                assert!(
+                    !text_of(&events).contains(marker),
+                    "the markup is never passed on as text: {events:?}"
+                );
+            }
+        }
+    }
+
+    /// A reply that talks about the markup, mid-sentence or quoted, is
+    /// prose: it streams whole and ends with the provider's own reason.
+    #[test]
+    fn the_markup_mentioned_in_prose_passes() {
+        for marker in LEAKED_CALL_MARKERS {
+            let prose = format!(
+                "The DSML syntax looks like `{marker} calls>`.\nIt starts with {marker} and a name.\n"
+            );
+            let events = reply_in_pieces(&[&prose[..10], &prose[10..]]);
+            assert_eq!(text_of(&events), prose, "{marker}");
+            assert_eq!(
+                events.last(),
+                Some(&ProviderEvent::Done {
+                    finish_reason: "stop".to_owned()
+                }),
+                "{events:?}"
+            );
+        }
+    }
+
+    /// A tool call already streamed is not flushed once the reply leaks
+    /// markup: the reply is cut, and nothing of it is trusted.
+    #[test]
+    fn a_cut_for_leaked_markup_drops_pending_calls() {
+        let mut translator = Translator::new();
+        let call = json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "c1", "function": {"name": "read_file", "arguments": "{}"}}
+        ]}}]});
+        let mut events = translator.on_data(&call.to_string());
+        let leak = json!({"choices": [{"delta": {"content": format!("{} calls>", LEAKED_CALL_MARKERS[0])}}]});
+        events.extend(translator.on_data(&leak.to_string()));
+        events.extend(translator.on_data(
+            &json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}).to_string(),
+        ));
+        events.extend(translator.finish());
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCall(_))),
+            "{events:?}"
+        );
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Done {
+                finish_reason: CUT_STREAM.to_owned()
+            }]
         );
     }
 }

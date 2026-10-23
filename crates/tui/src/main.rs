@@ -2,17 +2,25 @@
 //! subcommands. No full-screen mode; the terminal keeps its scrollback.
 
 mod app;
+mod build_cmd;
 mod checks;
 mod config;
 mod doctor;
 mod exec;
+mod front;
 mod init_cmd;
 mod pocock;
 mod pocock_templates;
+mod progress;
 mod project_cmd;
+mod run_view;
 mod skills_cmd;
+mod start_ask;
 mod stats;
+mod threads_index;
+mod workspace_cmd;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use aigentic_api::client::{Addr, Client};
@@ -20,27 +28,43 @@ use aigentic_api::{Request, Response, ThreadState};
 use aigentic_runtime::aigentic_core::AgentId;
 use aigentic_runtime::aigentic_log::ThreadLog;
 use aigentic_runtime::aigentic_tools::{ToolRegistry, Workdir};
+use aigentic_runtime::project::person_memory_dir;
 use aigentic_runtime::{GlobalLayer, Layers, Mode, Project, ProjectFile, Runtime};
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
+use time::OffsetDateTime;
 use ulid::Ulid;
 
 use crate::app::engine::{ClientRepl, Identity};
+use crate::build_cmd::BuildArgs;
 use crate::config::Config;
 use crate::project_cmd::ProjectCommand;
 use crate::skills_cmd::{SkillPaths, SkillsCommand};
+use crate::workspace_cmd::WorkspaceCommand;
+
+/// The version `aigentic --version` prints: the package version, and the
+/// commit the binary was built from. The commit is put in the environment
+/// by `build.rs`, which reads it out of the repository's git directory.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("AIGENTIC_GIT_SHA"),
+    ")"
+);
 
 #[derive(Debug, Parser)]
 #[command(
     name = "aigentic",
-    version,
+    version = VERSION,
     about = "Aigentic agent harness, streaming REPL"
 )]
 struct Cli {
     /// Config file (default: ~/.config/aigentic/config.toml).
     #[arg(long, global = true)]
     config: Option<PathBuf>,
-    /// Thread to resume. Omit to start a new thread; its id is printed.
+    /// Thread to resume. Omit to resume your front thread (the first run
+    /// makes one; `/new` starts another). `exec` without it starts a new
+    /// thread and prints its id.
     #[arg(long, global = true)]
     thread: Option<Ulid>,
     /// Profile from the config file (default: the project's `[model]
@@ -79,7 +103,13 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
-    /// List this project's threads, newest first.
+    /// Create, fill and list workspaces: groups of projects that belong
+    /// together.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
+    /// List this folder's project's threads, newest first.
     Threads,
     /// What the thread logs spent: cost, calls, context, cache and
     /// retries, by day and project. Reads local logs only. With the
@@ -99,10 +129,33 @@ enum Command {
         /// profile guesses their cost.
         #[arg(long, value_name = "NAME")]
         assume_profile: Option<String>,
-        /// Every thread whose first user message names `#<n>`, with a
-        /// total: the cost of one issue's build cycle.
+        /// Threads naming `#<n>`, plus that issue's run leads and step
+        /// threads. Costs are totalled across all matching threads.
         #[arg(long, value_name = "N", conflicts_with = "thread")]
         issue: Option<u64>,
+        /// The decision record (issue #74): per kind, how many proposals
+        /// were made and how the operator answered them. Honours
+        /// `--since`; no producer writes the events yet.
+        #[arg(long, conflicts_with_all = ["thread", "issue"])]
+        decisions: bool,
+    },
+    /// What the running threads are doing right now: one line per live
+    /// thread, from its log. Reads local logs only. A turn whose last
+    /// event is over half an hour old is `stale` unless it is waiting on
+    /// a person (an unanswered question, approval or checkpoint): a log
+    /// cannot tell a crash from a long tool call, so a stale thread is
+    /// listed only with `--all` and only a resume clears it. A log not
+    /// written in the last day is not read at all, so a turn parked for
+    /// longer than that is missed.
+    Status {
+        /// Also list stale threads, and threads whose last turn ended
+        /// within the hour.
+        #[arg(long)]
+        all: bool,
+        /// The same report as one JSON array, one object per thread.
+        /// The shape is stable.
+        #[arg(long)]
+        json: bool,
     },
     /// Guided setup: config, project file and AGENTS.md, GitHub issues
     /// and labels through `gh`, knowledge links. Shows every file first.
@@ -122,6 +175,20 @@ enum Command {
         /// `AIGENTIC_TOKEN` on their machine. Nothing is stored.
         #[arg(long, value_name = "USER")]
         new_token: Option<String>,
+    },
+    /// Build one issue to the end: start (or resume) the build workflow
+    /// for `n` and follow it, answering a checkpoint `stop`. Progress on
+    /// stderr. Exit 0 closed, 3 stopped (a human is needed), 1 a run
+    /// stopped by an error. Ctrl-C detaches; the run stays resumable.
+    Build {
+        /// The issue number.
+        n: u64,
+        /// The workflow to run (default: the daemon's, `build`).
+        #[arg(long, value_name = "NAME")]
+        workflow: Option<String>,
+        /// Every notice as a JSON line on stdout.
+        #[arg(long)]
+        json: bool,
     },
     /// Run one prompt to the end with no prompt shown: progress on
     /// stderr, the final message on stdout. Exit 0 done, 1 failed, 3 done
@@ -190,8 +257,25 @@ async fn connect_remote(
     Ok((client, project))
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+/// A log reader's refusal of `--server`: the wording `stats` has always
+/// used, adapted to the command's own name (#109).
+fn local_only(command: &str) -> String {
+    format!("{command} reads this machine's logs; drop --server and run it locally")
+}
+
+fn main() -> anyhow::Result<()> {
+    // The listing's "today" is the person's day, and `time` reads the
+    // machine's zone only while the process has one thread: read it before
+    // the runtime starts any.
+    aigentic_server::runs::read_day_zone();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     // `.env` in the current directory, if present. Never printed.
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();
@@ -280,7 +364,9 @@ async fn main() -> anyhow::Result<()> {
         .threads_dir
         .clone()
         .unwrap_or_else(config::default_threads_dir);
-    let threads_dir = project_cmd::threads_dir_for(&threads_base, opened.as_ref());
+    // The embedded daemon's workspaces, as the daemon reads them; an
+    // unreadable file is none, since a local read never needs them.
+    let workspaces = aigentic_server::workspaces::load_all(&config_dir).unwrap_or_default();
     let global_instructions = config
         .global_instructions
         .clone()
@@ -300,11 +386,18 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(code);
         }
         Some(Command::Project {
-            command: ProjectCommand::Init,
-        }) => std::process::exit(project_cmd::init(&cwd)?),
+            command: ProjectCommand::Init { workspace },
+        }) => std::process::exit(project_cmd::init(&cwd, &config_dir, workspace.as_deref())?),
         Some(Command::Project {
             command: ProjectCommand::Setup,
         }) => std::process::exit(pocock::run(opened.as_ref())?),
+        Some(Command::Workspace { command }) => std::process::exit(workspace_cmd::run(
+            command,
+            &config_dir,
+            &cwd,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )?),
         Some(Command::Threads) if cli.server.is_some() => {
             let (client, project) = connect_remote(
                 cli.server.as_deref().expect("checked"),
@@ -320,20 +413,25 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(0);
         }
         Some(Command::Threads) => {
-            let threads = project_cmd::list_threads(&threads_dir)?;
-            println!("{}", project_cmd::render_threads(&threads, &threads_dir));
+            let project = threads_index::folder_project(&cwd, opened.as_ref(), &workspaces);
+            let threads = project_cmd::list_threads(&threads_base, &project, &workspaces);
+            println!(
+                "{}",
+                project_cmd::render_threads(&threads, &project, &threads_base)
+            );
             std::process::exit(0);
         }
         // Stats read this machine's logs: a daemon holds threads of other
         // users and other projects, and would answer about its own disk.
         Some(Command::Stats { .. }) if cli.server.is_some() => {
-            bail!("stats reads this machine's logs; drop --server and run it locally");
+            bail!("{}", local_only("stats"));
         }
         Some(Command::Stats {
             since,
             json,
             assume_profile,
             issue,
+            decisions,
         }) => {
             // #40: the config's price tables travel with the request, so
             // an unpriced call can be retro-priced and marked estimated.
@@ -344,6 +442,7 @@ async fn main() -> anyhow::Result<()> {
             match (cli.thread, issue) {
                 (Some(id), _) => stats::run_thread(
                     &threads_base,
+                    &workspaces,
                     cli.project.as_deref(),
                     id,
                     since.as_deref(),
@@ -352,20 +451,49 @@ async fn main() -> anyhow::Result<()> {
                 )?,
                 (None, Some(n)) => stats::run_issue(
                     &threads_base,
+                    &workspaces,
                     cli.project.as_deref(),
                     n,
                     since.as_deref(),
                     json,
                     &book,
                 )?,
+                (None, None) if decisions => stats::run_decisions(
+                    &threads_base,
+                    &workspaces,
+                    cli.project.as_deref(),
+                    since.as_deref(),
+                    json,
+                )?,
                 (None, None) => stats::run(
                     &threads_base,
+                    &workspaces,
                     cli.project.as_deref(),
                     since.as_deref(),
                     json,
                     &book,
                 )?,
             }
+            std::process::exit(0);
+        }
+        // Status reads this machine's logs too: a daemon's answer would
+        // be about its own disk and its own threads.
+        Some(Command::Status { .. }) if cli.server.is_some() => {
+            bail!("{}", local_only("status"));
+        }
+        Some(Command::Status { all, json }) => {
+            // The same price tables `stats` uses, so both answer one way.
+            let book = stats::PriceBook::from_config(&config, None)?;
+            // One clock for every age on the line, and both windows.
+            progress::run(
+                &threads_base,
+                &workspaces,
+                cli.project.as_deref(),
+                all,
+                json,
+                OffsetDateTime::now_utc(),
+                &book,
+            )?;
             std::process::exit(0);
         }
         Some(Command::Project {
@@ -391,8 +519,17 @@ async fn main() -> anyhow::Result<()> {
             // calls the model: the provider is built without a key so the
             // knowledge mode is decided for this profile's window.
             let (_, profile) = config.select(profile_arg)?;
+            // The daemon's owner, by the same rule `doctor` reports: the
+            // first user of a server.toml beside config.toml, else the
+            // config's user.
+            let owner = aigentic_server::ServerConfig::load(&config_dir.join("server.toml"))
+                .ok()
+                .and_then(|s| s.owner().map(str::to_owned))
+                .unwrap_or_else(|| config.user_name());
             let global = GlobalLayer::load(
                 &global_instructions,
+                Some(&person_memory_dir(&config_dir)),
+                Some(&owner),
                 config.denied_tools.clone(),
                 config.denied_skills.clone(),
             )?;
@@ -427,22 +564,35 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(0);
         }
         Some(
-            Command::Doctor { .. } | Command::Init | Command::Serve { .. } | Command::Exec { .. },
+            Command::Doctor { .. }
+            | Command::Init
+            | Command::Serve { .. }
+            | Command::Exec { .. }
+            | Command::Build { .. },
         )
         | None => {}
     }
 
     // `exec` reads its prompt before anything connects, so a missing
     // prompt fails fast.
-    let exec_args = match cli.command {
+    let exec_args = match &cli.command {
         Some(Command::Exec {
             prompt,
             json,
             output_last,
         }) => Some(exec::ExecArgs {
-            prompt: exec::prompt_from(prompt)?,
-            json,
-            output_last,
+            prompt: exec::prompt_from(prompt.clone())?,
+            json: *json,
+            output_last: output_last.clone(),
+        }),
+        _ => None,
+    };
+    // `build` names its issue before anything connects, like `exec`.
+    let build_args = match &cli.command {
+        Some(Command::Build { n, workflow, json }) => Some(BuildArgs {
+            issue: *n,
+            workflow: workflow.clone(),
+            json: *json,
         }),
         _ => None,
     };
@@ -480,51 +630,109 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     // `exec` never lands in a project by accident: it needs one named, a
-    // project file here, or a thread to continue.
-    if exec_args.is_some() && cli.project.is_none() && opened.is_none() && cli.thread.is_none() {
-        let names: Vec<&str> = welcome.projects.iter().map(|p| p.name.as_str()).collect();
-        bail!(
-            "exec needs a project: pass --project (one of: {}), run it in a project directory, or pass --thread",
-            if names.is_empty() {
-                "none".to_owned()
-            } else {
-                names.join(", ")
-            }
-        );
+    // project file here, or a thread to continue. A workspace's folder
+    // (issue #121) names the group and not the project, so it is not a
+    // project either: the refusal lists that workspace's projects first.
+    if exec_args.is_some() {
+        let known: Vec<String> = welcome.projects.iter().map(|p| p.name.clone()).collect();
+        let settled = cli.project.is_some() || cli.thread.is_some();
+        if let Some(message) =
+            start_ask::exec_guard(&cwd, &workspaces, &known, settled, opened.is_some())
+        {
+            bail!("{message}");
+        }
     }
-    let project_name = cli
+    // The folder's project: what a client would have created in today,
+    // and `exec`'s project. A plain run resumes the front thread in
+    // whatever project that thread lives in, so this is only a fallback
+    // (issue #89).
+    let folder_project = cli
         .project
         .clone()
         .or_else(|| opened.as_ref().map(|p| p.name.clone()))
         .or_else(|| embedded.as_ref().map(|e| e.project.clone()))
         .or_else(|| welcome.projects.first().map(|p| p.name.clone()));
-    let Some(project_name) = project_name else {
+    let Some(folder_project) = folder_project else {
         bail!(
             "no project to work in: {} has no role anywhere on {}",
             welcome.user,
             welcome.server
         );
     };
-    let role = welcome
-        .projects
-        .iter()
-        .find(|p| p.name == project_name)
-        .and_then(|p| p.role.clone());
-    let thread_id = match cli.thread {
-        Some(id) => id,
-        None => match client
-            .request(Request::CreateThread {
-                project: project_name.clone(),
-            })
-            .await?
-        {
-            Response::Thread { thread } => thread.id,
-            Response::Refused { reason } => {
-                bail!("cannot start a thread in {project_name}: {reason}")
-            }
-            other => bail!("unexpected reply creating a thread: {other:?}"),
-        },
+    let project_name = folder_project.clone();
+    // `build` asks the daemon to run the issue and follows the run: it
+    // never opens a thread of its own, so a run's lead is its one log.
+    if let Some(args) = build_args {
+        let notices = client.take_notices().context("notice stream")?;
+        let outcome = build_cmd::run(
+            &client,
+            notices,
+            &project_name,
+            &welcome.user,
+            &args,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )
+        .await?;
+        drop(embedded);
+        std::process::exit(outcome.code);
+    }
+    // The start-up ask (issue #121): which project when the folder
+    // doesn't say. It runs before `pick_thread` and before the banner,
+    // and its answer rides `Front` so the daemon logs it as a decision.
+    let here = front::here_project(cli.project.as_deref(), opened.as_ref());
+    let launch = start_ask::Launch {
+        project: cli.project.as_deref(),
+        thread: cli.thread,
+        exec: exec_args.is_some(),
+        interactive: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
     };
+    let asked = start_ask::run(
+        &client,
+        &cwd,
+        &workspaces,
+        &welcome.projects,
+        &project_name,
+        launch,
+    )
+    .await?;
+    let (project_name, here, asked) = match asked {
+        start_ask::Prompting::Answered(a) => {
+            let chosen = a.chosen.clone();
+            (chosen.clone(), Some(chosen), Some(*a))
+        }
+        start_ask::Prompting::Quit => {
+            // No thread opened, and nothing to resume later: `q` leaves
+            // the log exactly as it was.
+            println!("[nothing chosen; no thread opened]");
+            std::process::exit(0);
+        }
+        start_ask::Prompting::None => (project_name, here, None),
+    };
+    // One pick serves the REPL, plain mode and `exec` (issue #89):
+    // `--thread X` opens X; `exec` creates a thread in the folder's
+    // project; anything else resumes (or starts) the front thread.
+    // `here` is the folder's project, sent on `Front` only (issue #92).
+    let picked = front::pick_thread(
+        &client,
+        cli.thread,
+        exec_args.is_some(),
+        &project_name,
+        here.as_deref(),
+        asked.clone(),
+    )
+    .await?;
+    // The server judges a busy front thread (issue #121, design 5): it
+    // resumes where the thread is and ignores the answer. Say so, rather
+    // than looking as if the choice had been honoured. The rule and its
+    // exact text live in `api` (`StartAsk::ignored_note`), where the
+    // `Plain` rig pins them.
+    if let (Some(a), Some(info)) = (&asked, picked.info.as_ref())
+        && let Some(note) = a.ignored_note(info)
+    {
+        eprintln!("{note}");
+    }
+    let thread_id = picked.id;
     let (state, events, mode, identity) = match client
         .request(Request::Open {
             thread: thread_id,
@@ -539,6 +747,7 @@ async fn main() -> anyhow::Result<()> {
             profile,
             model,
             effort,
+            ..
         } => (
             state,
             events,
@@ -552,6 +761,23 @@ async fn main() -> anyhow::Result<()> {
         Response::Refused { reason } => bail!("cannot open thread {thread_id}: {reason}"),
         other => bail!("unexpected reply opening the thread: {other:?}"),
     };
+    // The REPL is in the thread's project, not the folder's (issue #89).
+    // `exec`'s thread was created in the folder's project, so it keeps it.
+    let thread_project = if exec_args.is_some() {
+        project_name.clone()
+    } else {
+        front::thread_project(&picked, &events, &project_name)
+    };
+    let role = front::role_for(&welcome.projects, &thread_project);
+    // The title the status line shows from the first frame: a `Front`
+    // reply carries one, a `--thread` resume has no reply, so the
+    // thread's own events name it.
+    let title = picked
+        .info
+        .as_ref()
+        .and_then(front::title_of)
+        .or_else(|| aigentic_runtime::title::title_of(&events));
+    let project_name = thread_project.clone();
     if cli.mode != Mode::Manual {
         client
             .request(Request::SetMode {
@@ -601,7 +827,6 @@ async fn main() -> anyhow::Result<()> {
         }),
         _ => None,
     };
-    use std::io::IsTerminal;
     if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
         // At a terminal: the logo and three short lines.
         let mut lines = vec![format!(
@@ -615,15 +840,20 @@ async fn main() -> anyhow::Result<()> {
                 format!(" · {where_}")
             }
         )];
-        if cli.thread.is_some() {
-            lines.push(format!("resumed {thread_id} · {} events", events.len()));
+        lines.push(front::front_line(
+            picked.outcome.as_ref(),
+            picked.info.as_ref(),
+            thread_id,
+            events.len(),
+            false,
+        ));
+        if matches!(
+            picked.outcome,
+            Some(aigentic_api::FrontOutcome::Resumed) | None
+        ) {
             for line in app::engine::recent_lines(&events, 3) {
                 lines.push(format!("  {line}"));
             }
-        } else {
-            lines.push(format!(
-                "new thread · resume later with --thread {thread_id}"
-            ));
         }
         if let Some(r) = &running {
             lines.push(r.clone());
@@ -640,13 +870,23 @@ async fn main() -> anyhow::Result<()> {
             welcome.user,
             role.as_deref().unwrap_or("no role"),
         );
-        if cli.thread.is_some() {
-            println!("thread {thread_id} resumed with {} events", events.len());
+        println!(
+            "{}",
+            front::front_line(
+                picked.outcome.as_ref(),
+                picked.info.as_ref(),
+                thread_id,
+                events.len(),
+                true,
+            )
+        );
+        if matches!(
+            picked.outcome,
+            Some(aigentic_api::FrontOutcome::Resumed) | None
+        ) {
             for line in app::engine::recent_lines(&events, 3) {
                 println!("  {line}");
             }
-        } else {
-            println!("new thread {thread_id} (resume with --thread {thread_id})");
         }
         if let Some(r) = &running {
             println!("[{r}]");
@@ -683,8 +923,11 @@ async fn main() -> anyhow::Result<()> {
         state,
         mode,
         identity,
+        &project_name,
     )
-    .with_skills(skills);
+    .with_skills(skills)
+    .with_workspaces(workspaces)
+    .with_title(title);
     app::run(repl, notices, history, project_name, project_root).await?;
     drop(embedded);
     Ok(())
@@ -695,6 +938,34 @@ mod tests {
     use super::*;
     use clap::Parser;
     use ulid::Ulid;
+
+    /// Issue #65: `aigentic --version` shows the package version and the
+    /// commit the binary was built from, so a run can say which binary a
+    /// thread actually used. The sha may be `unknown` off a checkout.
+    #[test]
+    fn version_names_the_package_and_the_commit() {
+        let sha = VERSION
+            .strip_prefix(env!("CARGO_PKG_VERSION"))
+            .and_then(|rest| rest.strip_prefix(" ("))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("not `version (sha)`: {VERSION}"));
+        assert_eq!(sha.len(), 12, "a short sha is twelve characters: {sha}");
+        assert!(
+            sha == "unknown"
+                || sha
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "neither a short sha nor `unknown`: {sha}"
+        );
+
+        let cli = Cli::try_parse_from(["aigentic", "--version"]).unwrap_err();
+        assert_eq!(
+            cli.kind(),
+            clap::error::ErrorKind::DisplayVersion,
+            "--version is clap's, not an argument error"
+        );
+        assert!(cli.to_string().contains(VERSION), "{}", cli);
+    }
 
     /// Issue #31: `stats` takes its own `--since` and `--json`, and the
     /// global `--project` still reaches it.
@@ -707,11 +978,13 @@ mod tests {
                 json,
                 assume_profile,
                 issue,
+                decisions,
             }) => {
                 assert_eq!(since.as_deref(), Some("7d"));
                 assert!(json);
                 assert_eq!(assume_profile, None);
                 assert_eq!(issue, None);
+                assert!(!decisions);
             }
             other => panic!("expected stats: {other:?}"),
         }
@@ -724,11 +997,13 @@ mod tests {
                 json,
                 assume_profile,
                 issue,
+                decisions,
             }) => {
                 assert_eq!(since, None);
                 assert!(!json);
                 assert_eq!(assume_profile, None);
                 assert_eq!(issue, None);
+                assert!(!decisions);
             }
             other => panic!("expected stats: {other:?}"),
         }
@@ -739,6 +1014,52 @@ mod tests {
             .unwrap();
         assert_eq!(cli.project.as_deref(), Some("alpha"));
         assert!(matches!(cli.command, Some(Command::Stats { .. })));
+    }
+
+    /// Issue #109: `status` takes `--all` and `--json`, and the global
+    /// `--project` still reaches it, exactly like `stats`.
+    #[test]
+    fn status_parses_all_json_and_project() {
+        let cli = Cli::try_parse_from(["aigentic", "status", "--all", "--json"]).unwrap();
+        match cli.command {
+            Some(Command::Status { all, json }) => {
+                assert!(all);
+                assert!(json);
+            }
+            other => panic!("expected status: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["aigentic", "status"]).unwrap();
+        match cli.command {
+            Some(Command::Status { all, json }) => {
+                assert!(!all, "the default is the live threads");
+                assert!(!json);
+            }
+            other => panic!("expected status: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["aigentic", "status", "--project", "alpha"]).unwrap();
+        assert_eq!(cli.project.as_deref(), Some("alpha"));
+        assert!(matches!(cli.command, Some(Command::Status { .. })));
+    }
+
+    /// Issue #109: a log reader refuses `--server`, with `stats`' wording
+    /// adapted to its own name. The guard is what the `Status` arm uses.
+    #[test]
+    fn status_refuses_server_with_the_log_reader_wording() {
+        let cli =
+            Cli::try_parse_from(["aigentic", "status", "--server", "tcp:127.0.0.1:7777"]).unwrap();
+        assert!(cli.server.is_some(), "the guard's own condition");
+        assert!(matches!(cli.command, Some(Command::Status { .. })));
+        assert_eq!(
+            local_only("status"),
+            "status reads this machine's logs; drop --server and run it locally"
+        );
+        // `stats`' own words are untouched (#109 leaves `stats` alone).
+        assert_eq!(
+            local_only("stats"),
+            "stats reads this machine's logs; drop --server and run it locally"
+        );
     }
 
     /// Issue #40: the drill-downs. A thread id is the *global* `--thread`
@@ -777,6 +1098,31 @@ mod tests {
                 assert_eq!(assume_profile.as_deref(), Some("tensorx"));
             }
             other => panic!("expected stats: {other:?}"),
+        }
+    }
+
+    /// Issue #74: `stats --decisions` parses, and asking for it together
+    /// with a drill-down is an error rather than a silent winner.
+    #[test]
+    fn stats_parses_the_decisions_flag() {
+        let cli = Cli::try_parse_from(["aigentic", "stats", "--decisions"]).unwrap();
+        match cli.command {
+            Some(Command::Stats {
+                decisions, issue, ..
+            }) => {
+                assert!(decisions);
+                assert_eq!(issue, None);
+            }
+            other => panic!("expected stats: {other:?}"),
+        }
+
+        let id = Ulid::generate();
+        let id = id.to_string();
+        let thread = vec!["aigentic", "stats", "--decisions", "--thread", &id];
+        let issue = vec!["aigentic", "stats", "--decisions", "--issue", "74"];
+        for args in [thread, issue] {
+            let clash = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(clash.kind(), clap::error::ErrorKind::ArgumentConflict);
         }
     }
 

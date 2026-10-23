@@ -18,6 +18,14 @@ pub const DOT_DIR: &str = ".aigentic";
 pub const INSTRUCTIONS_FILE: &str = "instructions.md";
 pub const KNOWLEDGE_DIR: &str = "knowledge";
 pub const MEMORY_DIR: &str = "memory";
+
+/// The person's memory folder: `memory/` under the config directory,
+/// beside `server.toml` and `instructions.md`. The same file layout as a
+/// project's, so one code path writes all the homes.
+pub fn person_memory_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join(MEMORY_DIR)
+}
+
 /// The memory block's heading; says who writes the files so the model
 /// does not (phase 4 step 9).
 pub const MEMORY_HEADING: &str = "# Project memory\n\nWritten by the harness after each turn from what participants \
@@ -26,7 +34,7 @@ stated. Edit these files outside the thread; a tool call that writes them is ref
 /// The keys of each table in `aigentic.toml`, in one place so a struct
 /// that gains a field has one line to add here. The walk in
 /// `config_keys` reads them; the spec tree below is built from them.
-pub const PROJECT_SECTION_KEYS: &[&str] = &["name", "description"];
+pub const PROJECT_SECTION_KEYS: &[&str] = &["name", "description", "related", "kind"];
 pub const MODEL_SECTION_KEYS: &[&str] = &["profile"];
 // BUDGET_KEYS and COMPACTION_KEYS live beside the shared structs below:
 // `[budget]` and `[compaction]` appear in `aigentic.toml` and in a
@@ -43,6 +51,9 @@ pub const COMPACTION_KEYS: &[&str] = &[
     "max_result_bytes",
     "summary_max_output_tokens",
     "keep_last_calls",
+    "working_set_tokens",
+    // The old name of `working_set_tokens`, still read (issue #76): kept
+    // in the list so a file that still uses it parses with no warning.
     "context_ceiling_tokens",
     "evict_above_tokens",
     "evict_min_free_percent",
@@ -50,6 +61,8 @@ pub const COMPACTION_KEYS: &[&str] = &[
 pub const TOOLS_SECTION_KEYS: &[&str] = &["allow", "bash_timeout_secs"];
 pub const KNOWLEDGE_SECTION_KEYS: &[&str] = &["threshold_fraction", "max_hits"];
 pub const MEMORY_SECTION_KEYS: &[&str] = &["enabled", "every_n_turns"];
+/// `[brief]`: whether the harness keeps the brief's current state fresh.
+pub const BRIEF_SECTION_KEYS: &[&str] = &["refresh"];
 pub const POCOCK_SECTION_KEYS: &[&str] = &[
     "issue_tracker",
     "triage_labels",
@@ -57,7 +70,9 @@ pub const POCOCK_SECTION_KEYS: &[&str] = &[
     "prs_as_requests",
 ];
 pub const SKILLS_SECTION_KEYS: &[&str] = &["enabled"];
-pub const POLICY_SECTION_KEYS: &[&str] = &["rules", "bash_allow"];
+pub const POLICY_SECTION_KEYS: &[&str] = &["rules", "bash_allow", "allow_paths"];
+/// `[workflow]`, the run's own switches.
+pub const WORKFLOW_SECTION_KEYS: &[&str] = &["decide_auto_go"];
 /// One `[[mcp_servers]]` entry, shared by `aigentic.toml` and
 /// `config.toml`; `crates/tools/src/mcp.rs` parses it in both.
 pub const MCP_SERVER_KEYS: &[&str] = &[
@@ -92,9 +107,11 @@ pub fn project_spec() -> Table {
         ("tools", Table::new(TOOLS_SECTION_KEYS)),
         ("knowledge", Table::new(KNOWLEDGE_SECTION_KEYS)),
         ("memory", Table::new(MEMORY_SECTION_KEYS)),
+        ("brief", Table::new(BRIEF_SECTION_KEYS)),
         ("pocock", Table::new(POCOCK_SECTION_KEYS)),
         ("skills", Table::new(SKILLS_SECTION_KEYS)),
         ("policy", Table::new(POLICY_SECTION_KEYS)),
+        ("workflow", Table::new(WORKFLOW_SECTION_KEYS)),
         ("mcp_servers", MCP_SERVER_SPEC),
         ("participants", PARTICIPANTS_SPEC),
     ];
@@ -107,9 +124,11 @@ pub fn project_spec() -> Table {
             "tools",
             "knowledge",
             "memory",
+            "brief",
             "pocock",
             "skills",
             "policy",
+            "workflow",
             "mcp_servers",
             "participants",
         ],
@@ -153,6 +172,9 @@ pub struct ProjectFile {
     pub knowledge: KnowledgeSection,
     #[serde(default)]
     pub memory: MemorySection,
+    /// `[brief]`: absent keeps the brief's current state refreshed.
+    #[serde(default)]
+    pub brief: BriefSection,
     #[serde(default)]
     pub pocock: Option<PocockSection>,
     #[serde(default)]
@@ -166,6 +188,10 @@ pub struct ProjectFile {
     /// keeps every name out of the unknown-key report.
     #[serde(default)]
     pub participants: aigentic_policy::Participants,
+    /// `[workflow]`: the run's own switches. Absent is every switch at
+    /// its default.
+    #[serde(default)]
+    pub workflow: Option<WorkflowSection>,
 }
 
 /// Keys in `PROJECT_SECTION_KEYS`.
@@ -174,6 +200,27 @@ pub struct ProjectSection {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// Projects in other workspaces this thread's project declares it
+    /// understands: each `<workspace>/<project>`, checked at parse.
+    /// Empty when absent.
+    #[serde(default)]
+    pub related: Vec<String>,
+    /// What the project holds. Absent reads as `Code`; an unknown value
+    /// is a parse error.
+    #[serde(default)]
+    pub kind: ProjectKind,
+}
+
+/// `[project] kind`: what a project holds. The harness behaves the same
+/// for every kind; only `doctor` reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectKind {
+    /// A code repository.
+    #[default]
+    Code,
+    /// Notes and documents with no repository.
+    Notes,
 }
 
 /// Keys in `MODEL_SECTION_KEYS`.
@@ -205,6 +252,17 @@ impl ToolsSection {
             std::time::Duration::from_secs,
         )
     }
+}
+
+/// `[workflow]`: the switches the runner reads at run start. Keys in
+/// `WORKFLOW_SECTION_KEYS`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WorkflowSection {
+    /// Whether the runner answers a `decided_by` gate itself when the
+    /// decider proposed `go` with no choice among its items. Absent is
+    /// on.
+    #[serde(default = "default_true")]
+    pub decide_auto_go: bool,
 }
 
 /// Keys in `KNOWLEDGE_SECTION_KEYS`.
@@ -240,6 +298,21 @@ pub struct MemorySection {
     pub enabled: bool,
     #[serde(default = "default_one")]
     pub every_n_turns: u32,
+}
+
+/// Keys in `BRIEF_SECTION_KEYS`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct BriefSection {
+    /// Rewrite `brief.md`'s current-state section after a batch of turns
+    /// that wrote files.
+    #[serde(default = "default_true")]
+    pub refresh: bool,
+}
+
+impl Default for BriefSection {
+    fn default() -> Self {
+        Self { refresh: true }
+    }
 }
 
 fn default_true() -> bool {
@@ -293,6 +366,13 @@ pub struct PolicySection {
     /// Replaces the default bash allow patterns when set.
     #[serde(default)]
     pub bash_allow: Option<Vec<String>>,
+    /// Folders outside the project the file tools may reach without
+    /// asking (issue #124): `~` is `$HOME`, a relative entry is relative
+    /// to the project root. Every entry is canonicalised at build, so a
+    /// symlink here is another way to widen the boundary on purpose.
+    /// Rules cannot widen it: they only match inside it.
+    #[serde(default)]
+    pub allow_paths: Vec<String>,
 }
 
 /// A per-turn budget, every field optional. Used by `[profiles.<name>.budget]`
@@ -322,6 +402,7 @@ impl BudgetConfig {
             max_wall_time: self
                 .max_wall_time_secs
                 .map_or(base.max_wall_time, std::time::Duration::from_secs),
+            max_cost_usd: base.max_cost_usd,
             cache_read_price_ratio: self
                 .cache_read_price_ratio
                 .unwrap_or(base.cache_read_price_ratio),
@@ -347,17 +428,23 @@ pub struct CompactionConfig {
     pub summary_max_output_tokens: Option<u64>,
     /// Calls of the running turn kept in full before in-turn eviction
     /// stubs the rest (issue #30). Read only when
-    /// `context_ceiling_tokens = 0`; with a ceiling set the depth is the
+    /// `working_set_tokens = 0`; with a target set the depth is the
     /// floor instead, so this has no effect.
     #[serde(default)]
     pub keep_last_calls: Option<usize>,
-    /// What one call's context may cost, whatever the window (issue #30).
+    /// The working-set target, in tokens (issue #76): what one call's
+    /// context may cost, whatever the model's window.
+    #[serde(default)]
+    pub working_set_tokens: Option<u64>,
+    /// The working-set target's old name (issue #30), still read. Settling
+    /// both names is a config error, not a silent last-one-wins
+    /// ([`CompactionConfig::validate`]).
     #[serde(default)]
     pub context_ceiling_tokens: Option<u64>,
     /// The sweep runs only over this many tokens (issue #32).
     #[serde(default)]
     pub evict_above_tokens: Option<u64>,
-    /// The share of the ceiling a sweep must free to be worth its cache
+    /// The share of the target a sweep must free to be worth its cache
     /// break (issue #35). Zero moves the boundary as soon as the floor
     /// advances, however little that frees — the sweep runs on nearly
     /// every call.
@@ -366,6 +453,37 @@ pub struct CompactionConfig {
 }
 
 impl CompactionConfig {
+    /// The range checks shared by project and profile configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.working_set_tokens.is_some() && self.context_ceiling_tokens.is_some() {
+            return Err(
+                "compaction.working_set_tokens and compaction.context_ceiling_tokens are the \
+                 same setting under its old name; keep working_set_tokens"
+                    .into(),
+            );
+        }
+        if let Some(f) = self.trigger_fraction
+            && !(0.05..=0.95).contains(&f)
+        {
+            return Err(format!(
+                "compaction.trigger_fraction must be between 0.05 and 0.95, got {f}"
+            ));
+        }
+        if let Some(n) = self.working_set_tokens.or(self.context_ceiling_tokens)
+            && n < 8_192
+        {
+            return Err("compaction.working_set_tokens must be at least 8192".into());
+        }
+        if let Some(p) = self.evict_min_free_percent
+            && p > 100
+        {
+            return Err(format!(
+                "compaction.evict_min_free_percent must be at most 100, got {p}"
+            ));
+        }
+        Ok(())
+    }
+
     pub fn over(&self, base: CompactionSettings) -> CompactionSettings {
         CompactionSettings {
             trigger_fraction: self.trigger_fraction.unwrap_or(base.trigger_fraction),
@@ -375,9 +493,14 @@ impl CompactionConfig {
                 .summary_max_output_tokens
                 .unwrap_or(base.summary_max_output_tokens),
             keep_last_calls: self.keep_last_calls.unwrap_or(base.keep_last_calls),
-            context_ceiling_tokens: self
-                .context_ceiling_tokens
-                .unwrap_or(base.context_ceiling_tokens),
+            // The old name maps onto the new field, and the new name wins
+            // if both are somehow set here: `CompactionConfig::validate`
+            // refuses that, so this is only reachable before validation
+            // (issue #76).
+            working_set_tokens: self
+                .working_set_tokens
+                .or(self.context_ceiling_tokens)
+                .unwrap_or(base.working_set_tokens),
             evict_above_tokens: self.evict_above_tokens.unwrap_or(base.evict_above_tokens),
             evict_min_free_percent: self
                 .evict_min_free_percent
@@ -387,6 +510,31 @@ impl CompactionConfig {
 
     pub fn settings(&self) -> CompactionSettings {
         self.over(DEFAULT_COMPACTION)
+    }
+}
+
+/// A `[project] related` entry must be exactly `<workspace>/<project>`:
+/// one `/`, both halves non-empty and neither `.` nor `..`, and no `\`.
+/// Anything else — a path, a bare name, an absolute or `~` form — is
+/// refused here rather than expanded anywhere, so an entry that parses
+/// always names a workspace and a project.
+fn validate_related(entry: &str) -> Result<(), String> {
+    let ok = !entry.contains('\\')
+        && entry.split_once('/').is_some_and(|(ws, project)| {
+            ws != "."
+                && ws != ".."
+                && !ws.is_empty()
+                && project != "."
+                && project != ".."
+                && !project.is_empty()
+                && !project.contains('/')
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "[project] related: `{entry}` is not <workspace>/<project>"
+        ))
     }
 }
 
@@ -402,6 +550,16 @@ impl ProjectFile {
                 "[tools] bash_timeout_secs must be 1 to {}, got {secs}",
                 aigentic_tools::MAX_TIMEOUT_SECS
             ));
+        }
+        if let Some(compaction) = &file.compaction {
+            compaction
+                .validate()
+                .map_err(|message| format!("invalid [compaction] table: {message}"))?;
+        }
+        if let Some(project) = &file.project {
+            for entry in &project.related {
+                validate_related(entry)?;
+            }
         }
         let unknown = match toml::from_str::<toml::Value>(text) {
             Ok(value) => project_spec().unknown(&value),
@@ -438,6 +596,48 @@ impl ProjectFile {
 
     pub fn policy(&self) -> Policy {
         Policy::configured(self.policy.rules.clone(), self.policy.bash_allow.clone())
+    }
+
+    /// `[policy] allow_paths` resolved against `root`: a leading `~` is
+    /// `$HOME`, a relative entry is relative to the project root, an
+    /// absolute one stands. An entry under an unset `HOME`, and an entry
+    /// that names a *user* rather than the home directory — `~nobody/x` —
+    /// are both refused, so the boundary is never widened past `$HOME`.
+    /// The returned warnings name each refused entry.
+    pub fn allow_paths(&self, root: &Path) -> (Vec<PathBuf>, Vec<String>) {
+        let mut found = Vec::new();
+        let mut warnings = Vec::new();
+        for entry in &self.policy.allow_paths {
+            let Some(rest) = entry.strip_prefix('~') else {
+                // A relative entry is relative to the project root.
+                found.push(root.join(entry));
+                continue;
+            };
+            // `~` and `~/…` are `$HOME` and `$HOME/…`; another `~name`
+            // names that user's home, which aigentic will not guess at,
+            // so the entry is refused rather than read as `$HOME/name`.
+            let under_home = if rest.is_empty() || rest.starts_with('/') {
+                Some(rest.trim_start_matches('/'))
+            } else {
+                None
+            };
+            let Some(under_home) = under_home else {
+                warnings.push(format!(
+                    "policy.allow_paths: {entry} names a user home; ignored"
+                ));
+                continue;
+            };
+            match std::env::var_os("HOME") {
+                Some(home) if !under_home.is_empty() => {
+                    found.push(PathBuf::from(home).join(under_home));
+                }
+                Some(home) => found.push(PathBuf::from(home)),
+                None => warnings.push(format!(
+                    "policy.allow_paths: {entry} needs HOME, which is unset; ignored"
+                )),
+            }
+        }
+        (found, warnings)
     }
 
     /// Whether any phase 4 section is present, which makes `[project]
@@ -515,6 +715,15 @@ impl Project {
         Ok(project)
     }
 
+    /// `[project] kind`, `Code` when the file has no `[project]` table
+    /// or no `kind` key.
+    pub fn kind(&self) -> ProjectKind {
+        self.file
+            .project
+            .as_ref()
+            .map_or(ProjectKind::default(), |p| p.kind)
+    }
+
     pub fn dot_dir(&self) -> PathBuf {
         self.root.join(DOT_DIR)
     }
@@ -525,6 +734,14 @@ impl Project {
 
     pub fn memory_dir(&self) -> PathBuf {
         self.dot_dir().join(MEMORY_DIR)
+    }
+
+    /// The project's brief (issue #123): `.aigentic/brief.md`, a regular
+    /// file. Read live rather than kept on `Project`, so a hand edit
+    /// shows in the next turn; the comparison that keeps an unchanged
+    /// read from reloading lives in `Runtime::refresh_brief`.
+    pub fn brief(&self) -> Option<String> {
+        crate::brief::project_brief(&self.root)
     }
 
     /// Re-read the memory files: after an extraction, before the next turn.
@@ -547,6 +764,25 @@ impl Project {
         }
         Some(out.trim_end().to_owned())
     }
+}
+
+/// Whether a run in `root` answers a `decided_by` gate itself.
+///
+/// No `aigentic.toml`, no `[workflow]` section and no key all mean on. A
+/// file that cannot be read means off: a run that cannot tell asks the
+/// person rather than answering for them.
+pub fn decide_auto_go(root: &Path) -> bool {
+    if !root.join(FILE_NAME).is_file() {
+        return true;
+    }
+    let Ok(project) = Project::open_root(root) else {
+        return false;
+    };
+    project
+        .file
+        .workflow
+        .map(|w| w.decide_auto_go)
+        .unwrap_or(true)
 }
 
 /// Walk up from `cwd` to the nearest directory holding `aigentic.toml`.
@@ -645,7 +881,7 @@ max_tokens = 3000000
 
 [compaction]
 keep_turns = 4
-context_ceiling_tokens = 96_000
+working_set_tokens = 96_000
 
 [tools]
 allow = ["read_file", "bash"]
@@ -699,11 +935,7 @@ enabled = ["implement"]
         );
         assert_eq!(p.compaction.as_ref().unwrap().settings().keep_turns, 4);
         assert_eq!(
-            p.compaction
-                .as_ref()
-                .unwrap()
-                .settings()
-                .context_ceiling_tokens,
+            p.compaction.as_ref().unwrap().settings().working_set_tokens,
             96_000
         );
         assert_eq!(p.tools.allow, vec!["read_file", "bash"]);
@@ -719,6 +951,43 @@ enabled = ["implement"]
         );
         assert!(!pocock.prs_as_requests);
         assert!(p.has_phase4_sections());
+    }
+
+    #[test]
+    fn project_compaction_uses_profile_range_validation() {
+        for (text, expected) in [
+            (
+                "[compaction]\ntrigger_fraction = 2.0\n",
+                "trigger_fraction must be between 0.05 and 0.95",
+            ),
+            (
+                "[compaction]\nworking_set_tokens = 1024\n",
+                "working_set_tokens must be at least 8192",
+            ),
+            (
+                "[compaction]\ncontext_ceiling_tokens = 1024\n",
+                "working_set_tokens must be at least 8192",
+            ),
+            (
+                "[compaction]\nevict_min_free_percent = 101\n",
+                "evict_min_free_percent must be at most 100",
+            ),
+        ] {
+            let error = ProjectFile::parse(text).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+        let error = ProjectFile::parse(
+            "[compaction]\nworking_set_tokens = 8192\ncontext_ceiling_tokens = 65536\n",
+        )
+        .unwrap_err();
+        assert!(error.contains("same setting under its old name"), "{error}");
+    }
+
+    #[test]
+    fn project_compaction_accepts_the_deprecated_working_set_name() {
+        let parsed = ProjectFile::parse("[compaction]\ncontext_ceiling_tokens = 65536\n").unwrap();
+        let settings = parsed.compaction.unwrap().over(crate::DEFAULT_COMPACTION);
+        assert_eq!(settings.working_set_tokens, 65536);
     }
 
     #[test]
@@ -741,6 +1010,48 @@ enabled = ["implement"]
         )
         .unwrap();
         assert_eq!(unknown, vec!["project.bogus", "tools.bash_timout_secs"]);
+    }
+
+    #[test]
+    fn a_notes_kind_parses() {
+        let (file, unknown) =
+            ProjectFile::parse_with("[project]\nname = \"p\"\nkind = \"notes\"\n").unwrap();
+        assert_eq!(file.project.unwrap().kind, ProjectKind::Notes);
+        assert_eq!(unknown, Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_absent_kind_reads_as_code() {
+        let absent = ProjectFile::parse("[project]\nname = \"p\"\n").unwrap();
+        assert_eq!(absent.project.as_ref().unwrap().kind, ProjectKind::Code);
+        let explicit = ProjectFile::parse("[project]\nname = \"p\"\nkind = \"code\"\n").unwrap();
+        assert_eq!(explicit, absent);
+    }
+
+    #[test]
+    fn an_unknown_kind_is_a_parse_error_naming_the_key() {
+        let err = ProjectFile::parse("[project]\nname = \"p\"\nkind = \"other\"\n").unwrap_err();
+        assert!(err.contains("kind"), "{err}");
+        assert!(err.contains("other"), "{err}");
+    }
+
+    #[test]
+    fn a_project_without_a_project_table_is_code() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE_NAME), "").unwrap();
+        assert_eq!(
+            Project::open_root(dir.path()).unwrap().kind(),
+            ProjectKind::Code
+        );
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            "[project]\nname = \"p\"\nkind = \"notes\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Project::open_root(dir.path()).unwrap().kind(),
+            ProjectKind::Notes
+        );
     }
 
     #[test]
@@ -795,6 +1106,7 @@ enabled = ["implement"]
             "budget.max_tokens",
             "budget.max_wall_time_secs",
             "compaction.context_ceiling_tokens",
+            "compaction.working_set_tokens",
             "compaction.evict_above_tokens",
             "compaction.evict_min_free_percent",
             "compaction.keep_last_calls",
@@ -826,14 +1138,17 @@ enabled = ["implement"]
             "skills.enabled",
             "tools.allow",
             "tools.bash_timeout_secs",
+            "workflow.decide_auto_go",
         ] {
             assert!(paths.contains(&expected.to_owned()), "missing {expected}");
         }
     }
 
-    /// Every key `aigentic.toml`'s structs have, in one file. This is the
-    /// checklist: a struct that gains a field without a line here and in
-    /// `PROJECT_SPEC` fails `the_full_fixture_is_clean_under_the_spec`.
+    /// Every canonical key `aigentic.toml`'s structs have, in one file. This
+    /// is the checklist: a struct that gains a field without a line here and
+    /// in `PROJECT_SPEC` fails `the_full_fixture_is_clean_under_the_spec`.
+    /// The old `context_ceiling_tokens` alias is tested separately because
+    /// it cannot be set alongside its replacement.
     const FULL_PROJECT: &str = "\
 [project]
 name = \"vendela\"
@@ -851,7 +1166,7 @@ keep_turns = 2
 max_result_bytes = 100
 summary_max_output_tokens = 10
 keep_last_calls = 3
-context_ceiling_tokens = 90000
+working_set_tokens = 90000
 evict_above_tokens = 64000
 [tools]
 allow = [\"bash\"]
@@ -878,18 +1193,72 @@ transport = { stdio = { command = \"npx\" } }
 class = \"read\"
 [participants]
 steve = \"admin\"
+[workflow]
+decide_auto_go = false
 ";
 
     #[test]
     fn the_full_fixture_is_clean_under_the_spec() {
         let (file, unknown) = ProjectFile::parse_with(FULL_PROJECT).unwrap();
         assert_eq!(unknown, Vec::<String>::new(), "{FULL_PROJECT}");
-        // The fixture really is the whole struct, not a subset: a key the
-        // struct has but the file leaves out would go unnoticed above.
+        // The fixture covers canonical fields; the deprecated alias is
+        // mutually exclusive with its replacement and is checked separately.
         assert!(file.project.is_some() && file.model.is_some());
         assert!(file.budget.is_some() && file.compaction.is_some());
         assert!(file.pocock.is_some());
         assert!(file.has_phase4_sections());
+    }
+
+    /// The `[workflow]` switch: on when no key says otherwise, off when one
+    /// says so, and a typo in its name reported rather than ignored.
+    #[test]
+    fn the_workflow_section_defaults_on_and_reports_a_typo() {
+        // The section with no key at all is what "absent" means for the
+        // field, so the default is the parser's own answer, not a literal.
+        let bare = ProjectFile::parse("[project]\nname = \"p\"\n[workflow]\n")
+            .unwrap()
+            .workflow
+            .expect("the section is present");
+        let off = ProjectFile::parse(FULL_PROJECT)
+            .unwrap()
+            .workflow
+            .expect("the fixture sets the section");
+        assert!(bare.decide_auto_go);
+        assert!(!off.decide_auto_go);
+        assert!(
+            ProjectFile::parse("[project]\nname = \"p\"\n")
+                .unwrap()
+                .workflow
+                .is_none()
+        );
+
+        let (_, unknown) = ProjectFile::parse_with(
+            "[project]\nname = \"p\"\n[workflow]\ndecide_auto_g0 = false\n",
+        )
+        .unwrap();
+        assert_eq!(unknown, vec!["workflow.decide_auto_g0"]);
+    }
+
+    /// What a run does at a `decided_by` gate, read from the directory: on
+    /// with no file and no section, the section's value with one, and off
+    /// for a file that cannot be read.
+    #[test]
+    fn the_switch_a_run_reads_defaults_on_and_fails_closed() {
+        let empty = tempfile::tempdir().unwrap();
+        assert!(decide_auto_go(empty.path()));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE_NAME), "[project]\nname = \"p\"\n").unwrap();
+        // No `[workflow]` at all: on, as no file is.
+        assert!(decide_auto_go(dir.path()));
+        std::fs::write(dir.path().join(FILE_NAME), FULL_PROJECT).unwrap();
+        let file = ProjectFile::parse(FULL_PROJECT).unwrap();
+        assert_eq!(
+            decide_auto_go(dir.path()),
+            file.workflow.unwrap().decide_auto_go
+        );
+        // A file the project cannot open leaves the answer to a person.
+        std::fs::write(dir.path().join(FILE_NAME), "[project]\nname = 7\n").unwrap();
+        assert!(!decide_auto_go(dir.path()));
     }
 
     #[test]
@@ -903,6 +1272,44 @@ steve = \"admin\"
             ProjectFile::default().tools.bash_timeout(),
             std::time::Duration::from_secs(120)
         );
+    }
+
+    #[test]
+    fn the_related_key_parses_and_is_a_known_key() {
+        // A fixture can only turn the walk's silence into evidence if
+        // the key is in both lists: a fixture that sets it and reports
+        // no unknown key proves both.
+        let (file, unknown) =
+            ProjectFile::parse_with("[project]\nname = \"p\"\nrelated = [\"v/r\", \"w/q\"]\n")
+                .unwrap();
+        assert_eq!(unknown, Vec::<String>::new());
+        assert_eq!(
+            file.project.unwrap().related,
+            vec!["v/r".to_owned(), "w/q".to_owned()]
+        );
+        // Absent, the key is an empty vector.
+        let file = ProjectFile::parse("[project]\nname = \"p\"\n").unwrap();
+        assert!(file.project.unwrap().related.is_empty());
+    }
+
+    #[test]
+    fn a_related_entry_that_is_not_workspace_slash_project_is_refused() {
+        // Every bad shape names the offending entry and the reason; the
+        // value is the fixture's, so the message is built from it.
+        for entry in [
+            "r", "", "v/", "/r", "v/r/x", "v/../r", "v/..", "v/r\\x", "/",
+        ] {
+            let text = format!("[project]\nname = \"p\"\nrelated = ['{entry}']\n");
+            let err = ProjectFile::parse(&text).unwrap_err();
+            assert!(
+                err.contains(&format!("`{entry}` is not <workspace>/<project>")),
+                "{entry}: {err}"
+            );
+        }
+        // A bare string where the list belongs is serde's error, not ours
+        // to word.
+        let text = "[project]\nname = \"p\"\nrelated = \"v/r\"\n";
+        assert!(ProjectFile::parse(text).is_err());
     }
 
     #[test]

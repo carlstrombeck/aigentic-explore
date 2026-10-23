@@ -33,6 +33,13 @@ let stream = provider.complete(&CompletionRequest {
 });
 ```
 
+With `AIGENTIC_DUMP_REQUESTS=<dir>` set, every request body either adapter
+sends is also written there, pretty-printed, as `<unix-millis>.json`; the
+directory must already exist, and an unset or empty value writes nothing.
+The key is never in a body, so it is never in a dump. Diffing two
+consecutive bodies is how a silent cache invalidator — or the parameter a
+400 follows — is found.
+
 ## What leaks through the abstraction, and where it goes
 
 | Concern | Handling |
@@ -53,7 +60,11 @@ comments, multi-line data). `Translator` turns each chunk into
 by index and emitted whole when the choice finishes, `Done` carries the
 finish reason and is emitted on `[DONE]` or EOF. A non-2xx response, a
 transport failure or an `error` object in the stream becomes a single
-`ProviderEvent::Error` and closes the stream.
+`ProviderEvent::Error` and closes the stream. An `error` object whose `code`
+names a 429 or a 5xx status (or, with no such code, whose `type` is
+`server_error`, `api_error` or `overloaded_error`) becomes the same
+transient class an HTTP 5xx gets, with the object's JSON kept as the body;
+any other one becomes a `Protocol` error.
 
 Tests run the parser and translator over recorded streams in
 `fixtures/openai_compat/`:
@@ -157,10 +168,6 @@ tool-call request twice, keeping the second, so `tool_calls.sse` shows
 3. On the second turn `/cost` must show `cache read > 0`.
 4. Resume a thread recorded on TensorX with `--profile anthropic` and ask
    what happened earlier; then the reverse.
-
-Set `AIGENTIC_DUMP_REQUESTS=<dir>` to write every request body there as
-JSON (never the key); diffing two consecutive bodies is how a silent cache
-invalidator is found.
 
 Status: all four steps passed on 2026-09-21 with `claude-opus-5`. Fixtures
 were recorded; the parser needed no change. A thread produced entirely on

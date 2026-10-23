@@ -10,6 +10,12 @@ pub struct KeyContext {
     /// A turn runs (or waits on someone) on the thread.
     pub running: bool,
     pub composer_empty: bool,
+    /// A build lead is followed (issue #68): the first Ctrl-C or Esc
+    /// detaches instead of arming quit or recall.
+    pub following: bool,
+    /// A run's step is watched: Esc at an empty composer
+    /// goes back to the front thread.
+    pub inside: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +49,11 @@ pub enum Action {
     /// Ctrl-T: the transcript pager — the whole checklist at its top,
     /// then the run so far.
     Transcript,
+    /// Stop following the run (issue #68), leaving it running.
+    DetachRun,
+    /// Leave the watched step and go back to the front
+    /// thread.
+    Back,
     None,
 }
 
@@ -55,15 +66,20 @@ pub fn action_for(key: &KeyEvent, ctx: KeyContext) -> Action {
         KeyCode::Enter if shift || alt => Action::Newline,
         KeyCode::Enter => Action::Submit,
         KeyCode::Char('j') if ctrl => Action::Newline,
-        KeyCode::Char('c') if ctrl => match (ctx.running, ctx.composer_empty) {
-            (true, _) => Action::Interrupt,
-            (false, false) => Action::ClearDraft,
-            (false, true) => Action::QuitArm,
+        KeyCode::Char('c') if ctrl => match (ctx.running, ctx.composer_empty, ctx.following) {
+            (true, _, _) => Action::Interrupt,
+            (false, false, _) => Action::ClearDraft,
+            (false, true, true) => Action::DetachRun,
+            (false, true, false) => Action::QuitArm,
         },
-        KeyCode::Esc => match (ctx.running, ctx.composer_empty) {
-            (true, _) => Action::Interrupt,
-            (false, false) => Action::ClearDraft,
-            (false, true) => Action::RecallArm,
+        // Ctrl-C never reads `inside`: a watched step's own turn is not
+        // this shell's to interrupt.
+        KeyCode::Esc => match (ctx.running, ctx.composer_empty, ctx.following, ctx.inside) {
+            (true, _, _, _) => Action::Interrupt,
+            (false, false, _, _) => Action::ClearDraft,
+            (false, true, _, true) => Action::Back,
+            (false, true, true, false) => Action::DetachRun,
+            (false, true, false, false) => Action::RecallArm,
         },
         KeyCode::Char('d') if ctrl => {
             if ctx.composer_empty {
@@ -90,13 +106,28 @@ pub fn action_for(key: &KeyEvent, ctx: KeyContext) -> Action {
     }
 }
 
+/// The action a key takes while a raise is armed at the budget gate.
+///
+/// Esc withdraws the raise whatever the composer holds, so an emptied
+/// composer cannot route Esc anywhere else. Every other key keeps its
+/// meaning: Backspace edits the figure rather than withdrawing it, so a
+/// person can clear the prefill and type their own. A running turn still
+/// takes Esc as an interrupt.
+pub fn while_raising(action: Action, key: &KeyEvent) -> Action {
+    if key.code == KeyCode::Esc && action != Action::Interrupt {
+        Action::ClearDraft
+    } else {
+        action
+    }
+}
+
 /// `/keys`.
 pub const KEYS: &str = "\
 Enter            send; while a turn runs: queue for the next turn (in the log at once); a prompt menu: pick the row
 !text Enter      interrupt the running turn, then send this
 Shift-Enter      new line (Ctrl-J where the terminal sends plain Enter)
-Ctrl-C           turn running: interrupt · draft: clear it · empty: press again within a second to quit
-Esc              turn running: interrupt · draft: clear it · a permission menu: answer with a reason · empty: Esc again recalls the last message sent
+Ctrl-C           turn running: interrupt · draft: clear it · following a run: detach from it · empty: press again within a second to quit
+Esc              turn running: interrupt · draft: clear it · a permission menu: answer with a reason · a checkpoint menu: leave the run waiting · watching a step: go back to the front thread · following a run: detach from it · empty: Esc again recalls the last message sent
 Alt-Up           copy the last message sent into the composer (a queued one stays queued)
 Up / Down        move in the draft; on one line, walk the history; a prompt menu: move its selection
 0-9              a prompt menu: pick that row
@@ -105,6 +136,7 @@ Ctrl-A / Ctrl-E  start / end of the line
 Ctrl-U           clear the draft
 Ctrl-T           the transcript pager: the whole checklist, then the run in full
 Ctrl-D           quit when the composer is empty
+/view [dev|normal] the transcript view: dev (default) or normal
 /copy [n|all]    the n-th code block of the last reply to the clipboard (\"all\" for the whole reply)
 y / a / n        a permission menu, hidden: once / allow more / no";
 
@@ -118,15 +150,118 @@ mod tests {
     const IDLE_EMPTY: KeyContext = KeyContext {
         running: false,
         composer_empty: true,
+        following: false,
+        inside: false,
     };
     const IDLE_DRAFT: KeyContext = KeyContext {
         running: false,
         composer_empty: false,
+        following: false,
+        inside: false,
     };
     const RUNNING: KeyContext = KeyContext {
         running: true,
         composer_empty: true,
+        following: false,
+        inside: false,
     };
+    /// Idle, empty composer, a run followed: detach (issue #68).
+    const FOLLOWING: KeyContext = KeyContext {
+        running: false,
+        composer_empty: true,
+        following: true,
+        inside: false,
+    };
+
+    /// Issue #68: while a run is followed, the first Ctrl-C or Esc
+    /// detaches; the expectations for every other context are unchanged.
+    #[test]
+    fn ctrl_c_and_esc_detach_from_a_followed_run() {
+        let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(action_for(&ctrl_c, FOLLOWING), Action::DetachRun);
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(action_for(&esc, FOLLOWING), Action::DetachRun);
+        // A running chat turn still interrupts, and a non-empty draft
+        // still clears.
+        assert_eq!(action_for(&ctrl_c, RUNNING), Action::Interrupt);
+        assert_eq!(action_for(&ctrl_c, IDLE_DRAFT), Action::ClearDraft);
+    }
+
+    /// A figure cleared to be retyped stays a raise: only Esc withdraws
+    /// it, at an empty composer as at a full one, and a running turn
+    /// still takes Esc as an interrupt.
+    #[test]
+    fn while_raising_only_esc_withdraws_the_raise() {
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        for ctx in [IDLE_EMPTY, IDLE_DRAFT, FOLLOWING] {
+            assert_eq!(
+                while_raising(action_for(&esc, ctx), &esc),
+                Action::ClearDraft,
+                "{ctx:?}"
+            );
+        }
+        assert_eq!(
+            while_raising(action_for(&esc, RUNNING), &esc),
+            Action::Interrupt
+        );
+        for code in [KeyCode::Backspace, KeyCode::Delete, KeyCode::Char('5')] {
+            let k = key(code, KeyModifiers::NONE);
+            for ctx in [IDLE_EMPTY, IDLE_DRAFT] {
+                assert_eq!(while_raising(action_for(&k, ctx), &k), action_for(&k, ctx));
+            }
+        }
+    }
+
+    /// A step watched: Esc at an empty composer goes back,
+    /// and Ctrl-C's table does not move.
+    #[test]
+    fn escape_inside_goes_back() {
+        const INSIDE: KeyContext = KeyContext {
+            running: false,
+            composer_empty: true,
+            following: false,
+            inside: true,
+        };
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(action_for(&esc, INSIDE), Action::Back);
+        for inside in [false, true] {
+            let ctx = KeyContext { inside, ..INSIDE };
+            let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+            assert_eq!(
+                action_for(&ctrl_c, ctx),
+                Action::QuitArm,
+                "Ctrl-C never reads `inside`"
+            );
+            // A running child turn is the child's, not this shell's: the
+            // context is always the front engine's own state.
+            let running = KeyContext {
+                running: true,
+                ..INSIDE
+            };
+            assert_eq!(
+                action_for(&ctrl_c, running),
+                Action::Interrupt,
+                "Ctrl-C interrupts the front's turn, inside or not"
+            );
+            assert_eq!(
+                action_for(&esc, running),
+                Action::Interrupt,
+                "Esc interrupts the front's turn, inside or not"
+            );
+        }
+        let following = KeyContext {
+            following: true,
+            ..INSIDE
+        };
+        assert_eq!(action_for(&esc, following), Action::Back, "inside wins");
+        let draft = KeyContext {
+            composer_empty: false,
+            ..INSIDE
+        };
+        assert_eq!(action_for(&esc, draft), Action::ClearDraft);
+        assert_eq!(action_for(&esc, IDLE_EMPTY), Action::RecallArm);
+        assert_eq!(action_for(&esc, FOLLOWING), Action::DetachRun);
+    }
 
     #[test]
     fn ctrl_c_and_esc_depend_on_the_context() {

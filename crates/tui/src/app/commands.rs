@@ -32,16 +32,38 @@ pub enum Command<'a> {
     Policy,
     /// The memory files as the prefix carries them.
     Memory,
+    /// Follow a build of an issue here: `/build <n> [workflow]`.
+    Build(Option<&'a str>),
+    /// Answer the followed run's checkpoint: `/answer go`, `/answer retry`,
+    /// `/answer amend <text>` or `/answer stop`.
+    Answer(&'a str),
+    /// Watch a running issue's step here, read-only:
+    /// `/watch <issue> [step]`: open one of its running steps here.
+    Watch(Option<&'a str>),
+    /// Today's builds: `/jobs` lists them, `/jobs <n>` looks at one of
+    /// them read-only, where `n` is the number from the listing.
+    Jobs(Option<u32>),
+    /// Leave the watched step and return to the front thread:
+    /// `/back`: leave a watched step for the front thread.
+    Back,
     /// A user-invoked skill: its name and the rest of the line.
     Skill(&'a str, &'a str),
     /// The key table.
     Keys,
+    /// The transcript view: `/view` prints it, `/view dev|normal` sets
+    /// it (issue #115).
+    View(Option<&'a str>),
     /// The project's working-tree diff, in the pager.
     Diff,
     /// Set the thread's title.
     Rename(&'a str),
     /// Move the thread to another project.
     ProjectUse(&'a str),
+    /// `/project use` with no name: pick the project from a list.
+    ProjectPick,
+    /// Start a new front thread, leaving the old one listed. With a turn
+    /// open, the REPL asks first (issue #108).
+    New,
     Unknown(&'a str),
     Chat(&'a str),
     Empty,
@@ -64,14 +86,18 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("quit" | "exit", _) => Command::Quit,
         ("help", _) => Command::Help,
         ("keys", _) => Command::Keys,
+        ("view", "") => Command::View(None),
+        ("view", name) => Command::View(Some(name)),
         ("diff", _) => Command::Diff,
         ("rename", title) if !title.is_empty() => Command::Rename(title),
         ("skills", _) => Command::Skills,
         ("project", rest) if rest.starts_with("use ") && !rest[4..].trim().is_empty() => {
             Command::ProjectUse(rest[4..].trim())
         }
+        ("project", "use") => Command::ProjectPick,
         ("project", _) => Command::Project,
         ("threads", _) => Command::Threads,
+        ("new", _) => Command::New,
         ("compact", _) => Command::Compact,
         ("interrupt", text) if !text.is_empty() => Command::Interrupt(text),
         ("who", _) => Command::Who,
@@ -84,6 +110,17 @@ pub fn parse_line<'a>(line: &'a str, skills: &[String]) -> Command<'a> {
         ("policy", _) => Command::Policy,
         ("memory", _) => Command::Memory,
         ("pin", text) if !text.is_empty() => Command::Pin(text),
+        ("build", "") => Command::Build(None),
+        ("build", arg) => Command::Build(Some(arg)),
+        ("watch", "") => Command::Watch(None),
+        ("watch", arg) => Command::Watch(Some(arg)),
+        ("jobs", "") => Command::Jobs(None),
+        ("jobs", arg) => match arg.parse::<u32>() {
+            Ok(n) if n >= 1 => Command::Jobs(Some(n)),
+            _ => Command::Unknown(trimmed),
+        },
+        ("back", "") => Command::Back,
+        ("answer", arg) => Command::Answer(arg),
         ("remember", text) if !text.is_empty() => Command::Remember(text),
         (name, args) if skills.iter().any(|s| s == name) => Command::Skill(name, args),
         _ => Command::Unknown(trimmed),
@@ -126,10 +163,34 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "project",
         "the layers, the knowledge mode and every tool's fate",
     ),
-    ("threads", "this project's threads, newest first"),
+    (
+        "threads",
+        "your threads in every project: front, builds, then by workspace",
+    ),
+    (
+        "new",
+        "start a new front thread; the old one stays listed; asks first if a turn is running",
+    ),
+    (
+        "build",
+        "follow a build of issue n here: /build <n> [workflow]",
+    ),
+    (
+        "answer",
+        "answer the run's checkpoint: /answer go, /answer retry, /answer amend <text>, /answer stop",
+    ),
+    (
+        "watch",
+        "watch a running issue's step here, read-only: /watch <issue> [step]",
+    ),
+    (
+        "jobs",
+        "today's builds and what each is doing: /jobs, then /jobs <n> to look at one read-only",
+    ),
     ("diff", "the project's working-tree diff, in the pager"),
     ("copy", "copy a code block of the last reply: /copy [n|all]"),
     ("rename", "set the thread's title: /rename <title>"),
+    ("view", "show or set the transcript view: dev, normal"),
     ("keys", "the key table: interrupt, recall, quit"),
     ("help", "the command list"),
     ("quit", "exit (Ctrl-D too)"),
@@ -150,10 +211,18 @@ pub const HELP: &str = "\
 /skills          list enabled skills; user-invoked ones are slash commands
 /project         the layers, the knowledge mode and every tool's fate
 /project use <n> move this thread to project <n>, keeping the conversation
-/threads         this project's threads, newest first
+/project use     pick the project from a list: Enter moves the thread, Esc keeps it
+/threads         your threads in every project: front, builds, then by workspace
+/new             start a new front thread; the old one stays listed; asks first if a turn is running
+/build <n> [w]   follow a build of issue n here (workflow w, else build), and answer its checkpoints
+/watch <n> [s]   watch a running issue's step s (default: the step it is on) read-only; /back leaves
+/answer go       continue the run past its checkpoint; /answer retry grants one more attempt where one is offered; /answer amend <text> continues with changes; /answer raise <usd> lifts a run's budget; /answer stop
+/back            leave a watched step and return to the front thread
+/jobs [n]        today's builds and what each is doing; with a number from the listing, look at that build read-only
 /<skill> [args]  run a user-invoked skill
 /diff            the project's working-tree diff, untracked files included
 /rename <title>  set the thread's title (one is proposed after the first turn)
+/view [dev|normal] show the transcript view, or set it (dev is the default)
 /copy [n|all]    copy the n-th code block of the last reply (default: the last); \"all\" for the whole reply, without the decorations
 /keys            the key table: interrupt, recall, quit
 /help            this list
@@ -273,6 +342,46 @@ mod tests {
         );
     }
 
+    /// T5 (issue #97): `/threads` is described as listing every project,
+    /// grouped, in both help texts.
+    #[test]
+    fn threads_is_listed_in_commands_and_help_as_every_project() {
+        const SAID: &str = "your threads in every project: front, builds, then by workspace";
+        assert!(
+            COMMANDS
+                .iter()
+                .any(|(name, said)| *name == "threads" && *said == SAID),
+            "{COMMANDS:#?}"
+        );
+        assert!(HELP.contains(SAID), "{HELP}");
+    }
+
+    /// T1 (issue #115): `/view` parses, and is discoverable in the
+    /// completion table, HELP and KEYS.
+    #[test]
+    fn view_parses_and_is_listed_in_commands_help_and_keys() {
+        let none: Vec<String> = vec![];
+        assert_eq!(parse_line("/view", &none), Command::View(None));
+        assert_eq!(parse_line("/view dev", &none), Command::View(Some("dev")));
+        assert_eq!(
+            parse_line("/view normal", &none),
+            Command::View(Some("normal"))
+        );
+        // An argument the design never named still parses; the engine
+        // answers it, not the grammar.
+        assert_eq!(parse_line("/view wat", &none), Command::View(Some("wat")));
+        assert!(
+            COMMANDS.iter().any(|(name, _)| *name == "view"),
+            "{COMMANDS:#?}"
+        );
+        assert!(HELP.contains("/view"), "{HELP}");
+        assert!(
+            crate::app::keymap::KEYS.contains("/view"),
+            "{}",
+            crate::app::keymap::KEYS
+        );
+    }
+
     #[test]
     fn short_output_is_untouched() {
         assert_eq!(truncate_for_display("a\nb\n", 12, 1200), "a\nb\n");
@@ -321,6 +430,31 @@ mod tests {
         assert!(HELP.contains("/why"), "{HELP}");
     }
 
+    /// `/new` is a command, and discoverable wherever the others are
+    /// (issue #89, T1).
+    #[test]
+    fn new_is_a_command_and_is_listed_in_commands_and_help() {
+        let none: Vec<String> = vec![];
+        assert_eq!(parse_line("/new", &none), Command::New);
+        assert!(
+            COMMANDS.iter().any(|(name, _)| *name == "new"),
+            "{COMMANDS:#?}"
+        );
+        assert!(HELP.contains("/new"), "{HELP}");
+    }
+
+    /// The `/new` help says it asks first (issue #108, T4): the row and
+    /// the long help both carry the question.
+    #[test]
+    fn the_new_help_says_it_asks_first() {
+        let said = COMMANDS
+            .iter()
+            .find_map(|(name, said)| (*name == "new").then_some(*said))
+            .expect("a /new row");
+        assert!(said.contains("asks first if a turn is running"), "{said}");
+        assert!(HELP.contains("asks first if a turn is running"), "{HELP}");
+    }
+
     /// `/copy` is discoverable wherever the others are (issue #41).
     #[test]
     fn copy_is_listed_in_commands_help_and_keys() {
@@ -334,5 +468,48 @@ mod tests {
             "{}",
             crate::app::keymap::KEYS
         );
+    }
+
+    /// `/jobs` with no number asks for the listing, and
+    /// `/jobs <n>` carries the number. Anything else that is not a number
+    /// from one upwards is not this command, so it reaches the engine as
+    /// an unknown command rather than as a listing request.
+    #[test]
+    fn jobs_parses_with_and_without_a_number() {
+        let none: Vec<String> = vec![];
+        assert_eq!(parse_line("/jobs", &none), Command::Jobs(None));
+        assert_eq!(parse_line("/jobs 3", &none), Command::Jobs(Some(3)));
+        assert_eq!(parse_line("/jobs 0", &none), Command::Unknown("/jobs 0"));
+        assert_eq!(parse_line("/jobs x", &none), Command::Unknown("/jobs x"));
+        assert_eq!(
+            parse_line("/jobs 1 extra", &none),
+            Command::Unknown("/jobs 1 extra")
+        );
+    }
+
+    /// `/jobs` is discoverable wherever the others are.
+    #[test]
+    fn help_names_jobs() {
+        assert!(
+            COMMANDS.iter().any(|(name, _)| *name == "jobs"),
+            "{COMMANDS:#?}"
+        );
+        assert!(HELP.contains("/jobs"), "{HELP}");
+    }
+
+    /// A bare `/project use` is the picker; with a name it is the move it
+    /// always was, so a script that names the project is unchanged.
+    #[test]
+    fn bare_project_use_parses_to_the_picker() {
+        let none: Vec<String> = Vec::new();
+        assert_eq!(parse_line("/project use", &none), Command::ProjectPick);
+        assert_eq!(parse_line("/project use ", &none), Command::ProjectPick);
+        assert_eq!(parse_line("/project use  ", &none), Command::ProjectPick);
+        assert_eq!(
+            parse_line("/project use web", &none),
+            Command::ProjectUse("web")
+        );
+        assert_eq!(parse_line("/project", &none), Command::Project);
+        assert!(HELP.contains("/project use     pick the project"), "{HELP}");
     }
 }

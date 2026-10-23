@@ -3,25 +3,44 @@
 //! (`~/.config/aigentic/`); the project layer is `aigentic.toml` and its
 //! folders; the thread layer is the pinned facts in the log.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use aigentic_log::MemoryHome;
 
 use crate::Project;
-use crate::project::ProjectError;
+use crate::project::{MEMORY_DIR, ProjectError};
+
+/// The heading of the person's memory block in the prefix. The person is
+/// unnamed here: the config names a user, not the person the memory is
+/// about.
+pub const PERSON_MEMORY_HEADING: &str = "# Person memory";
 
 /// The owner's layer: who the agent is, house rules, and what no project
 /// may offer.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GlobalLayer {
     pub instructions: Option<String>,
+    /// The person's memory folder, kept so the runtime can reload it;
+    /// `None` when nobody configured one.
+    pub memory_dir: Option<PathBuf>,
+    /// The person's memory files, name and text, in name order.
+    pub memory: Vec<(String, String)>,
+    /// The daemon's owner: the only person whose lines the person's
+    /// memory is written from. `None` when the config lists no user, and
+    /// then there is no person memory at all.
+    pub owner: Option<String>,
     /// Tool names, exact or with a trailing `*`.
     pub denied_tools: Vec<String>,
     pub denied_skills: Vec<String>,
 }
 
 impl GlobalLayer {
-    /// Read `instructions.md`; a missing file is no instructions.
+    /// Read `instructions.md` and the person's memory folder; a missing
+    /// file or folder is empty.
     pub fn load(
         instructions: &Path,
+        memory_dir: Option<&Path>,
+        owner: Option<&str>,
         denied_tools: Vec<String>,
         denied_skills: Vec<String>,
     ) -> Result<Self, ProjectError> {
@@ -35,29 +54,79 @@ impl GlobalLayer {
                 });
             }
         };
+        let memory = match memory_dir {
+            Some(dir) => crate::project::read_md_files(dir)?,
+            None => Vec::new(),
+        };
         Ok(Self {
             instructions: text.filter(|t| !t.trim().is_empty()),
+            memory_dir: memory_dir.map(Path::to_path_buf),
+            memory,
+            owner: owner.map(str::to_owned),
             denied_tools,
             denied_skills,
         })
     }
+
+    /// Re-read the person's memory folder, if this layer has one.
+    pub fn reload_memory(&mut self) -> Result<(), ProjectError> {
+        let Some(dir) = &self.memory_dir else {
+            return Ok(());
+        };
+        self.memory = crate::project::read_md_files(dir)?;
+        Ok(())
+    }
+
+    /// The person's memory, as the block the prefix carries right after
+    /// the global instructions: one `## <file>` per non-empty file, and
+    /// nothing when the folder has none.
+    pub(crate) fn memory_block(&self) -> Option<String> {
+        let parts: Vec<String> = self
+            .memory
+            .iter()
+            .filter(|(_, t)| !t.trim().is_empty())
+            .map(|(n, t)| format!("## {n}\n\n{}", t.trim_end()))
+            .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        Some(format!("{PERSON_MEMORY_HEADING}\n\n{}", parts.join("\n\n")))
+    }
 }
 
 /// A workspace's layer (phase 6 step 10): what every project in it
-/// shares. Its files live in `<shared>/workspace/`: `instructions.md`
-/// and `memory/*.md` now, knowledge and a brief in step 12.
+/// shares. Its files live in `<shared>/workspace/`: `instructions.md`,
+/// `brief.md`, `memory/*.md` and `knowledge/*.md`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkspaceLayer {
     pub name: String,
+    /// The folder the layer was read from, kept so the runtime can reload
+    /// and stat the knowledge beside the project's.
+    pub shared: Option<std::path::PathBuf>,
     pub instructions: Option<String>,
+    /// `brief.md` beside `instructions.md` (issue #123), read in `load`
+    /// and kept here, so the prefix is a getter, not a live read. A
+    /// missing, empty or non-regular file is `None`.
+    pub brief: Option<String>,
     /// Memory files, name and text, in name order.
     pub memory: Vec<(String, String)>,
+    /// The workspace's knowledge folder, loaded and reloaded by the
+    /// runtime. The whole shared dir is trusted, so no boundary walk.
+    pub knowledge: Option<crate::knowledge::Knowledge>,
 }
 
 impl WorkspaceLayer {
     /// The folder under `shared` that holds the workspace's own files.
     pub fn dir(shared: &Path) -> std::path::PathBuf {
         shared.join("workspace")
+    }
+
+    /// The folder the workspace's knowledge lives in, under the shared
+    /// dir the layer was read from.
+    pub fn knowledge_dir(&self) -> Option<std::path::PathBuf> {
+        self.shared
+            .as_ref()
+            .map(|shared| Self::dir(shared).join(crate::project::KNOWLEDGE_DIR))
     }
 
     /// Read the layer; missing files are an empty layer.
@@ -69,7 +138,7 @@ impl WorkspaceLayer {
         let Some(shared) = shared else {
             return Ok(layer);
         };
-        let dir = Self::dir(shared);
+        layer.shared = Some(shared.to_path_buf());
         let read = |path: &Path| match std::fs::read_to_string(path) {
             Ok(t) => Ok(Some(t)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -78,8 +147,26 @@ impl WorkspaceLayer {
                 source,
             }),
         };
-        layer.instructions = read(&dir.join("instructions.md"))?.filter(|t| !t.trim().is_empty());
-        if let Ok(entries) = std::fs::read_dir(dir.join("memory")) {
+        layer.instructions =
+            read(&Self::dir(shared).join("instructions.md"))?.filter(|t| !t.trim().is_empty());
+        layer.brief = crate::brief::read_file(&crate::brief::workspace_brief_path(shared));
+        layer.memory = Self::read_memory(shared)?;
+        Ok(layer)
+    }
+
+    /// `memory/*.md` beside the workspace's instructions; a missing
+    /// folder is empty.
+    fn read_memory(shared: &Path) -> Result<Vec<(String, String)>, ProjectError> {
+        let read = |path: &Path| match std::fs::read_to_string(path) {
+            Ok(t) => Ok(Some(t)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(ProjectError::Io {
+                path: path.to_path_buf(),
+                source,
+            }),
+        };
+        let mut memory = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(Self::dir(shared).join(MEMORY_DIR)) {
             let mut files: Vec<_> = entries
                 .filter_map(Result::ok)
                 .map(|e| e.path())
@@ -92,11 +179,25 @@ impl WorkspaceLayer {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    layer.memory.push((name, text));
+                    memory.push((name, text));
                 }
             }
         }
-        Ok(layer)
+        Ok(memory)
+    }
+
+    /// Re-read the workspace's memory folder, if this layer has one.
+    pub fn reload_memory(&mut self) -> Result<(), ProjectError> {
+        let Some(shared) = &self.shared else {
+            return Ok(());
+        };
+        self.memory = Self::read_memory(shared)?;
+        Ok(())
+    }
+
+    /// The workspace's brief (issue #123), for the prefix block.
+    pub fn brief(&self) -> Option<&str> {
+        self.brief.as_deref()
     }
 
     /// The block the prefix carries after the global one.
@@ -208,6 +309,48 @@ impl Layers {
         self.workspace.as_ref()?.instructions_block()
     }
 
+    /// Where a home's memory folder is in this thread, `None` when the
+    /// thread has not got it: no person folder or no owner, no workspace,
+    /// no project.
+    pub fn memory_home(&self, home: MemoryHome) -> Option<PathBuf> {
+        match home {
+            MemoryHome::Person => self
+                .global
+                .owner
+                .as_ref()
+                .and(self.global.memory_dir.clone()),
+            MemoryHome::Workspace => self
+                .workspace
+                .as_ref()
+                .and_then(|w| w.shared.as_deref())
+                .map(|shared| WorkspaceLayer::dir(shared).join(MEMORY_DIR)),
+            MemoryHome::Project => self.project.as_ref().map(Project::memory_dir),
+        }
+    }
+
+    /// The homes a thread keeps besides the project's, in the order the
+    /// extraction request names them.
+    pub fn extra_memory_homes(&self) -> Vec<MemoryHome> {
+        [MemoryHome::Person, MemoryHome::Workspace]
+            .into_iter()
+            .filter(|h| self.memory_home(*h).is_some())
+            .collect()
+    }
+
+    /// Re-read every home this thread has: the person's, the workspace's
+    /// and the project's. Called at turn start, so a file edited by hand
+    /// or by another thread shows in the next turn.
+    pub fn reload_memory(&mut self) -> Result<(), ProjectError> {
+        self.global.reload_memory()?;
+        if let Some(workspace) = &mut self.workspace {
+            workspace.reload_memory()?;
+        }
+        if let Some(project) = &mut self.project {
+            project.reload_memory()?;
+        }
+        Ok(())
+    }
+
     /// The workspace's memory, then the project's, as one block.
     pub fn memory_prefix(&self) -> Option<String> {
         let parts: Vec<String> = [
@@ -269,6 +412,7 @@ mod tests {
                 instructions: None,
                 denied_tools: names(&["mcp.*", "bash"]),
                 denied_skills: names(&["wizard"]),
+                ..GlobalLayer::default()
             },
             project: Some(project(&["bash", "mcp.docs.search", "read_file"])),
             workspace: None,
@@ -302,18 +446,18 @@ mod tests {
     fn global_layer_loads_or_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("instructions.md");
-        let g = GlobalLayer::load(&path, vec![], vec![]).unwrap();
+        let g = GlobalLayer::load(&path, None, None, vec![], vec![]).unwrap();
         assert_eq!(g.instructions, None);
         std::fs::write(&path, "  \n").unwrap();
         assert_eq!(
-            GlobalLayer::load(&path, vec![], vec![])
+            GlobalLayer::load(&path, None, None, vec![], vec![])
                 .unwrap()
                 .instructions,
             None
         );
         std::fs::write(&path, "You are terse.\n").unwrap();
         assert_eq!(
-            GlobalLayer::load(&path, vec![], vec![])
+            GlobalLayer::load(&path, None, None, vec![], vec![])
                 .unwrap()
                 .instructions
                 .as_deref(),

@@ -4,11 +4,14 @@
 
 use aigentic_core::{Author, ContentBlock, Event, EventKind, Message, Role};
 use time::format_description::well_known::Rfc3339;
+use ulid::Ulid;
 
 use crate::payload::{
     AssistantMessagePayload, CompactedPayload, CompactionStrategy, ContextEvictedPayload,
-    InterruptedPayload, PinnedPayload, SkillLoadedPayload, ToolResultPayload, UserMessagePayload,
+    InterruptedPayload, JobFinishedPayload, JobOutcome, PinnedPayload, ResultsStubbedPayload,
+    SkillLoadedPayload, ToolResultPayload, UserMessagePayload,
 };
+use crate::recall::{call_index, cut_chars, short_args};
 use crate::store::LogError;
 
 /// What the runtime builds context from.
@@ -70,6 +73,10 @@ struct CallResult {
 /// other top-level value over [`STUB_ARG_MAX_CHARS`] cut with a
 /// `… [+N chars]` marker — except failed results and the last result of
 /// each distinct tool, which stay whole;
+/// a `results_stubbed` event stubs every successful result of every turn
+/// already closed at or before its `through_seq` (issue #76), the last of
+/// a tool included, so a whole closed turn's material leaves the context
+/// in one batch;
 /// provider blobs are dropped from every assistant message
 /// that predates the latest summary compaction; an interrupted event
 /// becomes a short note; a loaded skill becomes a user-role message from
@@ -105,10 +112,13 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
 
     // In-turn eviction: what each call is, what its result is, and the
     // last result of each distinct tool per turn, so the second pass can
-    // decide what the `context_evicted` events stub.
+    // decide what the `context_evicted` events stub. The call index is
+    // `recall`'s, shared with the stub text and the `recall` tool.
     let mut evictions: Vec<Eviction> = Vec::new();
-    let mut calls: std::collections::HashMap<String, (String, serde_json::Value)> =
-        std::collections::HashMap::new();
+    // Closed-turn batches (issue #76): each `results_stubbed` names a
+    // `turn_ended`; every successful result at or before it is stubbed.
+    let mut batches: Vec<u64> = Vec::new();
+    let calls = call_index(events)?;
     let mut results: std::collections::HashMap<String, CallResult> =
         std::collections::HashMap::new();
     let mut last_of_tool: std::collections::HashMap<(Option<u64>, String), u64> =
@@ -162,13 +172,9 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                     through: p.through_seq,
                 });
             }
-            EventKind::AssistantMessage => {
-                let p: AssistantMessagePayload = payload(event)?;
-                for block in &p.blocks {
-                    if let ContentBlock::ToolCall(c) = block {
-                        calls.insert(c.id.clone(), (c.name.clone(), c.args.clone()));
-                    }
-                }
+            EventKind::ResultsStubbed => {
+                let p: ResultsStubbedPayload = payload(event)?;
+                batches.push(p.through_seq);
             }
             EventKind::ToolResult => {
                 let p: ToolResultPayload = payload(event)?;
@@ -195,6 +201,17 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
         let Some((name, _)) = calls.get(id) else {
             continue;
         };
+        // A closed turn's used results go in a batch (issue #76): the
+        // rule is exactly "successful, closed, at or before the batch's
+        // boundary", with no exemption — the last-result-of-a-tool rule
+        // belongs to the open turn's sweep alone. `closure` is seq < the
+        // last `turn_ended`, the projection's own rule, so a result the
+        // batch reaches always sits in a closed turn.
+        let closed = last_turn_end.is_some_and(|end| r.seq < end);
+        if closed && batches.iter().any(|through| r.seq <= *through) {
+            stubbed.insert(id.clone());
+            continue;
+        }
         // The last result of each distinct tool stays, however old.
         if last_of_tool.get(&(r.turn, name.clone())) == Some(&r.seq) {
             continue;
@@ -331,7 +348,8 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                 let ToolResultPayload { mut result, .. } = payload(event)?;
                 if stubbed.contains(&result.id) {
                     if let Some((name, args)) = calls.get(&result.id) {
-                        result.content = result_stub(name, args, &result.content);
+                        result.content =
+                            result_stub(event.seq, name, args, &result.content);
                     }
                 } else if let Some(max) = truncations
                     .iter()
@@ -339,7 +357,7 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                     .map(|t| t.max_bytes)
                     .min()
                 {
-                    result.content = truncate_middle(&result.content, max);
+                    result.content = truncate_middle(&result.content, max, Some(event.seq));
                 }
                 push(
                     &mut body,
@@ -423,10 +441,28 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                     },
                 );
             }
+            EventKind::JobFinished => {
+                let p: JobFinishedPayload = payload(event)?;
+                push(
+                    &mut body,
+                    &mut pending_calls,
+                    &mut held,
+                    Message {
+                        role: Role::User,
+                        author: Author::System,
+                        blocks: vec![ContentBlock::Text(format!(
+                            "{}\n\n{}",
+                            job_marker(&p.job_thread, p.outcome, p.cost_usd),
+                            p.summary
+                        ))],
+                    },
+                );
+            }
             EventKind::TurnEnded
             | EventKind::Compacted
             | EventKind::Pinned
             | EventKind::ContextEvicted
+            | EventKind::ResultsStubbed
             | EventKind::PermissionRequested
             | EventKind::PermissionDecided
             | EventKind::MemoryExtracted
@@ -439,7 +475,35 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
             | EventKind::ContextSaturated
             // A retry is a UI fact (issue #31), not context: the model
             // is told nothing about transport trouble.
-            | EventKind::ProviderRetried => {}
+            | EventKind::ProviderRetried
+            // The build runner's facts (issue #53) are about the lead
+            // thread's own machinery — which step is open, what the
+            // checks said, where a push landed. None of it is context,
+            // and a projection that carried it would change the prefix
+            // it exists to leave alone: the runner reads them from the
+            // log, the model never sees them.
+            | EventKind::RunStarted
+            | EventKind::StepStarted
+            | EventKind::StepFinished
+            | EventKind::ChecksRun
+            | EventKind::RouteTaken
+            | EventKind::CheckpointAsked
+            | EventKind::CheckpointAnswered
+            | EventKind::BudgetWarned
+            | EventKind::BudgetRaised
+            | EventKind::Pushed
+            | EventKind::RunFinished
+            | EventKind::RunErrored
+            | EventKind::StepReported
+            // Decisions (issue #74) are bookkeeping kept out of the
+            // model's context: the outcome of a decision reaches the
+            // model through what it caused (a `project_switched`, a job's
+            // summary), not through the record itself.
+            | EventKind::DecisionProposed
+            | EventKind::DecisionAnswered
+            // A brief's refresh records a write to the brief's file; the
+            // model reads the brief, never the record of its rewrite.
+            | EventKind::BriefRefreshed => {}
         }
     }
 
@@ -464,26 +528,43 @@ pub fn skill_marker(name: &str) -> String {
     format!("[Skill `{name}` loaded; follow it for this task]")
 }
 
-/// The stub an evicted result projects to: what ran, roughly with what,
-/// how big it was, and how to get it back (issue #30).
-fn result_stub(name: &str, args: &serde_json::Value, content: &str) -> String {
+/// The line placed before a finished job's summary, so a model reads it as a child
+/// thread's return and knows the child's transcript is not here.
+pub fn job_marker(job_thread: &Ulid, outcome: JobOutcome, cost_usd: f64) -> String {
+    let how = match outcome {
+        JobOutcome::Finished => "finished",
+        JobOutcome::Failed => "failed",
+        JobOutcome::Stopped => "was stopped",
+    };
     format!(
-        "[result of {name} {} · {} lines · dropped from context; re-run it if you need it again]",
-        short_args(args),
-        content.lines().count()
+        "[Background job {job_thread} {how}, cost ${cost_usd:.2}: below is its summary, not its transcript.]"
     )
 }
 
-/// A call's arguments as one short line: enough to tell two calls of the
-/// same tool apart, never the payload itself.
-fn short_args(args: &serde_json::Value) -> String {
-    let text = serde_json::to_string(args).unwrap_or_default();
-    if text.chars().count() <= 60 {
-        text
-    } else {
-        format!("{}…", text.chars().take(59).collect::<String>())
+/// The stub an evicted result projects to: what ran, roughly with what,
+/// how big it was, the result's own first line, and the handle to bring
+/// the whole of it back (issues #30, #75). A result with no non-empty
+/// line drops the excerpt and its separator, so nothing reads as empty.
+fn result_stub(seq: u64, name: &str, args: &serde_json::Value, content: &str) -> String {
+    let head = format!(
+        "[result {seq} · {name} {} · {} lines",
+        short_args(args),
+        content.lines().count()
+    );
+    let excerpt = content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| cut_chars(l.trim(), EXCERPT_MAX_CHARS));
+    match excerpt {
+        Some(excerpt) => {
+            format!("{head} · {excerpt} · dropped from context; recall {seq} to bring it back]")
+        }
+        None => format!("{head} · dropped from context; recall {seq} to bring it back]"),
     }
 }
+
+/// How many characters of a result's first line the stub quotes.
+pub const EXCERPT_MAX_CHARS: usize = 80;
 
 /// The most characters an argument value keeps behind the eviction
 /// boundary (issue #51). Every value longer than this is cut and
@@ -590,9 +671,10 @@ fn payload<T: serde::de::DeserializeOwned>(event: &Event) -> Result<T, LogError>
 }
 
 /// Keep the head and the tail of `text` within `max_bytes`, noting what
-/// was omitted. The same rule the tools crate applies at capture time;
+/// was omitted and, with a handle, the seq to recall the whole of it
+/// (issue #75). The same rule the tools crate applies at capture time;
 /// duplicated here because `log` may not depend on `tools`.
-pub fn truncate_middle(text: &str, max_bytes: usize) -> String {
+pub fn truncate_middle(text: &str, max_bytes: usize, handle: Option<u64>) -> String {
     if text.len() <= max_bytes {
         return text.to_owned();
     }
@@ -605,11 +687,15 @@ pub fn truncate_middle(text: &str, max_bytes: usize) -> String {
         tail_start += 1;
     }
     let omitted = tail_start - head;
-    format!(
-        "{}\n[... {omitted} bytes omitted by compaction ...]\n{}",
-        &text[..head],
-        &text[tail_start..]
-    )
+    let marker = match handle {
+        Some(seq) => {
+            format!(
+                "[... {omitted} bytes omitted by compaction; recall {seq} for the whole result ...]"
+            )
+        }
+        None => format!("[... {omitted} bytes omitted by compaction ...]"),
+    };
+    format!("{}\n{marker}\n{}", &text[..head], &text[tail_start..])
 }
 
 /// Convenience for callers that only want the body.
@@ -620,11 +706,20 @@ pub fn project_body(events: &[Event]) -> Result<Vec<Message>, LogError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::payload::Usage;
+    use crate::payload::{
+        BudgetScope, BudgetWarnedPayload, CheckOutcome, CheckResult, CheckpointAnswer,
+        CheckpointAnsweredPayload, CheckpointAskedPayload, ChecksRunPayload, CommitRef,
+        DecisionAnswer, DecisionAnsweredPayload, DecisionKind, DecisionProposedPayload,
+        DecisionStage, PushedPayload, ReleaseImpact, ReportStatus, RouteTakenPayload,
+        RunFinishedPayload, RunOutcome, RunStartedPayload, StepFinishedPayload, StepReport,
+        StepStartedPayload, StepStatus, Usage,
+    };
     use aigentic_core::{AgentId, ToolCall, ToolResult, UserId};
     use serde_json::json;
     use time::macros::datetime;
     use ulid::Ulid;
+
+    use crate::recall::short_args;
 
     fn ev(seq: u64, kind: EventKind, author: Author, payload: serde_json::Value) -> Event {
         Event {
@@ -689,6 +784,7 @@ mod tests {
                 model: "m".into(),
                 usage: Box::new(Usage::reported(aigentic_core::Usage::default())),
             },
+            continuous: false,
         };
         ev(
             seq,
@@ -702,6 +798,7 @@ mod tests {
             from_seq: from,
             to_seq: to,
             strategy: CompactionStrategy::TruncateResults { max_bytes: max },
+            continuous: false,
         };
         ev(
             seq,
@@ -722,6 +819,7 @@ mod tests {
                     args,
                 })],
                 usage: None,
+                finish_reason: None,
             })
             .unwrap(),
         )
@@ -740,6 +838,27 @@ mod tests {
             EventKind::ContextEvicted,
             Author::System,
             json!({"through_seq": through}),
+        )
+    }
+    /// A closed-turn batch (issue #76): every successful result of every
+    /// turn closed at or before `through`.
+    fn batch(seq: u64, through: u64) -> Event {
+        ev(
+            seq,
+            EventKind::ResultsStubbed,
+            Author::System,
+            json!({"through_seq": through}),
+        )
+    }
+    /// The stub the projection builds for a successful result, from the
+    /// fixture's own seq, name, args and content (issues #30, #75): the
+    /// rule is restated here so a test never copies the stub text.
+    fn stub(seq: u64, name: &str, args: &serde_json::Value, content: &str) -> String {
+        format!(
+            "[result {seq} · {name} {} · {} lines · {} · dropped from context; recall {seq} to bring it back]",
+            short_args(args),
+            content.lines().count(),
+            first_line(content),
         )
     }
     /// Every tool result's content, oldest first, as `name:content`.
@@ -763,6 +882,25 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+    /// The line a stub quotes from a result: its first non-empty line,
+    /// trimmed. Hand-computed excerpts are how a stub test goes wrong,
+    /// so every expectation derives it from the fixture.
+    fn first_line(content: &str) -> String {
+        content
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_owned())
+            .unwrap_or_default()
+    }
+    /// Issue #75's derived stub prefix: `"[result "` plus a seq, then the
+    /// tool's name. Lets a test say "this result is stubbed" without
+    /// pinning the whole text, and `== 0` still means "no stub".
+    fn is_stub(text: &str, name: &str) -> bool {
+        text.strip_prefix("[result ")
+            .and_then(|rest| rest.split_once(' '))
+            .filter(|(seq, _)| !seq.is_empty() && seq.chars().all(|c| c.is_ascii_digit()))
+            .is_some_and(|(_, rest)| rest.starts_with(&format!("· {name} ")))
     }
     fn texts(p: &Projection) -> Vec<String> {
         p.body
@@ -832,6 +970,7 @@ mod tests {
                     }),
                 ],
                 usage: None,
+                finish_reason: None,
             })
             .unwrap(),
         )
@@ -1161,6 +1300,7 @@ mod tests {
                         }),
                     ],
                     usage: None,
+                    finish_reason: None,
                 })
                 .unwrap(),
             ),
@@ -1251,12 +1391,34 @@ mod tests {
 
     #[test]
     fn truncate_middle_keeps_head_and_tail_on_char_boundaries() {
-        assert_eq!(truncate_middle("short", 100), "short");
+        assert_eq!(truncate_middle("short", 100, None), "short");
         let text = "é".repeat(100);
-        let out = truncate_middle(&text, 21);
+        let out = truncate_middle(&text, 21, None);
         assert!(!out.contains('\u{FFFD}'));
         assert!(out.contains("omitted by compaction"));
         assert!(out.starts_with("ééééé\n"), "{out}");
+    }
+
+    /// T4 (issue #75): with a handle the truncation marker names the seq
+    /// to recall, and the kept text and the byte budget are unchanged.
+    #[test]
+    fn a_truncation_marker_with_a_handle_names_the_seq_to_recall() {
+        let text = "abcdefghij".repeat(10); // 100 bytes
+        let max_bytes = 40;
+        let plain = truncate_middle(&text, max_bytes, None);
+        let handled = truncate_middle(&text, max_bytes, Some(7));
+        let omitted = text.len() - max_bytes;
+        let plain_marker = format!("[... {omitted} bytes omitted by compaction ...]");
+        let handle_marker = format!(
+            "[... {omitted} bytes omitted by compaction; recall 7 for the whole result ...]"
+        );
+        assert!(plain.contains(&plain_marker), "{plain}");
+        assert!(handled.contains(&handle_marker), "{handled}");
+        assert_eq!(
+            handled.replace(&handle_marker, ""),
+            plain.replace(&plain_marker, ""),
+            "the kept text is the same with and without a handle"
+        );
     }
 
     #[test]
@@ -1274,6 +1436,7 @@ mod tests {
                         args: json!({}),
                     })],
                     usage: None,
+                    finish_reason: None,
                 })
                 .unwrap(),
             ),
@@ -1386,13 +1549,364 @@ mod tests {
             vec![
                 (
                     "c1".into(),
-                    "[result of bash {\"command\":\"cargo test\"} · 200 lines · dropped from context; re-run it if you need it again]".into()
+                    format!(
+                        "[result 2 · bash {} · {} lines · {} · dropped from context; recall 2 to bring it back]",
+                        short_args(&json!({"command": "cargo test"})),
+                        long.lines().count(),
+                        first_line(&long),
+                    )
                 ),
                 // The last bash result of the turn stays, as before.
                 ("c2".into(), long.clone()),
                 ("c3".into(), long),
             ]
         );
+    }
+
+    /// A finished job reaches the front thread as one system message holding
+    /// the marker and the summary, and as nothing else: its transcript stays
+    /// in the job's own log, which this thread never reads.
+    #[test]
+    fn a_finished_job_reaches_context_as_its_summary_only() {
+        let job_thread = Ulid::from_parts(1_700_000_000_000, 9);
+        let outcome = JobOutcome::Finished;
+        let summary = "one screen";
+        let cost_usd = 0.42;
+
+        let events = vec![user(0, "build it"), assistant(1, "on it", false), ended(2)];
+        let mut with = events.clone();
+        with.push(ev(
+            3,
+            EventKind::JobFinished,
+            Author::System,
+            json!({
+                "job_thread": job_thread.to_string(),
+                "outcome": outcome,
+                "summary": summary,
+                "cost_usd": cost_usd,
+            }),
+        ));
+
+        let quiet = project_body(&events).unwrap();
+        let loud = project_body(&with).unwrap();
+        assert_eq!(
+            loud.len(),
+            quiet.len() + 1,
+            "one message more, not two: {loud:?}"
+        );
+        assert_eq!(
+            loud[..quiet.len()],
+            quiet[..],
+            "every earlier message holds"
+        );
+        let appended = &loud[quiet.len()];
+        assert_eq!(appended.role, Role::User);
+        assert_eq!(appended.author, Author::System);
+        assert_eq!(
+            appended.blocks,
+            vec![ContentBlock::Text(format!(
+                "{}\n\n{}",
+                job_marker(&job_thread, outcome, cost_usd),
+                summary
+            ))]
+        );
+    }
+
+    /// A brief's refresh changes nothing the model sees: the brief's file
+    /// is what reaches context, and a record of its rewrite in the body
+    /// would change the cached prefix for no gain.
+    #[test]
+    fn a_refreshed_brief_never_reaches_context() {
+        let events = vec![user(0, "build it"), assistant(1, "on it", false), ended(2)];
+        let mut with = events.clone();
+        with.push(ev(
+            3,
+            EventKind::BriefRefreshed,
+            Author::System,
+            json!({
+                "through_seq": 2,
+                "old_hash": "0a1b",
+                "new_hash": "2c3d",
+                "model": "m",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }),
+        ));
+        assert_eq!(project(&with).unwrap(), project(&events).unwrap());
+    }
+
+    #[test]
+    fn every_job_outcome_is_named_in_its_marker() {
+        let job_thread = Ulid::from_parts(1_700_000_000_000, 9);
+        let cost_usd = 1.5;
+        let markers: Vec<String> = [
+            JobOutcome::Finished,
+            JobOutcome::Failed,
+            JobOutcome::Stopped,
+        ]
+        .into_iter()
+        .map(|outcome| job_marker(&job_thread, outcome, cost_usd))
+        .collect();
+
+        for (i, marker) in markers.iter().enumerate() {
+            assert!(
+                marker.contains(&job_thread.to_string()),
+                "the job's thread is named: {marker}"
+            );
+            assert!(
+                marker.contains(&format!("{cost_usd:.2}")),
+                "the cost is named: {marker}"
+            );
+            for other in &markers[i + 1..] {
+                assert_ne!(marker, other, "an outcome never reads as another");
+            }
+        }
+    }
+
+    /// T4 (issue #53): the build runner's events are the runner's own
+    /// machinery, never model context. A log with all eleven kinds woven
+    /// into a real exchange projects to exactly the same `Projection` as
+    /// the same log without them (equality of the projection, not of
+    /// literals), and no runner fact appears anywhere in it.
+    #[test]
+    fn the_runner_kinds_are_kept_out_of_the_projection() {
+        let child = Ulid::from_parts(1_700_000_000_000, 7);
+        let reported = Ulid::from_parts(1_700_000_000_000, 8);
+        let runner = Author::Agent(AgentId("runner".into()));
+        let runner_event =
+            |kind: EventKind, payload: serde_json::Value| ev(0, kind, runner.clone(), payload);
+        fn to_value<T: serde::Serialize>(v: &T) -> serde_json::Value {
+            serde_json::to_value(v).unwrap()
+        }
+
+        let exchange = vec![
+            user(0, "build it"),
+            call(1, "c1", "bash", json!({"command": "cargo test"})),
+            result(2, "c1", "ok"),
+            ended(3),
+        ];
+
+        // The eleven kinds, in the order a run writes them, built from
+        // the payload types rather than from hand-written JSON.
+        let run_started = runner_event(
+            EventKind::RunStarted,
+            to_value(&RunStartedPayload {
+                issue: 53,
+                workflow: "build".into(),
+                version: 1,
+                content_hash: "abc".into(),
+                budget_usd: 10.0,
+            }),
+        );
+        let step_started = runner_event(
+            EventKind::StepStarted,
+            to_value(&StepStartedPayload {
+                step: "implement".into(),
+                role: "implementer".into(),
+                profile: "flash".into(),
+                child_thread: child,
+                attempt: 1,
+                budget_usd: 3.0,
+                head_at_start: None,
+                remote_at_start: None,
+            }),
+        );
+        let step_finished = runner_event(
+            EventKind::StepFinished,
+            to_value(&StepFinishedPayload {
+                step: "implement".into(),
+                status: StepStatus::Done,
+                end_reason: "done".into(),
+                cost_usd: 0.4,
+                reported_event: Some(reported),
+            }),
+        );
+        let checks_run = runner_event(
+            EventKind::ChecksRun,
+            to_value(&ChecksRunPayload {
+                step: "implement".into(),
+                checks: vec![CheckOutcome {
+                    id: "E1".into(),
+                    result: CheckResult::Pass,
+                    detail: None,
+                }],
+            }),
+        );
+        let route_taken = runner_event(
+            EventKind::RouteTaken,
+            to_value(&RouteTakenPayload {
+                branch: "review".into(),
+                proposed: "review".into(),
+                taken: "review".into(),
+                preconditions: vec![],
+                fallback_reason: None,
+                budget_usd: None,
+            }),
+        );
+        let checkpoint_asked = runner_event(
+            EventKind::CheckpointAsked,
+            to_value(&CheckpointAskedPayload {
+                gate: "plan_gate".into(),
+                shown: vec!["## Plan".into()],
+                options: vec!["go".into(), "stop".into()],
+                raise_usd: None,
+                choices: Vec::new(),
+            }),
+        );
+        let checkpoint_answered = ev(
+            0,
+            EventKind::CheckpointAnswered,
+            steve(),
+            to_value(&CheckpointAnsweredPayload {
+                answer: CheckpointAnswer::Go,
+                amendment: None,
+                marks: vec![],
+            }),
+        );
+        let budget_warned = runner_event(
+            EventKind::BudgetWarned,
+            to_value(&BudgetWarnedPayload {
+                scope: BudgetScope::Issue,
+                spent_usd: 8.0,
+                limit_usd: 10.0,
+            }),
+        );
+        let pushed = runner_event(
+            EventKind::Pushed,
+            to_value(&PushedPayload {
+                commits: vec![CommitRef {
+                    sha: "abc123".into(),
+                    subject: "log: add the runner's kinds".into(),
+                }],
+                ref_before: "abc000".into(),
+                ref_after: "abc123".into(),
+                installed: Some("abc123".into()),
+            }),
+        );
+        let run_finished = runner_event(
+            EventKind::RunFinished,
+            to_value(&RunFinishedPayload {
+                outcome: RunOutcome::Closed,
+                cost_usd: 0.9,
+                release_impact: Some(ReleaseImpact::NoImpact),
+                note: None,
+            }),
+        );
+        let step_reported = ev(
+            0,
+            EventKind::StepReported,
+            agent(),
+            to_value(&StepReport {
+                status: Some(ReportStatus::Done),
+                body: Some("## Implementation".into()),
+                ..StepReport::default()
+            }),
+        );
+
+        let mut with = vec![
+            exchange[0].clone(),
+            run_started,
+            exchange[1].clone(),
+            step_started,
+            exchange[2].clone(),
+            step_finished,
+            checks_run,
+            route_taken,
+            checkpoint_asked,
+            checkpoint_answered,
+            budget_warned,
+            pushed,
+            exchange[3].clone(),
+            run_finished,
+            step_reported,
+        ];
+        // Gapless sequence numbers: the interleaving is positional only.
+        for (seq, e) in with.iter_mut().enumerate() {
+            e.seq = seq as u64;
+        }
+
+        let quiet = project(&exchange).unwrap();
+        let loud = project(&with).unwrap();
+        assert_eq!(quiet, loud);
+        assert!(
+            !loud.body.iter().any(|m| m.author == runner),
+            "no runner event becomes a message: {loud:?}"
+        );
+        let rendered = format!("{loud:?}");
+        for leaked in ["plan_gate", "ref_after", "content_hash", "budget_usd"] {
+            assert!(
+                !rendered.contains(leaked),
+                "{leaked} never reaches the projection: {rendered}"
+            );
+        }
+    }
+
+    /// T4 (issue #74): the decision events are kept out of the projection —
+    /// a log with a proposal and its answer woven into a real exchange
+    /// projects to exactly the same `Projection` as the same log without
+    /// them, and neither the proposal nor its reason leaks in.
+    #[test]
+    fn the_decision_kinds_are_kept_out_of_the_projection() {
+        let exchange = vec![
+            user(0, "build it"),
+            call(1, "c1", "bash", json!({"command": "cargo test"})),
+            result(2, "c1", "ok"),
+            ended(3),
+        ];
+        let proposed = ev(
+            0,
+            EventKind::DecisionProposed,
+            agent(),
+            serde_json::to_value(&DecisionProposedPayload {
+                kind: DecisionKind::Project,
+                proposal: "switch-to-getscale-site".into(),
+                target: Some("getscale/site".into()),
+                reason: "the-brief-names-it".into(),
+                call_id: None,
+                job: None,
+                stage: DecisionStage::Ask,
+            })
+            .unwrap(),
+        );
+        let mut answered = ev(
+            0,
+            EventKind::DecisionAnswered,
+            steve(),
+            serde_json::to_value(&DecisionAnsweredPayload {
+                answer: DecisionAnswer::Yes,
+                correction: None,
+                note: None,
+            })
+            .unwrap(),
+        );
+        answered.parent_event = Some(proposed.id);
+
+        let mut with = vec![
+            exchange[0].clone(),
+            proposed,
+            exchange[1].clone(),
+            answered,
+            exchange[2].clone(),
+            exchange[3].clone(),
+        ];
+        // Gapless sequence numbers: the interleaving is positional only.
+        for (seq, e) in with.iter_mut().enumerate() {
+            e.seq = seq as u64;
+        }
+
+        let quiet = project(&exchange).unwrap();
+        let loud = project(&with).unwrap();
+        assert_eq!(quiet, loud);
+        let rendered = format!("{loud:?}");
+        for leaked in [
+            "switch-to-getscale-site",
+            "the-brief-names-it",
+            "getscale/site",
+        ] {
+            assert!(
+                !rendered.contains(leaked),
+                "{leaked} never reaches the projection: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -1444,15 +1958,23 @@ mod tests {
         ];
         let p = project(&events).unwrap();
         let stub_c5 = format!(
-            "[result of write_file {} · 6 lines · dropped from context; re-run it if you need it again]",
-            short_args(&json!({"path": "src/new.rs", "content": payload}))
+            "[result 10 · write_file {} · 6 lines · {} · dropped from context; recall 10 to bring it back]",
+            short_args(&json!({"path": "src/new.rs", "content": payload})),
+            first_line(
+                "--- a/src/new.rs\n+++ b/src/new.rs\n@@ -0,0 +1,2 @@\n+one\n+two\nwrote 8 bytes to src/new.rs"
+            ),
         );
         assert_eq!(
             results(&p),
             vec![
                 (
                     "c1".into(),
-                    "[result of bash {\"command\":\"cargo test\"} · 200 lines · dropped from context; re-run it if you need it again]".into()
+                    format!(
+                        "[result 2 · bash {} · {} lines · {} · dropped from context; recall 2 to bring it back]",
+                        short_args(&json!({"command": "cargo test"})),
+                        long.lines().count(),
+                        first_line(&long),
+                    )
                 ),
                 ("c2".into(), long.clone()), // last read_file of the turn
                 ("c3".into(), long),         // last bash result of the turn
@@ -1538,17 +2060,148 @@ mod tests {
         );
     }
 
-    #[test]
-    fn long_result_args_are_shortened_in_the_stub() {
+    /// T3 (issue #76): three closed turns and an open one, with a
+    /// `results_stubbed` batch at the second turn's end.
+    ///
+    /// Turn 1 holds two `bash` results — the second is its last of that
+    /// tool — and one failure; turn 2 a `read_file`; turn 3 and the open
+    /// turn sit past the batch's boundary.
+    fn three_closed_turns_and_an_open_one() -> (Vec<Event>, String, String, String) {
+        let long = "line\n".repeat(200);
+        let read = "read\n".repeat(50);
+        let tail = "tail\n".repeat(30);
         let events = vec![
-            user(0, "go"),
+            user(0, "one"),
             call(
                 1,
                 "c1",
-                "write_file",
-                json!({"path": "big.rs", "content": "z".repeat(400)}),
+                "bash",
+                json!({"command": "cargo test --all\ncargo build\n"}),
             ),
-            result(2, "c1", "wrote 400 bytes to big.rs"),
+            result(2, "c1", &long),
+            call(
+                3,
+                "c2",
+                "bash",
+                json!({"command": "cargo build --release\n"}),
+            ),
+            result(4, "c2", &long),
+            call(5, "c3", "grep", json!({"pattern": "x"})),
+            failed(6, "c3", "no matches"),
+            ended(7),
+            user(8, "two"),
+            call(9, "c4", "read_file", json!({"path": "a.rs"})),
+            result(10, "c4", &read),
+            ended(11),
+            // The batch, at the second turn's end.
+            batch(12, 11),
+            user(13, "three"),
+            call(14, "c5", "bash", json!({"command": "ls"})),
+            result(15, "c5", &tail),
+            ended(16),
+            user(17, "four"),
+            call(18, "c6", "read_file", json!({"path": "b.rs"})),
+            result(19, "c6", &tail),
+        ];
+        (events, long, read, tail)
+    }
+
+    #[test]
+    fn a_batch_stubs_a_closed_turns_used_results_and_leaves_the_rest_whole() {
+        let (events, long, read, tail) = three_closed_turns_and_an_open_one();
+        let p = project(&events).unwrap();
+        let c1_args = json!({"command": "cargo test --all\ncargo build\n"});
+        let c2_args = json!({"command": "cargo build --release\n"});
+        let c4_args = json!({"path": "a.rs"});
+        assert_eq!(
+            results(&p),
+            vec![
+                ("c1".into(), stub(2, "bash", &c1_args, &long)),
+                // The last bash of a closed turn goes in the batch too:
+                // the last-of-tool rule belongs to the open turn's sweep.
+                ("c2".into(), stub(4, "bash", &c2_args, &long)),
+                // A failure is information; it stays whole.
+                ("c3".into(), "no matches".into()),
+                ("c4".into(), stub(10, "read_file", &c4_args, &read)),
+                // Past the batch's boundary: turn 3's and the open turn's
+                // results are untouched.
+                ("c5".into(), tail.clone()),
+                ("c6".into(), tail.clone()),
+            ]
+        );
+        // A stubbed call's arguments shorten, exactly as in turn; from
+        // the fixture's own command and the cut the projection applies.
+        let args = call_args(&p);
+        let c1: String = first_line("cargo test --all\ncargo build\n");
+        let c1_removed = "cargo test --all\ncargo build\n".chars().count() - c1.chars().count();
+        assert_eq!(
+            args[0],
+            json!({"command": format!("{c1}… [+{c1_removed} chars]")})
+        );
+        let c2: String = first_line("cargo build --release\n");
+        let c2_removed = "cargo build --release\n".chars().count() - c2.chars().count();
+        assert_eq!(
+            args[1],
+            json!({"command": format!("{c2}… [+{c2_removed} chars]")})
+        );
+        // The failed call is not stubbed, so its arguments stay.
+        assert_eq!(args[2], json!({"pattern": "x"}));
+        // And calls past the boundary keep theirs.
+        assert_eq!(args[3], c4_args);
+        assert_eq!(args[4], json!({"command": "ls"}));
+        assert_eq!(args[5], json!({"path": "b.rs"}));
+    }
+
+    /// T3 (issue #76): with the batch event removed, every result projects
+    /// whole — nothing else stubs a closed turn, so a log with no
+    /// `results_stubbed` reads exactly as it did before #76.
+    #[test]
+    fn without_the_batch_the_same_log_projects_every_result_whole() {
+        let (events, long, read, tail) = three_closed_turns_and_an_open_one();
+        let without: Vec<Event> = events
+            .iter()
+            .filter(|e| e.kind != EventKind::ResultsStubbed)
+            .cloned()
+            .collect();
+        let plain = project(&without).unwrap();
+        assert_eq!(
+            results(&plain),
+            vec![
+                ("c1".into(), long.clone()),
+                ("c2".into(), long.clone()),
+                ("c3".into(), "no matches".into()),
+                ("c4".into(), read.clone()),
+                ("c5".into(), tail.clone()),
+                ("c6".into(), tail.clone()),
+            ]
+        );
+        assert_eq!(
+            call_args(&plain),
+            vec![
+                json!({"command": "cargo test --all\ncargo build\n"}),
+                json!({"command": "cargo build --release\n"}),
+                json!({"pattern": "x"}),
+                json!({"path": "a.rs"}),
+                json!({"command": "ls"}),
+                json!({"path": "b.rs"}),
+            ]
+        );
+        // The batch is the only other difference: the two projections share
+        // everything but the stubbed turns.
+        let with = project(&events).unwrap();
+        assert_ne!(results(&with), results(&plain));
+        assert_eq!(with.pinned, plain.pinned);
+        assert_eq!(with.compacted_through, plain.compacted_through);
+    }
+
+    #[test]
+    fn long_result_args_are_shortened_in_the_stub() {
+        let content = "wrote 400 bytes to big.rs";
+        let long_args = json!({"path": "big.rs", "content": "z".repeat(400)});
+        let events = vec![
+            user(0, "go"),
+            call(1, "c1", "write_file", long_args.clone()),
+            result(2, "c1", content),
             evicted(3, 2),
             call(
                 4,
@@ -1561,15 +2214,136 @@ mod tests {
         let p = project(&events).unwrap();
         let (_, stub) = results(&p)[0].clone();
         assert!(
-            stub.starts_with("[result of write_file {\"content\":\"zz"),
+            stub.starts_with("[result 2 · write_file {\"content\":\"zz"),
             "{stub}"
         );
         assert!(stub.contains("…"), "the arguments are cut short: {stub}");
         assert!(
-            stub.ends_with(" · dropped from context; re-run it if you need it again]"),
+            stub.ends_with(&format!(
+                " · {} · dropped from context; recall 2 to bring it back]",
+                first_line(content)
+            )),
             "{stub}"
         );
-        assert!(stub.len() < 200, "{stub}");
+        // The cut is real: the stub is shorter than the call's own
+        // arguments, and shorter than the result it stands for.
+        let args_len = serde_json::to_string(&long_args).unwrap().len();
+        assert!(stub.len() < args_len, "{stub}");
+        assert!(
+            stub.contains("recall 2 to bring it back"),
+            "the handle is in there: {stub}"
+        );
+    }
+
+    /// T1 (issue #75): the stub's two literal forms, derived from the
+    /// fixture — seq, name, shortened args, line count, excerpt, handle.
+    #[test]
+    fn a_stub_quotes_a_handle_and_the_result_first_line() {
+        let content = "one match\nsecond line\n";
+        let args = json!({"pattern": "x"});
+        let events = vec![
+            user(0, "find it"),
+            call(1, "c1", "grep", args.clone()),
+            result(2, "c1", content),
+            call(3, "c2", "grep", json!({"pattern": "y"})),
+            result(4, "c2", "another match"),
+            evicted(5, 2),
+        ];
+        let p = project(&events).unwrap();
+        assert_eq!(
+            results(&p)[0].1,
+            format!(
+                "[result 2 · grep {} · {} lines · {} · dropped from context; recall 2 to bring it back]",
+                short_args(&args),
+                content.lines().count(),
+                first_line(content),
+            ),
+            "the stub names the seq, the call, the size, the first line and the handle"
+        );
+        // The log's own payload still holds the result whole: the stub is
+        // a projection, not a rewrite.
+        assert_eq!(events[2].payload["content"], json!(content));
+    }
+
+    /// T2 (issue #75): the excerpt is the first non-empty line, trimmed,
+    /// cut at 80 chars plus `…`.
+    #[test]
+    fn an_excerpt_is_cut_at_eighty_chars() {
+        let content = format!("\n\n  {}\nrest\n", "x".repeat(100));
+        let args = json!({"command": "echo"});
+        let events = vec![
+            user(0, "run it"),
+            call(1, "c1", "bash", args.clone()),
+            result(2, "c1", &content),
+            call(3, "c2", "bash", json!({"command": "ls"})),
+            result(4, "c2", "ok"),
+            evicted(5, 2),
+        ];
+        let p = project(&events).unwrap();
+        let line = first_line(&content);
+        assert_eq!(line.chars().count(), 100, "the fixture is over the cut");
+        let excerpt: String = line.chars().take(EXCERPT_MAX_CHARS).collect();
+        // The spec's number, literally (#75's review: the constant alone
+        // was pinned by nothing).
+        assert_eq!(excerpt.chars().count(), 80);
+        assert_eq!(
+            results(&p)[0].1,
+            format!(
+                "[result 2 · bash {} · {} lines · {excerpt}… · dropped from context; recall 2 to bring it back]",
+                short_args(&args),
+                content.lines().count(),
+            )
+        );
+    }
+
+    /// T2 (issue #75): a result with no non-empty line takes the second
+    /// form — no excerpt, and no separator where it would have stood.
+    #[test]
+    fn a_stub_for_a_result_with_no_line_at_all_has_no_excerpt() {
+        let content = "\n   \n";
+        let args = json!({"command": "echo"});
+        let events = vec![
+            user(0, "run it"),
+            call(1, "c1", "bash", args.clone()),
+            result(2, "c1", content),
+            call(3, "c2", "bash", json!({"command": "ls"})),
+            result(4, "c2", "ok"),
+            evicted(5, 2),
+        ];
+        let p = project(&events).unwrap();
+        assert_eq!(
+            results(&p)[0].1,
+            format!(
+                "[result 2 · bash {} · {} lines · dropped from context; recall 2 to bring it back]",
+                short_args(&args),
+                content.lines().count(),
+            )
+        );
+    }
+
+    /// T4 (issue #75): a result behind the eviction boundary and inside a
+    /// truncation range is stubbed, never also truncated: the stub branch
+    /// wins, so the marker of the other rule never appears beside it.
+    #[test]
+    fn a_stub_beats_truncation_on_the_same_result() {
+        let long = "x".repeat(1000);
+        let events = vec![
+            user(0, "go"),
+            call(1, "c1", "bash", json!({"command": "cat big.txt"})),
+            result(2, "c1", &long),
+            call(3, "c2", "bash", json!({"command": "ls"})),
+            result(4, "c2", "ok"),
+            evicted(5, 4),
+            truncation(6, 0, 5, 100),
+        ];
+        let p = project(&events).unwrap();
+        let stubbed = &results(&p)[0].1;
+        assert!(is_stub(stubbed, "bash"), "{stubbed}");
+        assert!(!stubbed.contains("omitted by compaction"), "{stubbed}");
+        assert!(stubbed.len() < 200, "{} bytes: {stubbed}", stubbed.len());
+        // The other result is in the truncation range and stays whole:
+        // both rules were seen, and only one touched a result.
+        assert_eq!(results(&p)[1].1, "ok");
     }
 
     /// The fixture of T1/T2/T3: a bash call whose `command` is several
@@ -1631,7 +2405,11 @@ mod tests {
         );
         // And it is stubbed on the other side of the same fixture, so the
         // comparison above is not vacuous.
-        assert!(results(&p)[0].1.starts_with("[result of bash"));
+        assert!(
+            is_stub(&results(&p)[0].1, "bash"),
+            "c1 is stubbed on the other side of the same fixture: {}",
+            results(&p)[0].1
+        );
     }
 
     #[test]
@@ -1665,8 +2443,9 @@ mod tests {
         ];
         let p = project(&events).unwrap();
         assert!(
-            results(&p)[0].1.starts_with("[result of grep"),
-            "c1 is behind the boundary"
+            is_stub(&results(&p)[0].1, "grep"),
+            "c1 is behind the boundary: {}",
+            results(&p)[0].1
         );
         assert_eq!(
             serde_json::to_string(&call_args(&p)[0]).unwrap(),

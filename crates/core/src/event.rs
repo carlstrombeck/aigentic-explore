@@ -56,16 +56,115 @@ pub enum EventKind {
     ContextEvicted,
     /// The eviction sweep cannot fit the turn (issue #35): the
     /// projection at the deepest legal boundary — the floor, the newest
-    /// calls — is still over `context_ceiling_tokens`, so no sweep the
+    /// calls — is still over the working-set target, so no sweep the
     /// turn could make would bring it down, and the thread is the one to
     /// hand to a fresh one. Appended once per turn, in the turn it
     /// happened in, and never projected into model context.
     ContextSaturated,
+    /// A closed turn's used results are stubbed in a batch (issue #76):
+    /// every successful tool result of every turn closed at or before
+    /// `through_seq` is stubbed in projection, with the handle to recall
+    /// it. Appended at a turn's first loop iteration, so the history
+    /// changes once at a turn's start and the cached prefix breaks once
+    /// per batch rather than once per message. The originals stay in the
+    /// log.
+    ResultsStubbed,
     /// A provider retry (issue #31), appended live as the adapter starts
     /// waiting, so a turn that hangs on a dead endpoint reads as retries
     /// and not as a slow model. Author `system`; the payload carries the
     /// attempt, the total, why, and the wait in ms.
     ProviderRetried,
+    /// The build runner began a run (layer 2, issue #53). Author
+    /// `agent:runner`; the payload names the issue, the workflow and its
+    /// version and content hash, and the provisional issue budget. It is
+    /// the first lead-thread event of a run, so a replay that finds none
+    /// is not looking at a run at all.
+    RunStarted,
+    /// The runner entered a step (layer 2, issue #53). Author
+    /// `agent:runner`; the payload names the step, role, profile, the
+    /// child thread and the attempt. Written before the child is
+    /// awaited, so a replay re-awaits instead of starting the step
+    /// twice. Every re-entry (send-back, continue, fresh thread) is a
+    /// new event with `attempt + 1`.
+    StepStarted,
+    /// A step's child turn ended (layer 2, issue #53). Author
+    /// `agent:runner`; the payload carries the status, the end reason,
+    /// the cost and the child's `step_reported` event id. Written after
+    /// the child ended and before the checks run.
+    StepFinished,
+    /// The runner ran a step's exact checks (layer 2, issue #53). Author
+    /// `agent:runner`; the payload carries each check's result. A `fail`
+    /// blocks the push, so a replay after this event decides send-back
+    /// or push from it rather than re-running the checks.
+    ChecksRun,
+    /// The runner took a route at a branch point (layer 2, issue #53).
+    /// Author `agent:runner`; the payload carries the branch, what was
+    /// proposed, the preconditions with their results, what was taken
+    /// and why a fallback was needed. Replay follows the logged decision:
+    /// preconditions read git state that a crash can change.
+    RouteTaken,
+    /// The runner asked a human at a checkpoint (layer 2, issue #53).
+    /// Author `agent:runner`; the payload carries the gate, what was
+    /// shown and the options. Written before the wait, so a replay waits
+    /// again instead of acting on an answer nobody gave.
+    CheckpointAsked,
+    /// A human answered a checkpoint (layer 2, issue #53). The author is
+    /// who answered; the payload carries the answer, an amendment and
+    /// the reveal marks. Written before the runner acts on it.
+    CheckpointAnswered,
+    /// The runner crossed a budget level (layer 2, issue #53). Author
+    /// `agent:runner`; the payload carries the scope, what was spent and
+    /// the limit, so a restart re-warns only at levels not yet reached.
+    /// Not a decision: replay sees the move of the event before it.
+    BudgetWarned,
+    /// The run's budget was raised at the budget gate (layer 2). Author
+    /// `agent:runner`; the payload carries the new figure in USD, which
+    /// is the one the run compares its cost against from here on. Written
+    /// when a person answers the gate with a raise, so a replay continues
+    /// past the park instead of asking again.
+    BudgetRaised,
+    /// The runner pushed the run's commits and installed the binary
+    /// (layer 2, issue #53). Author `agent:runner`; the payload carries
+    /// the commits, the remote ref before and after and the installed
+    /// binary's commit. Appended after push and install, which are
+    /// idempotent, so a replay resumes after the push.
+    Pushed,
+    /// The run ended (layer 2, issue #53). Author `agent:runner`; the
+    /// payload carries the outcome, the cost and the release impact.
+    /// The last lead-thread event of a run.
+    RunFinished,
+    /// A turn of the run ended in an error and the run was stopped
+    /// (layer 2). Author `agent:runner`; the payload carries the error's
+    /// text and the run's cost when it was noticed. Not final: the run
+    /// is unfinished, so the next `/build` resumes it, and a later
+    /// `step_started` or `run_finished` supersedes the event.
+    RunErrored,
+    /// A child step reported through `finish_step` (layer 2, issue #53).
+    /// Lives in the child thread, not the lead one; the payload is the
+    /// section 4 field table, every field optional because each step
+    /// fills a subset. Written by the tool — a later ticket's — and read
+    /// by the runner's `step_finished`.
+    StepReported,
+    /// The harness proposes a decision of some kind (issue #74). Author:
+    /// the agent or system that proposed it. Appended **before** the turn
+    /// parks (the `CheckpointAsked` rule), so a replay or resume finds the
+    /// open proposal rather than acting on an answer nobody gave.
+    DecisionProposed,
+    /// The answer to a `DecisionProposed` (issue #74), with
+    /// `parent_event = Some(<the proposal's event id>)`. Author: whoever
+    /// answered — a user for a person's answer, `Author::System` for a
+    /// proposal the system closes (`withdrawn`).
+    DecisionAnswered,
+    /// A background job's thread ended. Author `system`; appended to the
+    /// **front** thread, and its payload names the job's thread and how it
+    /// ended. The job's own work is in that thread's log; this event is the
+    /// front thread's record that the job returned.
+    JobFinished,
+    /// The utility model rewrote a brief's current state. Author `system`;
+    /// the payload carries the cursor it read through, the brief's hash
+    /// before and after, and the model and usage of the call. Never
+    /// projected into model context.
+    BriefRefreshed,
 }
 
 /// One line of a thread's append-only log. The log is the source of truth;
@@ -80,7 +179,8 @@ pub struct Event {
     pub author: Author,
     /// Kind-specific JSON.
     pub payload: serde_json::Value,
-    /// Links a `tool_result` to its `assistant_message`.
+    /// Links a `tool_result` to its `assistant_message`, and a
+    /// `decision_answered` to its `decision_proposed` (issue #74).
     pub parent_event: Option<Ulid>,
     /// Serialised as RFC 3339.
     #[serde(with = "time::serde::rfc3339")]
@@ -191,9 +291,141 @@ mod tests {
                 steve_again(),
                 json!({"project": "vendela", "root": "/srv/vendela", "created_by": {"kind": "user", "id": "steve"}}),
             ),
+            // The build runner's kinds (issue #53), in the order a run
+            // appends them.
+            event(
+                12,
+                EventKind::RunStarted,
+                runner(),
+                json!({"issue": 53, "workflow": "build", "version": 1, "content_hash": "abc", "budget_usd": 10.0}),
+            ),
+            event(
+                13,
+                EventKind::StepStarted,
+                runner(),
+                json!({"step": "plan", "role": "planner", "profile": "kimi",
+                       "child_thread": child().to_string(), "attempt": 1, "budget_usd": 3.0}),
+            ),
+            event(
+                14,
+                EventKind::StepFinished,
+                runner(),
+                json!({"step": "plan", "status": "done", "end_reason": "done",
+                       "cost_usd": 0.4, "reported_event": child().to_string()}),
+            ),
+            event(
+                15,
+                EventKind::ChecksRun,
+                runner(),
+                json!({"step": "plan", "checks": [{"id": "E1", "result": "pass", "detail": null}]}),
+            ),
+            event(
+                16,
+                EventKind::RouteTaken,
+                runner(),
+                json!({"branch": "plan_gate", "proposed": "implement", "taken": "implement",
+                       "preconditions": [], "fallback_reason": null}),
+            ),
+            event(
+                17,
+                EventKind::CheckpointAsked,
+                runner(),
+                json!({"gate": "plan_gate_blind", "shown": ["plan"], "options": ["go", "amend", "stop"]}),
+            ),
+            event(
+                18,
+                EventKind::CheckpointAnswered,
+                steve_again(),
+                json!({"answer": "go", "amendment": null, "marks": []}),
+            ),
+            event(
+                19,
+                EventKind::BudgetWarned,
+                runner(),
+                json!({"scope": "issue", "spent_usd": 8.0, "limit_usd": 10.0}),
+            ),
+            event(
+                20,
+                EventKind::Pushed,
+                runner(),
+                json!({"commits": [{"sha": "abc123", "subject": "core: add kinds"}],
+                       "ref_before": "abc000", "ref_after": "abc123", "installed": "abc123"}),
+            ),
+            event(
+                21,
+                EventKind::RunFinished,
+                runner(),
+                json!({"outcome": "closed", "cost_usd": 0.9, "release_impact": "none"}),
+            ),
+            event(
+                22,
+                EventKind::StepReported,
+                agent_again(),
+                json!({"status": "done", "body": "## Plan", "commits": []}),
+            ),
+            // Decisions (issue #74): the harness proposes, a person
+            // answers, and the answer names the proposal.
+            event(
+                23,
+                EventKind::DecisionProposed,
+                Author::System,
+                json!({"kind": "project", "proposal": "switch to getscale/site",
+                       "target": "getscale/site", "reason": "the brief names it",
+                       "stage": "ask"}),
+            ),
+            event(
+                24,
+                EventKind::DecisionAnswered,
+                steve_again(),
+                json!({"answer": "yes"}),
+            ),
         ];
         events[2].parent_event = Some(events[1].id);
         events[9].parent_event = Some(events[8].id);
+        events[24].parent_event = Some(events[23].id);
+        // A closed-turn batch (issue #76) sits at the end so the indices
+        // the wire-shape test reads stay put.
+        events.push(event(
+            25,
+            EventKind::ResultsStubbed,
+            Author::System,
+            json!({"through_seq": 3}),
+        ));
+        // A run stopped by an error sits after every kind the wire-shape
+        // test reads by position.
+        events.push(event(
+            26,
+            EventKind::RunErrored,
+            runner(),
+            json!({"reason": "turn: provider_error: HTTP 400", "cost_usd": 0.4}),
+        ));
+        // A job's finish sits after every kind the wire-shape test reads by
+        // position.
+        events.push(event(
+            27,
+            EventKind::JobFinished,
+            Author::System,
+            json!({
+                "job_thread": Ulid::from_parts(1_700_000_000_000, 9).to_string(),
+                "outcome": "finished",
+                "summary": "read the twelve files and filed three tickets",
+                "cost_usd": 0.42,
+            }),
+        ));
+        // A brief's refresh sits after every kind the wire-shape test reads
+        // by position.
+        events.push(event(
+            28,
+            EventKind::BriefRefreshed,
+            Author::System,
+            json!({
+                "through_seq": 27,
+                "old_hash": "0a1b",
+                "new_hash": "2c3d",
+                "model": "m",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }),
+        ));
         events
     }
 
@@ -205,6 +437,33 @@ mod tests {
         Author::Agent(AgentId("worker".into()))
     }
 
+    /// The build runner (issue #53) is an agent like any other.
+    fn runner() -> Author {
+        Author::Agent(AgentId("runner".into()))
+    }
+
+    fn child() -> Ulid {
+        Ulid::from_parts(1_700_000_000_000, 7)
+    }
+
+    /// The wire-name rule: `CamelCase` variant names become `snake_case`,
+    /// so the expected name is derived from the variant and not written
+    /// out by hand next to it.
+    fn snake_case(name: &str) -> String {
+        let mut out = String::new();
+        for (i, c) in name.char_indices() {
+            if c.is_uppercase() {
+                if i != 0 {
+                    out.push('_');
+                }
+                out.extend(c.to_lowercase());
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     #[test]
     fn every_kind_round_trips_as_jsonl() {
         for event in one_of_each_kind() {
@@ -213,6 +472,143 @@ mod tests {
             let back: Event = serde_json::from_str(&line).unwrap();
             assert_eq!(back, event, "round trip failed for {line}");
         }
+    }
+
+    /// The runner's kinds round-trip and land on the wire under the
+    /// enum's snake_case rule — the name comes from the variant, not
+    /// from a hand-written pair.
+    #[test]
+    fn the_runner_kinds_round_trip_under_the_snake_case_rule() {
+        let kinds = [
+            EventKind::RunStarted,
+            EventKind::StepStarted,
+            EventKind::StepFinished,
+            EventKind::ChecksRun,
+            EventKind::RouteTaken,
+            EventKind::CheckpointAsked,
+            EventKind::CheckpointAnswered,
+            EventKind::BudgetWarned,
+            EventKind::Pushed,
+            EventKind::RunFinished,
+            EventKind::RunErrored,
+            EventKind::StepReported,
+        ];
+        let mut names: Vec<String> = Vec::new();
+        for kind in kinds {
+            let wire = serde_json::to_value(kind).unwrap();
+            let expected = snake_case(&format!("{kind:?}"));
+            assert_eq!(wire, serde_json::Value::String(expected.clone()));
+            // And the kind reads back the same way in a whole event.
+            let event = event(
+                0,
+                kind,
+                runner(),
+                json!({"any": "payload survives whatever the kind"}),
+            );
+            let line = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&line).unwrap(), event);
+            names.push(expected);
+        }
+        assert_eq!(names.len(), 12);
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "wire names are distinct");
+    }
+
+    /// T1 (issue #74): the two decision kinds round-trip and land on the
+    /// wire under the enum's snake_case rule, derived the same way as the
+    /// runner kinds above — never a hand-written name pair.
+    #[test]
+    fn the_decision_kinds_round_trip_under_the_snake_case_rule() {
+        let kinds = [EventKind::DecisionProposed, EventKind::DecisionAnswered];
+        let mut names: Vec<String> = Vec::new();
+        for kind in kinds {
+            let wire = serde_json::to_value(kind).unwrap();
+            let expected = snake_case(&format!("{kind:?}"));
+            assert_eq!(wire, serde_json::Value::String(expected.clone()));
+            let event = event(
+                0,
+                kind,
+                steve_again(),
+                json!({"any": "payload survives whatever the kind"}),
+            );
+            let line = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&line).unwrap(), event);
+            names.push(expected);
+        }
+        assert_eq!(names, vec!["decision_proposed", "decision_answered"]);
+    }
+
+    /// T2 (issue #76): the batch kind round-trips as a whole event and
+    /// lands on the wire under the enum's snake_case rule, derived from
+    /// the variant, never a hand-written pair.
+    #[test]
+    fn the_results_stubbed_kind_round_trips_under_the_snake_case_rule() {
+        let kind = EventKind::ResultsStubbed;
+        let wire = serde_json::to_value(kind).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::Value::String(snake_case(&format!("{kind:?}")))
+        );
+        let event = event(0, kind, Author::System, json!({"through_seq": 3}));
+        let line = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&line).unwrap(), event);
+    }
+
+    /// A job's finish lands on the wire under the enum's snake_case rule,
+    /// derived from the variant, and rides one JSONL line like every other
+    /// kind.
+    #[test]
+    fn the_job_finished_kind_round_trips_under_the_snake_case_rule() {
+        let kind = EventKind::JobFinished;
+        let wire = serde_json::to_value(kind).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::Value::String(snake_case(&format!("{kind:?}")))
+        );
+        let event = event(
+            0,
+            kind,
+            Author::System,
+            json!({
+                "job_thread": child().to_string(),
+                "outcome": "finished",
+                "summary": "one screen",
+                "cost_usd": 0.42,
+            }),
+        );
+        let line = serde_json::to_string(&event).unwrap();
+        assert!(!line.contains('\n'), "an event must fit on one line");
+        assert_eq!(serde_json::from_str::<Event>(&line).unwrap(), event);
+    }
+
+    /// A brief's refresh lands on the wire as `brief_refreshed`, derived
+    /// from the variant, and rides one JSONL line like every other kind.
+    #[test]
+    fn the_brief_refreshed_kind_round_trips_under_the_snake_case_rule() {
+        let kind = EventKind::BriefRefreshed;
+        let wire = serde_json::to_value(kind).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::Value::String(snake_case(&format!("{kind:?}")))
+        );
+        assert_eq!(wire, "brief_refreshed");
+        let event = event(
+            0,
+            kind,
+            Author::System,
+            json!({
+                "through_seq": 12,
+                "old_hash": "0a1b",
+                "new_hash": "2c3d",
+                "model": "m",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }),
+        );
+        let line = serde_json::to_string(&event).unwrap();
+        assert!(!line.contains('\n'), "an event must fit on one line");
+        assert_eq!(serde_json::from_str::<Event>(&line).unwrap(), event);
     }
 
     #[test]

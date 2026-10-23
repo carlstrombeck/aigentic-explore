@@ -12,14 +12,19 @@ pub mod composer;
 pub mod copy;
 pub mod diff;
 pub mod engine;
+pub mod jobs;
 pub mod keymap;
 pub mod look;
 pub mod markdown;
 pub mod menu;
 pub mod pager;
+#[cfg(test)]
+pub(crate) mod rig;
 pub mod status;
 pub mod tui;
+pub(crate) mod watch;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -28,15 +33,16 @@ use crossterm::event::{Event, EventStream, KeyCode as K, KeyEventKind};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::app::cells::{Cell, ToolState, is_read_tool};
+use crate::app::cells::{Cell, ExploredRow, ToolState, is_read_tool};
 use crate::app::completion::{FileIndex, Popup};
 use crate::app::composer::Composer;
 use crate::app::engine::{ClientRepl, MenuKey, Printer, TurnStats};
-use crate::app::keymap::{Action, KeyContext, action_for};
+use crate::app::keymap::{Action, KeyContext, action_for, while_raising};
+use crate::app::look::View;
 use crate::app::menu::{Menu, Pick};
 use crate::app::pager::Pager;
 use crate::app::status::Status;
-use crate::app::tui::{Pane, Shell, needed_rows, wrap_line};
+use crate::app::tui::{Pane, Shell, held_rows, needed_rows, wrap_line};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -82,6 +88,28 @@ impl Printer for Stdout {
     fn line(&mut self, text: &str) {
         println!("{text}");
     }
+
+    fn prompt(&mut self, menu: &Menu) {
+        // No keys out here, so the prompt is printed once: the two
+        // prompts that have no earlier line of their own — a followed
+        // run's checkpoint (issue #68) and a switch proposal (#82).
+        // A permission or a question already spoke where it was asked
+        // for.
+        if prints_in_plain(menu.kind) {
+            for line in menu.plain() {
+                println!("{line}");
+            }
+        }
+    }
+}
+
+/// Which prompts a pipe prints (issues #82, #108).
+///
+/// The `/jobs` picker is not one of them: its table has
+/// already gone to `out` as plain lines, and a pipe reads no keys.
+fn prints_in_plain(kind: crate::app::menu::Kind) -> bool {
+    use crate::app::menu::Kind;
+    matches!(kind, Kind::Checkpoint | Kind::Switch | Kind::NewThread)
 }
 
 /// How many cells the pager keeps.
@@ -101,7 +129,7 @@ struct ShellOut {
     /// Committed lines the next draw flushes.
     pending: Vec<Line<'static>>,
     /// Reads not yet committed as one `Explored`.
-    explored: Vec<String>,
+    explored: Vec<ExploredRow>,
     /// The running tool, if any.
     running: Option<Cell>,
     /// The assistant's text since its last newline.
@@ -113,6 +141,16 @@ struct ShellOut {
     /// The kind of the last committed block, for spacing and the reply
     /// marker.
     last: Option<look::Group>,
+    /// The transcript view committed cells are rendered under (issue
+    /// #115). A switch applies from then on; scrollback is never
+    /// redrawn, the viewport is (it is not scrollback).
+    view: View,
+    /// Whether a step header is open, so the cells under it indent. Set
+    /// on a committed `Step`, cleared by the next header or a `Done`.
+    in_step: bool,
+    /// The prompt bodies already written whole to the transcript, by
+    /// prompt id and body, so a redraw of the same gate writes none.
+    in_full: HashSet<(String, String)>,
 }
 
 impl ShellOut {
@@ -129,7 +167,28 @@ impl ShellOut {
             fenced: false,
             page: None,
             last: None,
+            view: View::default(),
+            in_step: false,
+            in_full: HashSet::new(),
         }
+    }
+
+    /// Whether the transcript holds `menu`'s whole body: a body longer
+    /// than [`BODY_ROWS`] at this width is committed once per prompt,
+    /// title first, so the person can read in the scrollback what the
+    /// live block caps.
+    fn body_in_full(&mut self, id: Option<String>, menu: &Menu) -> bool {
+        if menu.body.is_empty()
+            || hang(&menu.body, 3, self.width, Style::default()).len() <= BODY_ROWS
+        {
+            return false;
+        }
+        let key = (id.unwrap_or_default(), menu.body.clone());
+        if !self.in_full.contains(&key) {
+            self.commit(Cell::Note(format!("{}\n{}", menu.title, menu.body)));
+            self.in_full.insert(key);
+        }
+        true
     }
 
     fn commit(&mut self, cell: Cell) {
@@ -137,18 +196,38 @@ impl ShellOut {
         // the order the work happened in.
         self.flush_explored();
         let width = self.width;
-        let group = look::group(&cell);
-        // A blank line between blocks of different kinds.
-        if self.last.is_some_and(|last| last != group) {
-            self.pending.push(Line::raw(""));
-        }
         let first = self.last != Some(look::Group::Assistant);
-        self.pending.extend(look::render(&cell, first, width));
-        self.last = Some(group);
-        self.transcript.push(cell);
+        let rendered = look::render(&cell, first, self.view, self.in_step, width);
+        // The cell is stored whatever the view draws for it: the pager
+        // reads `full()`, which always holds the detail (design 3).
+        self.transcript.push(cell.clone());
         if self.transcript.len() > TRANSCRIPT_KEEP {
             self.transcript.remove(0);
         }
+        // A step header opens the group (indented), a `Done` closes it.
+        if matches!(cell, Cell::Step { .. }) {
+            self.in_step = true;
+        } else if matches!(cell, Cell::Done(_)) {
+            self.in_step = false;
+        }
+        // A cell the current view draws nothing for stops here: no
+        // blank-line separator, no `last` update, no `pending` push
+        // (design 8), so a `Normal` turn gains no extra blank rows.
+        if rendered.is_empty() {
+            return;
+        }
+        let group = look::group(&cell);
+        // A blank line before a step header, and between blocks of
+        // different kinds; never one between a header and its items.
+        if matches!(cell, Cell::Step { .. }) {
+            if self.last.is_some() {
+                self.pending.push(Line::raw(""));
+            }
+        } else if self.last.is_some_and(|last| last != group) {
+            self.pending.push(Line::raw(""));
+        }
+        self.pending.extend(rendered);
+        self.last = Some(group);
     }
 
     /// Whether `text` draws nothing (issue #43): a text block that is
@@ -184,6 +263,8 @@ impl ShellOut {
             lines.extend(look::render(
                 &Cell::Explored(self.explored.clone()),
                 false,
+                self.view,
+                self.in_step,
                 width,
             ));
         }
@@ -196,7 +277,7 @@ impl ShellOut {
             if first && self.last.is_some() && lines.is_empty() {
                 lines.push(Line::raw(""));
             }
-            lines.extend(tail_rows(&tail, first, width));
+            lines.extend(tail_rows(&tail, first, self.view, self.in_step, width));
         }
         if phase == LivePhase::Writing {
             while lines.len() < TAIL_ROWS {
@@ -212,8 +293,14 @@ impl ShellOut {
 /// are the scrollback's once its line completes, so keeping them in
 /// the pane would only hold its height up and, with the line gone,
 /// pad the difference with blanks.
-fn tail_rows(cell: &Cell, first: bool, width: usize) -> Vec<Line<'static>> {
-    let rendered = look::render(cell, first, width);
+fn tail_rows(
+    cell: &Cell,
+    first: bool,
+    view: View,
+    indent: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let rendered = look::render(cell, first, view, indent, width);
     let skip = rendered.len().saturating_sub(TAIL_ROWS);
     rendered.into_iter().skip(skip).collect()
 }
@@ -244,6 +331,29 @@ impl Printer for ShellOut {
         // The shell owns the terminal, so it is the one place the
         // transport can be chosen (issue #41).
         crate::app::copy::set_clipboard(text)
+    }
+
+    fn thread_changed(&mut self) {
+        // `/new` (issue #89): the live state belonged to the thread
+        // left behind, and it must never draw in the new thread's pane.
+        // The old cells already committed stay in the pager, with the
+        // `new front thread …` line drawn by `/new` between them and
+        // the next thread's.
+        self.running = None;
+        self.tail.clear();
+        self.explored.clear();
+        self.pending.clear();
+        self.fenced = false;
+        self.last = None;
+        self.in_step = false;
+    }
+
+    fn view(&self) -> View {
+        self.view
+    }
+
+    fn set_view(&mut self, view: View) {
+        self.view = view;
     }
 
     fn tail(&mut self, text: &str) {
@@ -288,13 +398,16 @@ impl Printer for ShellOut {
                     full: _,
                     state,
                     output,
+                    detail,
                 },
                 true,
             ) => {
                 self.running = None;
                 if is_read_tool(name) && *state == ToolState::Ok {
-                    self.explored
-                        .push(look::explored_entry(name, summary, output));
+                    self.explored.push(ExploredRow {
+                        line: look::explored_entry(name, summary, output),
+                        detail: detail.clone(),
+                    });
                 } else {
                     self.flush_explored();
                     self.commit(cell);
@@ -337,13 +450,16 @@ fn popup_lines(popup: &Popup) -> Vec<Line<'static>> {
 /// about in full (wrapped, capped), and the rows to pick from with the
 /// selected one marked. Already wrapped; the pane draws them as they
 /// are.
-fn block_lines(menu: &Menu, width: usize) -> Vec<Line<'static>> {
+fn block_lines(menu: &Menu, width: usize, full_above: bool) -> Vec<Line<'static>> {
     let head = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut lines = vec![Line::from(Span::styled(format!(" {}", menu.title), head))];
-    lines.extend(body_lines(menu, width));
+    if let Some(lead) = &menu.lead {
+        lines.extend(hang(lead, 3, width, dim));
+    }
+    lines.extend(body_lines(menu, width, full_above));
     let inner = width.saturating_sub(6).max(1);
     for (i, row) in menu.rows.iter().enumerate() {
         let selected = i == menu.selected;
@@ -410,13 +526,14 @@ fn hang(text: &str, indent: usize, width: usize, style: Style) -> Vec<Line<'stat
         .collect()
 }
 
-/// Rows the body may take before it is capped head and tail, as tool
-/// output is.
+/// Rows the body may take in the live block before it is capped head
+/// and tail; a longer body is also written whole to the transcript.
 const BODY_ROWS: usize = 8;
 
 /// The body wrapped and hanging; a very long one keeps its head and
-/// tail with a note of what fell out.
-fn body_lines(menu: &Menu, width: usize) -> Vec<Line<'static>> {
+/// tail with a note of what fell out, which says the whole body is in
+/// the scrollback when `full_above`.
+fn body_lines(menu: &Menu, width: usize, full_above: bool) -> Vec<Line<'static>> {
     if menu.body.is_empty() {
         return Vec::new();
     }
@@ -426,8 +543,9 @@ fn body_lines(menu: &Menu, width: usize) -> Vec<Line<'static>> {
         let kept = BODY_ROWS - 3;
         let omitted = rows.len() - kept - 2;
         let mut capped: Vec<_> = rows.drain(..kept).collect();
+        let above = if full_above { ", in full above" } else { "" };
         capped.push(Line::from(Span::styled(
-            format!("   … {omitted} rows"),
+            format!("   … {omitted} rows{above}"),
             dim,
         )));
         capped.extend(rows.into_iter().skip(omitted));
@@ -509,14 +627,36 @@ fn next_phase(prev: LivePhase, state: &ThreadState, turn: Option<&TurnStats>) ->
 /// [`TAIL_ROWS`] rows while writing, and the compact task list is
 /// added as #21 draws it (at most three rows). Each row is one line:
 /// the full command is the pager's to show.
+#[cfg(test)]
 fn live_block(
     phase: LivePhase,
     running: Option<&Cell>,
     tasks: &[aigentic_runtime::harness_tools::Task],
     width: usize,
 ) -> Vec<Line<'static>> {
+    // The pure tests build it with no dev row: `Normal`, no step open.
+    live_block_in(phase, running, tasks, width, View::Normal, false)
+}
+
+/// The live area's rows, under a view and a possibly open step
+/// (issue #115): the same rows, with the running row indented while a
+/// step is open.
+fn live_block_in(
+    phase: LivePhase,
+    running: Option<&Cell>,
+    tasks: &[aigentic_runtime::harness_tools::Task],
+    width: usize,
+    view: View,
+    in_step: bool,
+) -> Vec<Line<'static>> {
     let one = |l: Line<'static>| -> Line<'static> {
         wrap_line(&l, width).into_iter().next().unwrap_or(l)
+    };
+    let row = |name: &str, summary: &str| {
+        one(look::running(name, summary, view, in_step, width)
+            .into_iter()
+            .next()
+            .unwrap_or_default())
     };
     let mut live: Vec<Line<'static>> = Vec::new();
     match phase {
@@ -525,19 +665,13 @@ fn live_block(
         // between its start and its cell.
         LivePhase::Tool => {
             live.push(match running {
-                Some(Cell::Tool { name, summary, .. }) => one(look::running(name, summary, width)
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default()),
+                Some(Cell::Tool { name, summary, .. }) => row(name, summary),
                 _ => Line::raw(""),
             });
         }
         LivePhase::Writing | LivePhase::Thinking => {
             if let Some(Cell::Tool { name, summary, .. }) = running {
-                live.push(one(look::running(name, summary, width)
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default()));
+                live.push(row(name, summary));
             }
         }
     }
@@ -580,6 +714,36 @@ const PROMPT_GRACE: Duration = Duration::from_millis(500);
 /// A second press of Ctrl-C or Esc within this long completes it.
 const ARM_WINDOW: Duration = Duration::from_secs(1);
 
+/// Since when the drawn prompt has been up: kept while the same prompt
+/// stays, restarted when another takes its place (#68's review). The
+/// answering keys wait out the grace from this instant, so a key in
+/// flight from answering one prompt cannot answer the next.
+fn next_grace(
+    drawn: Option<String>,
+    was: Option<(String, Instant)>,
+    now: Instant,
+) -> Option<(String, Instant)> {
+    match (drawn, was) {
+        (None, _) => None,
+        (Some(id), Some((prev, at))) if prev == id => Some((prev, at)),
+        (Some(id), _) => Some((id, now)),
+    }
+}
+/// The composer's hint while a prompt's text input is open: what the
+/// text means, per kind of prompt (issue #82). A switch proposal's text
+/// is where the work belongs; anything else is a deny's reason.
+fn text_hint(kind: Option<crate::app::menu::Kind>) -> &'static str {
+    use crate::app::menu::Kind;
+    match kind {
+        Some(Kind::Question) => "answer: Enter sends · Esc cancels",
+        Some(Kind::Switch) => "where it belongs: Enter sends · Esc cancels",
+        // The `/new` question (issue #108) has no text to type and no
+        // reason to deny: Enter takes the row, Esc answers `No`.
+        Some(Kind::NewThread) => "Enter answers · Esc says no",
+        _ => "deny with a reason · Enter sends · Esc cancels",
+    }
+}
+
 async fn run_shell(
     mut engine: ClientRepl,
     mut notices: mpsc::Receiver<Notice>,
@@ -591,6 +755,8 @@ async fn run_shell(
     // The turn's phase, kept across ticks: the live area's height
     // changes at phase boundaries only (issue #43).
     let mut phase = LivePhase::Idle;
+    // The turn's high-water mark for the pane's height (issue #93).
+    let mut held: u16 = 0;
     // The file index for `@`, walked once off the loop.
     let mut files_task = Some(tokio::task::spawn_blocking(move || FileIndex::walk(&root)));
     let mut files: Option<FileIndex> = None;
@@ -622,9 +788,11 @@ async fn run_shell(
     // becomes the prompt's text input; the draft it held comes back
     // after.
     let mut prompt_draft: Option<String> = None;
+    // Esc at a raise: the draft the prefill displaced comes back once.
+    let mut raise_stash: Option<String> = None;
     // When the current prompt block first showed: single-key answers wait
     // PROMPT_GRACE so a key meant for the draft does not answer it.
-    let mut block_since: Option<Instant> = None;
+    let mut block_since: Option<(String, Instant)> = None;
 
     // A thread opened while it waits: the prompt is shown at once.
     let state = engine.state().clone();
@@ -634,6 +802,9 @@ async fn run_shell(
         // Everything the last step produced, then the pane. The window
         // may have been resized since the last pass.
         out.width = out.shell.width();
+        let full_above = engine
+            .menu()
+            .is_some_and(|m| out.body_in_full(engine.menu_id(), m));
         out.flush()?;
         let state = engine.state().clone();
         status.apply_state(&state);
@@ -644,6 +815,17 @@ async fn run_shell(
         }
         status.title = engine.title().map(str::to_owned);
         status.usage = engine.usage();
+        status.working = engine.working();
+        // Inside a watch the line is the watch's: its own segment, and
+        // the run's figures with the run's head off.
+        status.inside = engine.inside();
+        // Inside, the run part is the watched run's alone: the front
+        // thread's own followed segment must not leak into the watch.
+        status.run = if status.inside.is_some() {
+            engine.watch_figures().map(str::to_owned)
+        } else {
+            engine.run_segment().map(str::to_owned)
+        };
         // The turn line carries the clock while a turn runs.
         status.elapsed = None;
         let activity = engine.turn().map(|t| {
@@ -660,11 +842,7 @@ async fn run_shell(
         {
             armed = None;
         }
-        block_since = match (engine.menu(), block_since) {
-            (None, _) => None,
-            (Some(_), Some(t)) => Some(t),
-            (Some(_), None) => Some(Instant::now()),
-        };
+        block_since = next_grace(engine.menu_id(), block_since, Instant::now());
         // The prompt went away while its reason input was open: the
         // draft comes back (the reason is moot).
         if prompt_draft.is_some() && engine.menu().is_none() {
@@ -677,12 +855,18 @@ async fn run_shell(
         // two rows while writing. The one blank row the layout puts
         // above them stays one.
         phase = next_phase(phase, &state, engine.turn());
-        let mut block: Vec<Line<'static>> =
-            live_block(phase, out.running.as_ref(), engine.tasks(), out.width);
+        let mut block: Vec<Line<'static>> = live_block_in(
+            phase,
+            out.running.as_ref(),
+            engine.tasks(),
+            out.width,
+            out.view,
+            out.in_step,
+        );
         block.extend(
             engine
                 .menu()
-                .map(|m| block_lines(m, out.width))
+                .map(|m| block_lines(m, out.width, full_above))
                 .unwrap_or_default(),
         );
         if files.is_none()
@@ -718,13 +902,9 @@ async fn run_shell(
         };
         let popup_lines = popup.as_ref().map(popup_lines).unwrap_or_default();
         let hint = match (&armed, &state) {
-            _ if prompt_draft.is_some() => Some(
-                match engine.menu().map(|m| m.kind) {
-                    Some(crate::app::menu::Kind::Question) => "answer: Enter sends · Esc cancels",
-                    _ => "deny with a reason · Enter sends · Esc cancels",
-                }
-                .to_owned(),
-            ),
+            _ if prompt_draft.is_some() => {
+                Some(text_hint(engine.menu().map(|m| m.kind)).to_owned())
+            }
             (Some((Action::QuitArm, _)), _) => Some("Ctrl-C again to quit".to_owned()),
             (Some((Action::RecallArm, _)), _) => {
                 Some("Esc again to recall the last message".to_owned())
@@ -744,8 +924,12 @@ async fn run_shell(
             popup: &popup_lines,
             activity,
         };
-        out.shell.fit(needed_rows(&pane))?;
-        out.shell.draw(&pane)?;
+        // The pane holds its height through a turn (issue #93): it
+        // grows when it must and shrinks once, when the turn ends.
+        held = held_rows(held, needed_rows(&pane), engine.turn().is_some());
+        out.shell.frame(&pane, held)?;
+        out.shell
+            .set_title(&status.title(engine.gate(), engine.busy()))?;
         if let Some((title, text)) = out.page.take() {
             let lines = if title == "diff" {
                 diff::lines(&text)
@@ -832,13 +1016,26 @@ async fn run_shell(
                         // passed.
                         if engine.menu().is_some() {
                             let settled =
-                                block_since.is_some_and(|t| t.elapsed() >= PROMPT_GRACE);
+                                block_since.as_ref().is_some_and(|(_, t)| t.elapsed() >= PROMPT_GRACE);
                             match engine
                                 .menu_key(&key, composer.is_empty(), settled, &mut out)
                                 .await
                             {
                                 MenuKey::Passed => {}
-                                MenuKey::Used => continue,
+                                MenuKey::Used => {
+                                    // A raise pick puts its figure in the
+                                    // composer, and the draft it displaced
+                                    // comes back if the raise is withdrawn.
+                                    if let Some(figure) = engine.raise_draft() {
+                                        // Each pick holds only its own
+                                        // draft: one left from an earlier
+                                        // gate never comes back.
+                                        raise_stash =
+                                            (!composer.is_empty()).then(|| composer.text());
+                                        composer.set_text(&figure);
+                                    }
+                                    continue;
+                                }
                                 MenuKey::Text => {
                                     prompt_draft = Some(composer.text());
                                     composer.clear();
@@ -849,22 +1046,24 @@ async fn run_shell(
                         let ctx = KeyContext {
                             running: !matches!(engine.state(), ThreadState::Idle),
                             composer_empty: composer.is_empty(),
+                            following: engine.following(),
+                            inside: engine.inside().is_some(),
                         };
-                        let action = action_for(&key, ctx);
+                        let mut action = action_for(&key, ctx);
+                        // The raise is withdrawn only through the
+                        // `ClearDraft` arm below: Esc, Ctrl-U, or Ctrl-C
+                        // on a non-empty composer. Backspacing the figure
+                        // to retype it leaves the raise armed.
+                        if engine.raising() {
+                            action = while_raising(action, &key);
+                        }
                         // An armed key completes on its second press.
                         let was_armed = armed.take().map(|(a, _)| a);
                         match action {
                             Action::Submit => {
-                                if let Some(text) = composer.take() {
-                                    // The composer clears, so the message
-                                    // itself goes to the transcript here.
-                                    out.cell(Cell::User(text.clone()), true);
-                                    if !text.starts_with('/') {
-                                        last_sent =
-                                            Some(text.trim_start_matches('!').trim().to_owned());
-                                    }
-                                    engine.handle_line(&text, &mut out).await;
-                                }
+                                engine
+                                    .submit_draft(&mut composer, &mut last_sent, &mut out)
+                                    .await;
                             }
                             Action::Newline => composer.newline(),
                             Action::Insert(c) => composer.insert_char(c),
@@ -876,8 +1075,21 @@ async fn run_shell(
                             Action::Down => composer.down(),
                             Action::Home => composer.home(),
                             Action::End => composer.end(),
-                            Action::ClearDraft => composer.clear(),
+                            Action::ClearDraft => {
+                                composer.clear();
+                                if engine.raising() {
+                                    engine.cancel_raise(&mut out);
+                                    if let Some(draft) = raise_stash.take() {
+                                        composer.set_text(&draft);
+                                    }
+                                }
+                            }
                             Action::Interrupt => engine.interrupt(&mut out).await,
+                            // The first Ctrl-C or Esc while a run is
+                            // followed detaches from it; the second
+                            // behaves as it always did (issue #68).
+                            Action::DetachRun => engine.detach(&mut out),
+                            Action::Back => engine.back(&mut out).await,
                             Action::QuitArm => {
                                 if was_armed == Some(Action::QuitArm) {
                                     break;
@@ -919,7 +1131,10 @@ async fn run_shell(
                     out.flush()?;
                     break;
                 }
-                Some(n) => engine.render(n, &mut out),
+                Some(n) => {
+                    engine.render(n, &mut out);
+                    engine.settle(&mut out).await;
+                }
             },
             _ = tick.tick() => {}
         }
@@ -933,6 +1148,8 @@ async fn run_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::cells::CallLine;
+    use crate::app::look::View;
     use crate::app::menu::Menu;
     use aigentic_runtime::aigentic_core::{Author, RiskClass, ToolCall};
     use serde_json::json;
@@ -963,6 +1180,141 @@ mod tests {
             RiskClass::Exec,
             "class exec: anything else in a shell",
         )
+    }
+
+    /// T3/T6/T7 (issue #115): at the commit seam, a developer cell
+    /// draws a row under `Dev` and, under `Normal`, draws nothing and
+    /// leaves no blank-line separator behind — no `pending` push, no
+    /// `last` update, so a `Normal` turn gains no extra blank rows.
+    #[test]
+    fn a_developer_cell_leaves_no_separator_when_it_renders_nothing() {
+        use aigentic_runtime::aigentic_log::Usage;
+        let usage = Usage {
+            input_tokens: 41_200,
+            output_tokens: 812,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: None,
+            estimated: false,
+            profile: None,
+            model: Some("deepseek-v4.1-flash".into()),
+            effort: None,
+            latency_ms: None,
+            ttft_ms: None,
+            cost_usd: Some(0.0141),
+        };
+        for cell in [
+            Cell::Call(CallLine::from_usage(1, &usage, Some("deepseek-v4.1-flash"))),
+            Cell::Step {
+                index: 2,
+                total: 5,
+                text: "Read key code regions".into(),
+            },
+            Cell::System("retry 1/3 in 2.0s: overloaded".into()),
+        ] {
+            let label = format!("{cell:?}");
+            let mut dev = out_at(80);
+            dev.view = View::Dev;
+            dev.commit(cell.clone());
+            assert!(!dev.pending.is_empty(), "Dev draws {label}");
+            let mut normal = out_at(80);
+            normal.view = View::Normal;
+            normal.commit(cell.clone());
+            assert!(normal.pending.is_empty(), "Normal draws no {label}");
+            assert!(normal.last.is_none(), "and leaves no separator for {label}");
+        }
+    }
+
+    /// The plain REPL's printer leaves `view()` to the `Printer`
+    /// default, so it is the default that decides whether a pipe stays
+    /// on HEAD's rows (issue #115). Pin it: `Stdout` prints `Normal`.
+    #[test]
+    fn the_plain_stdout_printer_prints_the_normal_view() {
+        assert_eq!(
+            Stdout.view(),
+            View::Normal,
+            "the plain REPL must not draw the developer view's cells"
+        );
+    }
+
+    /// T4 (issue #115): the pager keeps the step headers. `full()` has
+    /// no view, so both views see them.
+    #[test]
+    fn the_pager_keeps_the_step_headers() {
+        let lines = text(&transcript_lines(
+            &[Cell::Step {
+                index: 2,
+                total: 5,
+                text: "Read key code regions".into(),
+            }],
+            &[],
+        ));
+        assert_eq!(lines, vec!["▸ 2/5 Read key code regions".to_owned()]);
+    }
+
+    /// T1 (issue #115): `/view` decides the cells committed from then on.
+    /// Scrollback is never redrawn: a cell committed under `Dev` keeps
+    /// its developer row, and one committed after the switch to
+    /// `Normal` adds none.
+    #[test]
+    fn switching_the_view_only_changes_cells_committed_after_it() {
+        use aigentic_runtime::aigentic_log::Usage;
+        let usage = Usage {
+            input_tokens: 41_200,
+            output_tokens: 812,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: None,
+            estimated: false,
+            profile: None,
+            model: Some("m".into()),
+            effort: None,
+            latency_ms: None,
+            ttft_ms: None,
+            cost_usd: Some(0.0141),
+        };
+        let mut out = out_at(80);
+        out.view = View::Dev;
+        out.commit(Cell::Call(CallLine::from_usage(1, &usage, Some("m"))));
+        let dev_rows = text(&out.pending);
+        assert!(
+            dev_rows.iter().any(|r| r.contains("◦ call 1")),
+            "the call committed under Dev draws its row: {dev_rows:#?}"
+        );
+        // The view changes; the already-committed cell stays as it was
+        // drawn, and the next call adds no developer row.
+        out.view = View::Normal;
+        let before = out.transcript.len();
+        out.pending.clear();
+        out.commit(Cell::Call(CallLine::from_usage(2, &usage, Some("m"))));
+        assert_eq!(out.transcript.len(), before + 1, "the cell is still stored");
+        let normal_rows = text(&out.pending);
+        assert!(
+            !normal_rows.iter().any(|r| r.contains("◦ call ")),
+            "the cell committed under Normal draws none: {normal_rows:#?}"
+        );
+    }
+
+    /// T6 (issue #89): `/new` tells the printer the thread changed, and
+    /// that clears the live state of the thread just left — the running
+    /// tool, the unfinished line, the folded reads, the fenced flag.
+    #[test]
+    fn thread_changed_clears_the_live_state_of_the_old_thread() {
+        let mut out = out_at(80);
+        out.running = Some(Cell::Note("a tool".into()));
+        out.tail = "half a sentence".into();
+        out.explored = vec![ExploredRow {
+            line: "a read".into(),
+            detail: None,
+        }];
+        out.pending = vec![Line::from("a pending line")];
+        out.fenced = true;
+        out.thread_changed();
+        assert!(out.running.is_none(), "the old thread's tool is dropped");
+        assert!(out.tail.is_empty(), "and its unfinished line");
+        assert!(out.explored.is_empty(), "and its folded reads");
+        assert!(out.pending.is_empty(), "and its unflushed lines");
+        assert!(!out.fenced, "and the fence it was inside");
     }
 
     /// The pager opens with the whole checklist — the live block shows
@@ -1014,6 +1366,7 @@ mod tests {
             full: None,
             state: ToolState::Running,
             output: String::new(),
+            detail: None,
         };
         // Idle and Thinking reserve nothing: no turn, no rows.
         assert!(live_block(LivePhase::Idle, None, &[], 80).is_empty());
@@ -1103,6 +1456,7 @@ mod tests {
             full: None,
             state: ToolState::Running,
             output: String::new(),
+            detail: None,
         };
         // What the pane's own height is: the live block's rows plus
         // the tail slot. The layout's one blank row above them and the
@@ -1119,6 +1473,8 @@ mod tests {
                         fenced: tail.fenced,
                     },
                     false,
+                    tail.view,
+                    tail.in_step,
                     tail.width,
                 )
                 .len()
@@ -1222,8 +1578,8 @@ mod tests {
             text: "one two three four five six seven".into(),
             fenced: false,
         };
-        let full = text(&look::render(&cell, false, 12));
-        let last = tail_rows(&cell, false, 12);
+        let full = text(&look::render(&cell, false, View::Normal, false, 12));
+        let last = tail_rows(&cell, false, View::Normal, false, 12);
         assert_eq!(text(&last), full[full.len() - 2..].to_vec());
         assert_eq!(last.len(), 2);
         assert!(
@@ -1233,7 +1589,7 @@ mod tests {
         );
         // The reply's first row marker is elision's business, not the
         // cap's: the cap still keeps two rows.
-        assert_eq!(tail_rows(&cell, true, 12).len(), 2);
+        assert_eq!(tail_rows(&cell, true, View::Normal, false, 12).len(), 2);
     }
 
     /// The pane's own rows: what the viewport draws above the composer,
@@ -1256,6 +1612,8 @@ mod tests {
                     fenced: false,
                 },
                 first,
+                View::Normal,
+                false,
                 width,
             ))
         };
@@ -1318,6 +1676,8 @@ mod tests {
         let note = text(&look::render(
             &Cell::Note("[title set]".into()),
             false,
+            View::Normal,
+            false,
             width,
         ));
         assert_eq!(
@@ -1347,6 +1707,8 @@ mod tests {
                 fenced: false,
             },
             true,
+            View::Normal,
+            false,
             out.width,
         );
         assert_eq!(out.pending, rendered, "the block draws as it renders");
@@ -1370,6 +1732,7 @@ mod tests {
             full: None,
             state,
             output: "ok".into(),
+            detail: None,
         };
         let blank = || Cell::Assistant {
             text: "\n\n".into(),
@@ -1416,6 +1779,7 @@ mod tests {
             full: Some(chain.to_owned()),
             state: ToolState::Ok,
             output: "test result: ok".into(),
+            detail: None,
         };
         let done = Cell::Done("read the plan".into());
         let reply = Cell::Assistant {
@@ -1462,7 +1826,7 @@ mod tests {
     #[test]
     fn the_approval_menu_renders_as_the_issue_draws_it() {
         let menu = approval("sed -n '/^## 4\\./,/^## 10\\./p' docs/PLAN-phase6.md");
-        let lines = text(&block_lines(&menu, 76));
+        let lines = text(&block_lines(&menu, 76, false));
         assert_eq!(
             lines,
             vec![
@@ -1480,7 +1844,7 @@ mod tests {
     #[test]
     fn the_body_wraps_and_a_very_long_one_is_capped() {
         let menu = approval("grep pattern crates/tui/src");
-        let lines = text(&block_lines(&menu, 40));
+        let lines = text(&block_lines(&menu, 40, false));
         assert_eq!(
             lines,
             vec![
@@ -1497,7 +1861,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let menu = approval(&command);
-        let lines = text(&block_lines(&menu, 40));
+        let lines = text(&block_lines(&menu, 40, false));
         assert_eq!(
             lines[..9],
             [
@@ -1514,6 +1878,56 @@ mod tests {
                 "   line12",
             ]
         );
+    }
+
+    fn numbered(n: usize) -> String {
+        (1..=n)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A gate waits on the person, so the rows the live block caps must
+    /// still be readable: the scrollback holds every one of them.
+    #[test]
+    fn a_long_body_is_written_whole_once_and_the_cap_points_at_it() {
+        let menu = approval(&numbered(25));
+        let mut out = out_at(40);
+        assert!(out.body_in_full(Some("chat:c1".into()), &menu));
+        assert_eq!(out.transcript.len(), 1, "one cell");
+        let committed = text(&out.pending);
+        for i in 1..=25 {
+            let row = format!("  line{i}");
+            assert!(committed.contains(&row), "{row} in {committed:?}");
+        }
+        let lines = text(&block_lines(&menu, 40, true));
+        assert_eq!(lines[6], "   … 18 rows, in full above");
+        assert_eq!(lines[7], "   line24");
+    }
+
+    #[test]
+    fn a_body_that_fits_writes_no_cell() {
+        let menu = approval(&numbered(8));
+        let mut out = out_at(40);
+        assert!(!out.body_in_full(Some("chat:c1".into()), &menu));
+        assert!(out.transcript.is_empty());
+        assert!(out.pending.is_empty());
+        assert!(
+            !text(&block_lines(&menu, 40, false))
+                .iter()
+                .any(|l| l.contains('…'))
+        );
+    }
+
+    #[test]
+    fn a_redraw_or_resize_of_the_same_gate_writes_no_second_cell() {
+        let menu = approval(&numbered(25));
+        let mut out = out_at(40);
+        assert!(out.body_in_full(Some("gate:g".into()), &menu));
+        assert!(out.body_in_full(Some("gate:g".into()), &menu));
+        out.width = 30;
+        assert!(out.body_in_full(Some("gate:g".into()), &menu));
+        assert_eq!(out.transcript.len(), 1);
     }
 
     /// A question with options on the same widget: Other last, the
@@ -1553,7 +1967,7 @@ mod tests {
             },
         ]);
         assert_eq!(
-            text(&block_lines(&menu, 60)),
+            text(&block_lines(&menu, 60, false)),
             vec![
                 " Which colour?",
                 " ❯ 1. Red  the warm one",
@@ -1565,7 +1979,7 @@ mod tests {
         menu.answer("colour: Red");
         menu.picked[1] = true;
         assert_eq!(
-            text(&block_lines(&menu, 60)),
+            text(&block_lines(&menu, 60, false)),
             vec![
                 " Which tests?",
                 " ❯ 1. [ ] unit",
@@ -1588,7 +2002,7 @@ mod tests {
             multi: false,
         }]);
         assert_eq!(
-            text(&block_lines(&menu, 40)),
+            text(&block_lines(&menu, 40, false)),
             vec![" which colour?", "   type the answer"]
         );
         let call = ToolCall {
@@ -1597,7 +2011,7 @@ mod tests {
             args: json!({"query": "phase 6"}),
         };
         let menu = Menu::permission(&call, RiskClass::Network, "mcp.docs: the plan says ask");
-        let lines = block_lines(&menu, 76);
+        let lines = block_lines(&menu, 76, false);
         let last = lines.last().unwrap();
         assert_eq!(
             last.spans
@@ -1610,5 +2024,243 @@ mod tests {
         assert!(menu.note.is_some());
         let menu = approval("rm -rf build");
         assert_eq!(menu.note, None, "the class reason adds nothing");
+    }
+
+    /// T12 (issue #68): a run cell is dim with `▸ ` on every line, run
+    /// cells sit together, and a blank line separates them from the
+    /// next group; the checkpoint prompt's block draws its title, body
+    /// and two rows.
+    #[test]
+    fn run_cells_are_dim_and_sit_together_and_the_prompt_draws_its_rows() {
+        let reply = Cell::Assistant {
+            text: "done".into(),
+            fenced: false,
+        };
+        let transcript = vec![
+            Cell::User("build 58".into()),
+            Cell::Run("run 01ABC for issue #58 (started)".into()),
+            Cell::Run("checks 1: 1/2 passed\n  check T1: failed — 0 passed".into()),
+            reply,
+        ];
+        let lines = transcript_lines(&transcript, &[]);
+        // The tail is the cell's own text, not a spelling repeated here.
+        let mut expected = vec![
+            "> build 58".to_owned(),
+            String::new(),
+            "▸ run 01ABC for issue #58 (started)".to_owned(),
+            "▸ checks 1: 1/2 passed".to_owned(),
+            "▸   check T1: failed — 0 passed".to_owned(),
+            String::new(),
+        ];
+        expected.extend(text(
+            &Cell::Assistant {
+                text: "done".into(),
+                fenced: false,
+            }
+            .full(),
+        ));
+        assert_eq!(
+            text(&lines),
+            expected,
+            "a run cell's lines are marked, and the groups are spaced"
+        );
+        for line in &lines[2..5] {
+            assert!(
+                line.spans
+                    .iter()
+                    .all(|s| s.style.add_modifier.contains(Modifier::DIM)),
+                "every run span is dim: {line:?}"
+            );
+        }
+
+        let menu = Menu::checkpoint(
+            "route",
+            &["plan ready".to_owned()],
+            &["stop".to_owned()],
+            None,
+            &[],
+        );
+        let drawn = text(&block_lines(&menu, 40, false));
+        // The first row carries the selection marker; the labels are the
+        // picks, and the title and body are the gate's.
+        let labels: Vec<&str> = menu.rows.iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(labels, ["Leave it waiting", "Stop the run"]);
+        assert!(drawn[0].contains("checkpoint route"), "{drawn:?}");
+        assert_eq!(drawn[1], "   plan ready", "{drawn:?}");
+        for (i, label) in labels.iter().enumerate() {
+            assert!(
+                drawn[2 + i]
+                    .trim_start_matches([' ', '❯'])
+                    .starts_with(&format!("{}. {label}", i + 1)),
+                "row {i} draws its number and label: {drawn:?}"
+            );
+        }
+        assert_eq!(menu.rows.len(), 2, "two picks, no more");
+    }
+
+    /// A gate's choices: item 3 has two options, the second recommended,
+    /// and item 5 one option with no recommendation.
+    fn choice_items() -> Vec<aigentic_runtime::aigentic_log::DecideItem> {
+        use aigentic_runtime::aigentic_log::{DecideItem, DecideItemKind, DecideOption};
+        vec![
+            DecideItem {
+                item: Some(3),
+                kind: DecideItemKind::Choice,
+                text: "which temp dir".to_owned(),
+                options: vec![
+                    DecideOption {
+                        label: "b".to_owned(),
+                        text: "keep the repo's own".to_owned(),
+                        reason: Some("the run reads it".to_owned()),
+                    },
+                    DecideOption {
+                        label: "a".to_owned(),
+                        text: "use the system temp".to_owned(),
+                        reason: Some("the system cleans it".to_owned()),
+                    },
+                ],
+                recommended: Some("a".to_owned()),
+            },
+            DecideItem {
+                item: Some(5),
+                kind: DecideItemKind::Choice,
+                text: "which name".to_owned(),
+                options: vec![DecideOption {
+                    label: "c".to_owned(),
+                    text: "name it after the issue".to_owned(),
+                    reason: None,
+                }],
+                recommended: None,
+            },
+        ]
+    }
+
+    /// The lead counts the gate's choices above the proposal it caps, and
+    /// a gate without choices draws exactly the block it always drew.
+    #[test]
+    fn the_lead_line_counts_the_choices() {
+        let items = choice_items();
+        let options = ["go", "amend", "stop"].map(str::to_owned);
+        let menu = Menu::checkpoint("decide", &["plan ready".to_owned()], &options, None, &items);
+        let lines = block_lines(&menu, 40, false);
+        let lead = format!("{} choices to answer; full text above", items.len());
+        assert_eq!(text(&lines)[1], format!("   {lead}"));
+        let lead_span = lines[1]
+            .spans
+            .iter()
+            .find(|s| s.content.contains(&lead))
+            .expect("the lead's own span");
+        assert!(
+            lead_span.style.add_modifier.contains(Modifier::DIM),
+            "the lead is dim: {:?}",
+            lines[1]
+        );
+        let plain = Menu::checkpoint("decide", &["plan ready".to_owned()], &options, None, &[]);
+        assert!(plain.lead.is_none());
+        let today = block_lines(&plain, 40, false);
+        assert_eq!(
+            text(&today)[..2],
+            [format!(" {}", plain.title), "   plan ready".to_owned()]
+        );
+        assert_eq!(today.len(), 2 + plain.rows.len() + 1, "rows and note");
+    }
+
+    /// The proposal the gate caps is committed to the scrollback once,
+    /// whatever question is up: the questions change the title, never the
+    /// body the transcript holds.
+    #[test]
+    fn the_gate_body_and_its_scrollback_line_do_not_change_with_the_questions() {
+        let shown: Vec<String> = (1..=25).map(|i| format!("line{i}")).collect();
+        let options = ["go", "amend", "stop"].map(str::to_owned);
+        let items = choice_items();
+        let mut menu = Menu::checkpoint("decide", &shown, &options, None, &items);
+        let today = Menu::checkpoint("decide", &shown, &options, None, &[]);
+        assert_eq!(menu.body, today.body);
+        let mut out = out_at(40);
+        assert!(out.body_in_full(Some("gate:g".into()), &menu));
+        assert_eq!(out.transcript.len(), 1, "one cell");
+        let Cell::Note(note) = &out.transcript[0] else {
+            panic!("the body is committed as a note: {:?}", out.transcript)
+        };
+        let (head, body) = note.split_once('\n').expect("a title and a body");
+        assert_eq!(head, menu.title);
+        assert_eq!(body, shown.join("\n"), "the proposal, byte for byte");
+        let label = items[0]
+            .recommended
+            .as_deref()
+            .expect("the fixture names one");
+        assert_eq!(menu.answer_option(label), None, "the next question is up");
+        assert!(
+            out.body_in_full(Some("gate:g".into()), &menu),
+            "still the gate's body"
+        );
+        assert_eq!(out.transcript.len(), 1, "nothing committed again");
+    }
+
+    /// #68's review: the grace is the drawn prompt's, so it restarts
+    /// when another prompt takes the screen and holds while one stays.
+    #[test]
+    fn the_answering_grace_restarts_with_each_prompt() {
+        let t0 = Instant::now();
+        let later = t0 + std::time::Duration::from_secs(5);
+        let kept = next_grace(Some("chat:c1".into()), Some(("chat:c1".into(), t0)), later);
+        assert_eq!(
+            kept,
+            Some(("chat:c1".to_owned(), t0)),
+            "the same prompt keeps its clock"
+        );
+        let fresh = next_grace(Some("gate:l:g".into()), Some(("chat:c1".into(), t0)), later);
+        assert_eq!(
+            fresh,
+            Some(("gate:l:g".to_owned(), later)),
+            "a new prompt starts its own"
+        );
+        assert_eq!(next_grace(None, Some(("chat:c1".into(), t0)), later), None);
+        assert_eq!(
+            next_grace(Some("chat:c1".into()), None, later),
+            Some(("chat:c1".to_owned(), later))
+        );
+    }
+
+    /// T4 (#82): the composer's hint says what its text is for: a switch
+    /// proposal's text is where the work belongs, a question's is the
+    /// answer, anything else a deny's reason.
+    #[test]
+    fn the_hint_names_what_the_composer_holds() {
+        use crate::app::menu::Kind;
+        assert_eq!(
+            text_hint(Some(Kind::Switch)),
+            "where it belongs: Enter sends · Esc cancels"
+        );
+        assert_eq!(
+            text_hint(Some(Kind::Question)),
+            "answer: Enter sends · Esc cancels"
+        );
+        assert_eq!(
+            text_hint(Some(Kind::Permission)),
+            "deny with a reason · Enter sends · Esc cancels"
+        );
+        assert_eq!(
+            // The `/new` question (#108) is a row menu too.
+            text_hint(Some(Kind::NewThread)),
+            "Enter answers · Esc says no"
+        );
+        assert_eq!(
+            text_hint(None),
+            "deny with a reason · Enter sends · Esc cancels"
+        );
+    }
+
+    /// T6 (#82): a pipe prints the two prompts that have no line of
+    /// their own — a followed run's checkpoint and a switch proposal —
+    /// and, since #108 (T4), the `/new` question.
+    #[test]
+    fn a_pipe_prints_the_checkpoint_and_the_switch() {
+        use crate::app::menu::Kind;
+        assert!(prints_in_plain(Kind::Checkpoint));
+        assert!(prints_in_plain(Kind::Switch));
+        assert!(prints_in_plain(Kind::NewThread));
+        assert!(!prints_in_plain(Kind::Permission));
+        assert!(!prints_in_plain(Kind::Question));
     }
 }

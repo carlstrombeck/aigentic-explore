@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::files::parse_args;
 use crate::truncate::{DEFAULT_OUTPUT_CAP, truncate_output};
-use crate::workdir::Workdir;
+use crate::workdir::{Workdir, with_notice};
 
 /// Default cap on `grep` matches, before the byte cap applies.
 pub const DEFAULT_GREP_MATCHES: usize = 200;
@@ -87,7 +87,10 @@ impl Tool for ListDirTool {
                 lines.join("\n") + "\n"
             };
             Ok(ToolOutput {
-                content: truncate_output(&text, self.output_cap),
+                content: with_notice(
+                    self.workdir.take_notice(),
+                    truncate_output(&text, self.output_cap),
+                ),
                 is_error: false,
             })
         })
@@ -171,7 +174,7 @@ impl Tool for GrepTool {
                     .await
                     .map_err(|e| ToolError::Execution(format!("grep task failed: {e}")))??;
             Ok(ToolOutput {
-                content: truncate_output(&text, cap),
+                content: with_notice(self.workdir.take_notice(), truncate_output(&text, cap)),
                 is_error: false,
             })
         })
@@ -335,9 +338,12 @@ impl Tool for EditFileTool {
             let shown = path.strip_prefix(self.workdir.current()).unwrap_or(&path);
             let diff = crate::diff::unified(shown, &text, &edited);
             Ok(ToolOutput {
-                content: truncate_output(
-                    &format!("{diff}edited {} at line {line}", path.display()),
-                    DEFAULT_OUTPUT_CAP,
+                content: with_notice(
+                    self.workdir.take_notice(),
+                    truncate_output(
+                        &format!("{diff}edited {} at line {line}", path.display()),
+                        DEFAULT_OUTPUT_CAP,
+                    ),
                 ),
                 is_error: false,
             })
@@ -451,6 +457,30 @@ mod tests {
             out.content,
             "README.md:1:# hello\nsrc/inner/lib.rs:1:pub fn hello() {}\nsrc/main.rs:2:    hello();\n"
         );
+    }
+
+    #[tokio::test]
+    async fn grep_does_not_follow_a_symlink_out_of_the_walked_tree() {
+        // Pins `follow_links(false)` (issue #124): the boundary allows the
+        // project root, so it must be the walk that refuses to leave it. A
+        // later `follow_links(true)` would read the outside file through
+        // either link.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let needle = "12345-needle-outside";
+        std::fs::write(outside.join("secret.txt"), format!("{needle}\n")).unwrap();
+        std::fs::write(project.join("inside.txt"), "nothing here\n").unwrap();
+        std::os::unix::fs::symlink(&outside, project.join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), project.join("file-link.txt"))
+            .unwrap();
+        let out = GrepTool::new(Workdir::new(&project))
+            .call(json!({"pattern": needle, "path": "."}))
+            .await
+            .unwrap();
+        assert_eq!(out.content, "no matches in 1 files", "{}", out.content);
     }
 
     #[tokio::test]

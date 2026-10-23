@@ -5,11 +5,17 @@
 //! interrupt reaches a running turn, carrying who sent it.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use aigentic_core::{Author, ContentBlock};
-use aigentic_log::PermissionRequestedPayload;
+use aigentic_core::{Author, ContentBlock, EventKind};
+use aigentic_log::{
+    DecisionAnswer, DecisionKind, DecisionProposedPayload, DecisionStage,
+    PermissionRequestedPayload,
+};
 use tokio::sync::{mpsc, oneshot, watch};
+
+use crate::runtime::ProjectContext;
+use crate::{Runtime, RuntimeError, Signal};
 
 /// What a turn is waiting for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,12 +34,25 @@ pub enum Pending {
         question: String,
         questions: Vec<crate::harness_tools::HumanQuestion>,
     },
+    /// A proposal a person decides: `suggest_project` asks to move this
+    /// thread to another project, `start_job` asks to approve background
+    /// work, and the turn parks until the person answers. Only a `Yes` to
+    /// the first switches anything; for a job, `project` is the project
+    /// the job would run in and `reason` says why it is not this
+    /// conversation's work.
+    Switch {
+        call_id: String,
+        project: String,
+        reason: String,
+    },
 }
 
 impl Pending {
     pub fn call_id(&self) -> &str {
         match self {
-            Pending::Permission { call_id, .. } | Pending::Human { call_id, .. } => call_id,
+            Pending::Permission { call_id, .. }
+            | Pending::Human { call_id, .. }
+            | Pending::Switch { call_id, .. } => call_id,
         }
     }
 }
@@ -55,7 +74,82 @@ pub enum Answered {
         text: String,
         by: Author,
     },
+    /// A person's answer to a proposal of either kind. `ctx` carries the
+    /// target's `ProjectContext` and the ack a `Yes` is answered with; it
+    /// is empty for every other answer, and a job proposal acks it with an
+    /// error because a job takes no context.
+    Switch {
+        answer: SwitchAnswer,
+        by: Author,
+        ctx: SwitchCtx,
+    },
 }
+
+/// What a person did with a proposal: either kind, since `suggest_project`
+/// and `start_job` park and answer the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwitchAnswer {
+    /// Agree to the project the model proposed, or approve the job.
+    Yes,
+    /// Stay put; the model is told, and the turn continues.
+    No,
+    /// Stay put, and the person names the project it actually belongs
+    /// to: the correction is the useful part, and the model is told.
+    Corrected(String),
+    /// Nobody answered — the turn was interrupted, or a daemon that
+    /// restarted found it waiting. Never a `yes`.
+    Withdrawn(String),
+}
+
+/// The pair `SwitchCtx` carries: the target's context and the ack.
+pub type SwitchSlot = Arc<Mutex<Option<(ProjectContext, oneshot::Sender<Result<(), String>>)>>>;
+
+/// The target's `ProjectContext` and the ack a `Yes` fires, behind two
+/// `Arc`s so an answer stays `Clone` and `PartialEq` while its context
+/// is built once (a context is not `Clone`).
+///
+/// `Clone` shares the pair and the ack's receiver stays unique: a
+/// context handed out with an ack must be taken exactly once, or two
+/// projects would install and only one could be acked.
+#[derive(Debug)]
+pub struct SwitchCtx(SwitchSlot);
+
+impl SwitchCtx {
+    /// An answer with no context: every `No`, `Corrected` and
+    /// `Withdrawn`, and a `Yes` from a client that sent none.
+    pub fn none() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+
+    /// A `Yes`'s payload: the built context and the channel the
+    /// answerer waits on for the outcome.
+    pub fn oneshot(context: ProjectContext) -> (Self, oneshot::Receiver<Result<(), String>>) {
+        let (tx, rx) = oneshot::channel();
+        (Self(Arc::new(Mutex::new(Some((context, tx))))), rx)
+    }
+
+    /// Take the context and the ack; `None` on a second call, and on
+    /// every answer but a real `Yes`.
+    pub(crate) fn take(&self) -> Option<(ProjectContext, oneshot::Sender<Result<(), String>>)> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+impl Clone for SwitchCtx {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+/// The pair behind the `Arc` is not comparable, so a context compares
+/// by identity: the same payload, or two answers built from it.
+impl PartialEq for SwitchCtx {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SwitchCtx {}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DecisionError {
@@ -113,7 +207,8 @@ impl Decisions {
         };
         let (expected, given) = match (pending, &decided) {
             (Pending::Permission { .. }, Answered::Permission { .. })
-            | (Pending::Human { .. }, Answered::Human { .. }) => {
+            | (Pending::Human { .. }, Answered::Human { .. })
+            | (Pending::Switch { .. }, Answered::Switch { .. }) => {
                 let (_, tx) = inner.waiting.remove(call_id).expect("present");
                 inner.decided.insert(call_id.to_owned());
                 // A receiver that went away (the turn was cancelled) is
@@ -123,6 +218,10 @@ impl Decisions {
             }
             (Pending::Permission { .. }, Answered::Human { .. }) => ("decision", "human answer"),
             (Pending::Human { .. }, Answered::Permission { .. }) => ("human answer", "decision"),
+            (Pending::Switch { .. }, Answered::Permission { .. }) => ("switch answer", "decision"),
+            (Pending::Switch { .. }, Answered::Human { .. }) => ("switch answer", "human answer"),
+            (Pending::Permission { .. }, Answered::Switch { .. }) => ("decision", "switch answer"),
+            (Pending::Human { .. }, Answered::Switch { .. }) => ("human answer", "switch answer"),
         };
         Err(DecisionError::WrongKind {
             call_id: call_id.to_owned(),
@@ -267,6 +366,61 @@ impl Inbox {
             out.push(q);
         }
         out
+    }
+}
+
+/// Record a start-up ask's answer (issue #121): the person was asked
+/// which project to work in before any thread was open, and this is the
+/// pair the log keeps of it — a `project` proposal and its answer, back
+/// to back through the observer.
+///
+/// No turn waits and nothing parks: the ask is answered before the front
+/// thread is opened, so there is no `AwaitingSwitch` state and no
+/// keep-awake guard, and a subscriber of an already-open thread sees two
+/// decision events and nothing else. The `call_id` carries
+/// [`STARTUP_PREFIX`](aigentic_log::STARTUP_PREFIX) so `stats` counts the
+/// pair in the `startup` row, and `target` is `None` so answering
+/// "api, not web" does not decline a later #92 start-up proposal for
+/// web. The answered event's `parent_event` is the proposed event's id,
+/// which is what `decision_records` pairs by.
+impl Runtime {
+    pub fn record_startup_ask(
+        &mut self,
+        offered: &str,
+        chosen: &str,
+        reason: &str,
+        by: Author,
+        observe: &mut (dyn FnMut(Signal<'_>) + Send),
+    ) -> Result<(), RuntimeError> {
+        let call_id = format!(
+            "{}ask-{}",
+            aigentic_log::STARTUP_PREFIX,
+            ulid::Ulid::generate()
+        );
+        let proposed = self.append(
+            EventKind::DecisionProposed,
+            Author::System,
+            serde_json::to_value(DecisionProposedPayload {
+                kind: DecisionKind::Project,
+                proposal: offered.to_owned(),
+                target: None,
+                reason: reason.to_owned(),
+                call_id: Some(call_id),
+                job: None,
+                stage: DecisionStage::Ask,
+            })
+            .expect("serialisable"),
+            None,
+            observe,
+        )?;
+        // `Yes` when the person took the default row; `Corrected` names
+        // where they went instead.
+        let (answer, correction) = if chosen == offered {
+            (DecisionAnswer::Yes, None)
+        } else {
+            (DecisionAnswer::Corrected, Some(chosen.to_owned()))
+        };
+        self.append_decision_answered(answer, correction, None, by, proposed.id, observe)
     }
 }
 

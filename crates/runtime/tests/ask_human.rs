@@ -108,7 +108,7 @@ fn ask_human_takes_questions_and_the_old_shape() {
 /// no "Other" row of the model's own.
 #[test]
 fn the_spec_and_instructions_ask_for_questions_in_the_call() {
-    let spec = aigentic_runtime::harness_tools::harness_specs(false)
+    let spec = aigentic_runtime::harness_tools::harness_specs(false, false, true)
         .into_iter()
         .find(|s| s.name == "ask_human")
         .unwrap();
@@ -168,6 +168,7 @@ async fn an_answered_question_ends_the_turn_and_the_continuation_has_its_own_bud
             max_iterations: 2,
             max_tokens: 1_000_000,
             max_wall_time: Duration::from_secs(60),
+            max_cost_usd: None,
             cache_read_price_ratio: 0.25,
         });
     let first = rt
@@ -281,6 +282,7 @@ async fn an_old_log_with_the_single_question_shape_replays() {
         serde_json::to_value(AssistantMessagePayload {
             blocks: vec![ContentBlock::ToolCall(asked)],
             usage: None,
+            finish_reason: None,
         })
         .unwrap(),
     );

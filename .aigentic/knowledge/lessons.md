@@ -6,19 +6,16 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
 
 ## How work is split
 
-- **Plan → implement → review** for anything larger than a one-line fix:
-  a planner (profile `kimi`) posts `## Plan` on the issue, an implementer
-  (profile `flash`) follows it, a reviewer (`kimi`) posts `## Review` and
-  closes the issue. Issue comments are the handoff; every step starts in a
-  fresh thread. Trivial fixes: implementer alone.
+- **The loop as run now is in `build-loop.md`.** Spec (supervisor) →
+  spec check → spec v2 merge → implementer → judge → fix, every step a
+  fresh thread on `flash`, handing off through issue comments. The bullets
+  below are the history that shaped it: the planner/verifier split and the
+  Kimi roles were retired once a Flash judge that proves by running beat a
+  Kimi judge that read (#57).
 - **Cost lives in the loop, not the planner.** The model that runs the loop
   pays for ~95% of calls, mostly re-reading its cached context. Put the
   cheap model on the many calls, the strong one on the few. On #38/#39 the
   implement step cost $0.20–0.41 on Flash; the same tokens on GLM cost 3×.
-- **Review is split: verify on Flash, judge on Kimi.** The #43 review ran
-  tests and pty checks on Kimi for $6.86, 39% of the cycle. A verifier
-  (flash) posts `## Verification` with outputs and dumps; a judge (kimi)
-  reads evidence and diff and gives the verdict in a handful of calls.
 - **Every planned test is accounted for.** Flash dropped planned tests
   silently on #37 and #43. The implementer's `## Implementation` carries a
   ledger (T1, T2, … landed or not, with a reason); a planned test missing
@@ -39,11 +36,107 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   And on #52 an addendum described a T3 (90 replies, a 48,000 ceiling, a
   boundary list) that was never in the code; the shipped test used 32,000.
   A report's numbers and names are claims too: grep them against the diff.
+  It runs the other way too: #53's report listed a "corrected" literal
+  (`amend: bool`) that the code never had; the code followed the amendment.
+  The verifier caught it by reading the code a correction points at, not
+  only the quotes.
 - **Someone reads the plan before implementing.** Both trial plans had a
   flaw a second reader caught (#38: pipe filters counted as extra work,
   undoing #21; #31: retries collected and emitted after the fact, defeating
   live display). Corrections go in a separate `## Plan amendment` comment;
-  the plan's text stays as written.
+  the plan's text stays as written. Plan-check reads for mechanics, not
+  for the design's purpose: on #53 it raised 3 points, and a blind
+  supervisor check found 10, including replay holes (an answered gate that
+  replayed as unanswered, a send-back with no event written ahead of it).
+  When a ticket's purpose is a behaviour (replay, live display), read the
+  plan against that behaviour case by case.
+  Evidence-first binds the supervisor too: on #53 the supervisor claimed
+  the suite was not re-run after a late edit, from a log scan that cut
+  each command at 110 characters; the full command re-ran it. #56's
+  plan-check caught it by reading the log. Never state what a call did
+  from a truncated view of it.
+
+- **Code that judges runs gets run on real runs.** #56's checks passed
+  their plan, their fixtures, a verifier and a judge; running them on
+  #56's own implementer thread found four more bugs: check ids in the
+  wrong case for the workflow, a full suite hidden by a flag, every real
+  gate rejected for its leading `cd`, and a debugging run no send-back
+  could clear. A verifier or supervisor runs such code on the step's own
+  thread before the judge.
+- **A judge that probes beats a judge that reads.** #56's judges built an
+  out-of-tree probe against the shipped functions and found a hole each
+  round, one of them in the supervisor's own fix: a temp redirection
+  laundering `cp`/`tee`/`python3 -c`, then a digit filter that hid
+  `echo x > 1`. A fix by the supervisor gets the same judge as anyone's.
+- **Models chain the gate.** Both #56 builders ran
+  `cargo fmt && cargo clippy … | tail -30` as one call; the pipe makes
+  the exit status `tail`'s, so a failing clippy reads green. The template
+  says one command per call and E4 now enforces it.
+
+- **Consolidate the spec before a big implementation.** #57's first
+  implementer read a plan, two amendments and a rescoped issue, spent 400
+  calls and 18 context sweeps re-reading them in 15-line slices, and wrote
+  no code. A fresh implementer given one consolidated spec (conflicts
+  resolved, types copied in, work listed by commit) finished for $5.16.
+  When a plan has more than one amendment, merge them into one spec before
+  the implementer starts.
+  It happened again on #65 when the supervisor put two amendments on top
+  of a spec it had written up front: 400 calls, 17 sweeps, no commit. The
+  rule covers amendments to a spec too: merge before implementing, always.
+- **Spell out the gate's exact form.** Every builder until #57's fix round
+  wrapped a gate command (`cd …;`, `&&`, `| tail`, `; echo "exit=$?"`). The
+  fix prompt said "no `cd`, no `;`, no `&&`, no pipe" and got three bare
+  calls. Say what not to add, not only what to run.
+- **Flash judges well when asked to prove.** On #57 a Flash judge ($1.49)
+  finished a probing review, proved a cost bug by running it and found a
+  crash case (J9), while the Kimi judge capped twice ($8.67, no verdict;
+  `max_iterations = 80` is too low for a judge that builds a probe). The
+  round-2 Flash judge reproduced the fixer's mutation check itself. One
+  ticket is not proof: keep shadowing roles before moving them.
+
+- **Two independent judges beat one stronger judge.** On #65 a Flash judge
+  at `medium` and one at `high` (shadow, blind) both approved, and each
+  proved a finding the other missed: a failing git read escalates, and a
+  refused push errors out with no gate. `high` did not reason more per
+  call (270 tokens against 355), so on TensorX it is no stronger tier. The
+  diversity came from two samples, not from effort. On a critical ticket,
+  run two Flash judges in parallel (about $6, less than one capped Kimi
+  judge on #57).
+- **Size a ticket by cost, and review by risk.** #58 cost about $51 in
+  model spend: 4,939 lines across four crates, two spec checks, a
+  verifier and two judges a round, and a fix round that repeated most of
+  it. Small tickets under the same process cost $1.30 (#53, #54), because
+  calls × context per call grows faster than scope. So:
+  - one crate and one concern per ticket, split *before* the spec (as #57
+    was split into #57 and #65);
+  - one Flash spec check and one Flash judge by default, and a second
+    independent judge only for code that runs unattended, pushes, or is
+    concurrent;
+  - fix rounds get one judge and no verifier, since judges re-run
+    everything anyway;
+  - ask before a ticket passes $10, until #60 enforces budgets.
+
+  Spec quality is cheaper than rework: #58's $7.86 fix round came from gaps
+  in the supervisor's spec.
+- **Close a ticket that changes the run path only after a real run.** Five
+  review rounds approved #58 (keep-awake, cross-process writers, the
+  creation race). Then the first `aigentic build 29` found four bugs none
+  of them had:
+  - a gate that opened while the client watched deadlocked;
+  - the brief's `budget: "3 USD"` escalated;
+  - slots written as text read wrongly (`ui: "false"` truthy, so an
+    11-minute pty check ran on a one-line change);
+  - the template listed the reference check after the gate, against E4.
+
+  Tests drove the code the way the tests were written; models write slots
+  however they like, and a person watches live. The acceptance run on a
+  real trivial issue, `kill -9` included, is part of the review.
+- **Fix from the failing run's evidence, not a similar one.** Fixing #58's
+  `commits` slot, the supervisor read the *first* #29 brief (`'["…"]'`) and
+  not the brief of the run that failed (`'[{"subject": "…"}] (precedent …)'`),
+  so the fix and its test missed the real shape. Judge 5 caught it by
+  replaying the failing run's text. Pin the test on the verbatim value
+  from the log that failed.
 
 ## Plans and tests
 
@@ -61,19 +154,27 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   (changes per commit, tests, corrected plan literals, pty dumps). On #43
   the reviewer searched the disk for the implementer's thread to find its
   dumps: everything a later step needs goes on the issue.
-- **Visual changes need a pty check** (`~/.local/share/aigentic/devtools/drive.py`,
-  a venv with `pyte`); the implementer pastes dumps, and the reviewer
-  repeats the check for UI work. Code-only work gets a lean review.
-- **A pty check never copies `.env`.** The session it starts reads the key
-  from the environment: source the repo's `.env` by its absolute path and
-  start the session from a scratch directory with no `.env` of its own,
-  in one command (`(set -a; . <repo>/.env; set +a; cd <scratch> &&
-  python3 …/drive.py …)`); `. ./.env` inside the scratch directory finds
-  nothing. On #41 the implementer
-  copied `.env` into `/tmp/41-pty`, leaving the API key in a file any user
-  on the machine could read. Judge the dumps from `raw.bin` when rows
-  appear or vanish: pyte mis-renders scroll-region inserts (#48 was found
-  that way).
+- **Visual changes need a pty check** (`tools/pty/drive.py` in the repo, which
+  needs `pyte`: `python3 -m pip install --user pyte`, no venv committed); the
+  implementer pastes dumps, and the reviewer repeats the check for UI work.
+  Code-only work gets a lean review.
+- **A pty check never copies `.env`.** The driver never reads one: it starts its
+  child in a scratch cwd under the temp dir with no `.env` in it or above it, so
+  `dotenvy` finds nothing, and the key comes from the caller's own environment.
+  On #41 the implementer copied `.env` into `/tmp/41-pty`, leaving the API key
+  in a file any user on the machine could read. Judge a dump's `.raw` bytes
+  rather than its `.txt` when rows appear or vanish: pyte mis-renders
+  scroll-region inserts (#48 was found that way).
+- **A red gate is never "pre-existing" until it's proven at the base,
+  built in its own target dir.** #7's implementer and judge both cleared
+  a failing test as pre-existing by building the base commit in a
+  `git worktree` with a **shared** `CARGO_TARGET_DIR`, and ran the newer
+  binary for both. Built separately, the base passed. And **`cargo test`
+  stops at the first failing test binary**, so that one failure hid four
+  more that #7 had caused (tool lists missing `suggest_project`). Any
+  failure in the gate blocks: rerun with `--no-fail-fast` to see them
+  all, and prove a "pre-existing" claim at the base in a separate target
+  dir before accepting it.
 
 ## Git and GitHub
 
@@ -110,6 +211,19 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   #40). Run it once with its output in a log file, then search the file:
   #40's implementer ran the whole suite five times, three of them only to
   read other lines of the same result.
+- **A build outside the repository cleans up after itself.** Probes and
+  mutation copies each built the whole workspace into their own
+  `/tmp/<name>-target`, a few GB each, and nothing deleted them: on
+  2026-10-07, 76 GB of them left 2.9 GB free while an implementer was
+  compiling. Give **each tree its own** `CARGO_TARGET_DIR` under `/tmp` (a probe
+  crate, a base checkout, each mutation copy): on #124 one target dir
+  shared across different trees ran stale binaries (23 bogus `E0061`
+  errors, a copy that listed no tests). Before posting the report, delete
+  everything the run created in `/tmp`, target dirs included. A gate in the repository uses its own
+  `target/` and adds nothing to `/tmp`.
+- If the full-workspace `cargo test` stalls in `crates/server/tests/runs.rs`
+  inside the REPL (#103), don't rerun it: run `cargo test --no-fail-fast -p
+  <crate>` per crate. #99's implementer lost its whole wall time rerunning.
 - **One task per thread.** A new commit-sized task starts a fresh thread;
   resume the same thread only to finish what it was doing.
 - A turn that stops on `max_tokens`, `max_iterations` or `max_wall_time`
@@ -142,7 +256,7 @@ so the rule can be judged, not just obeyed. The `brief`, `plan-check` and
   record", "we decided", "going forward", …); long task prompts are skipped.
   When a prompt itself talks about memory cues, turn memory off for that
   session first.
-- Context is bounded by eviction (sweep above 64k, ceiling 128k) and by
+- Context is bounded by eviction (sweep above 64k, working-set target 120k since #76) and by
   dropping old reasoning. A healthy build call is ~40–70k context and
   almost all cached; many cold calls in a row, or context past ~90k, means
   something is wrong.

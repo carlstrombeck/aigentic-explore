@@ -2,6 +2,14 @@
 
 # Aigentic
 
+> **This is a fork** of [stevewerme/aigentic](https://github.com/stevewerme/aigentic),
+> aimed at one person running several projects in parallel from one
+> conversation. It tracks upstream and renames nothing. What it adds and
+> in what order is in [`docs/FORK.md`](docs/FORK.md) and
+> [`docs/PLAN-portfolio.md`](docs/PLAN-portfolio.md). The install
+> instructions below fetch upstream's releases; this fork publishes none
+> yet, so build from this repository to get its changes.
+
 An open source agent harness in Rust that runs open-weight models, on EU
 infrastructure or any OpenAI-compatible or Anthropic endpoint, and ships
 as a single terminal binary. The harness owns everything around the model,
@@ -38,17 +46,44 @@ and memory across threads.
 - `aigentic exec` for scripting (exit 0 done, 1 failed, 3 a human was
   needed), `aigentic doctor` for setup checks, and `aigentic stats` for
   what the logs spent, by day, project, thread or issue
+- Builds: `/build <n>` in the REPL, or `aigentic build <n>` from a script,
+  takes a trivial GitHub issue from brief to closed. A versioned workflow
+  renders each step's prompt; checks, the push and the install run as code;
+  the run's events stream into the thread, a checkpoint is answered in
+  place, and a killed run resumes from its log. The full path (plan, review,
+  fix) is next
+
+## Install
+
+Each release carries a prebuilt `aigentic` for macOS (Apple silicon and
+Intel) and Linux (x86_64 and aarch64, glibc 2.35 or newer), with a SHA-256
+checksum beside each archive. Pick the version and your target, download,
+verify, and put the binary on your `PATH`:
+
+```bash
+VERSION=0.6.0 TARGET=aarch64-apple-darwin   # or x86_64-apple-darwin, x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+BASE=https://github.com/stevewerme/aigentic/releases/download/v$VERSION
+curl -fLO "$BASE/aigentic-$VERSION-$TARGET.tar.gz"
+curl -fLO "$BASE/aigentic-$VERSION-$TARGET.tar.gz.sha256"
+shasum -a 256 -c "aigentic-$VERSION-$TARGET.tar.gz.sha256"   # or sha256sum -c
+tar -xzf "aigentic-$VERSION-$TARGET.tar.gz"
+install -m 755 "aigentic-$VERSION-$TARGET/aigentic" ~/.local/bin/aigentic
+```
+
+On macOS a binary downloaded with `curl` carries no quarantine flag, so it
+runs without a Gatekeeper prompt; one downloaded with a browser needs
+`xattr -d com.apple.quarantine ~/.local/bin/aigentic` first.
+
+From source, with a stable Rust toolchain:
+
+```bash
+git clone https://github.com/stevewerme/aigentic && cd aigentic
+cargo install --path crates/tui --force --locked   # installs the `aigentic` binary
+```
 
 ## Getting started
 
-Needs a stable Rust toolchain.
-
-1. Install:
-
-   ```bash
-   git clone https://github.com/stevewerme/aigentic && cd aigentic
-   cargo install --path crates/tui          # installs the `aigentic` binary
-   ```
+1. Install `aigentic` as above.
 
 2. Configure the endpoint in `~/.config/aigentic/config.toml` (override
    with `--config`). The key itself is never in this file: each profile

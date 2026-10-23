@@ -13,26 +13,35 @@
 //! their `memory_extracted` usage, so the agent's turns keep their own
 //! calls and context. Since #49 a utility title call is on that same
 //! line, priced from its stamped `thread_renamed` usage.
+//!
+//! Since #83 the walk follows #9's layout: every log is
+//! `threads/<id>.jsonl`, and a legacy `threads/<project>/<id>.jsonl` is
+//! still read, with the thread attributed to its project from its own
+//! lines (`crate::threads_index`).
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 
 use aigentic_runtime::Prices;
-use aigentic_runtime::aigentic_core::{Author, ContentBlock, EventKind};
+use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
-    AssistantMessagePayload, Invoker, MemoryExtractedPayload, SkillLoadedPayload, ThreadLog,
-    ThreadRenamedPayload, ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload,
+    AssistantMessagePayload, BriefRefreshedPayload, DecisionAnswer, DecisionKind, DecisionRecord,
+    Invoker, MemoryExtractedPayload, RunStartedPayload, SkillLoadedPayload, ThreadRenamedPayload,
+    ThreadStartedPayload, ToolResultPayload, TurnEndedPayload, Usage, UserMessagePayload,
+    decision_records,
 };
 use aigentic_server::config::Config;
+use aigentic_server::workspaces::Workspace;
 use anyhow::{Context, bail};
 use serde::Serialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use ulid::Ulid;
 
 use crate::project_cmd::first_line_of;
+use crate::threads_index::{self, Found, NO_PROJECT};
 
 /// The whole report, and what `--json` prints.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize)]
 pub struct Stats {
     /// The window's start, RFC 3339, when `--since` was given.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,14 +50,20 @@ pub struct Stats {
     pub days: Vec<DayStats>,
     /// Every project in the window, by name.
     pub projects: Vec<ProjectStats>,
+    /// Every model in the window, dearest first (issue #111). A model
+    /// row's `calls` and its side jobs are the calls the model ran.
+    pub models: Vec<ModelStats>,
     /// Up to five threads by effective spend, costliest first.
     pub threads: Vec<ThreadSpend>,
+    /// Up to ten individual calls by effective cost, dearest first
+    /// (issue #111).
+    pub costliest_calls: Vec<CallSpend>,
     /// Threads whose files could not be read; counted so the totals are
     /// never silently short.
     pub unreadable: u32,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize)]
 pub struct DayStats {
     pub day: String,
     pub calls: u32,
@@ -92,6 +107,8 @@ pub struct DayStats {
     pub job_unpriced_calls: u32,
     pub extractions: u32,
     pub titles: u32,
+    /// Brief refreshes among the side jobs.
+    pub briefs: u32,
     /// Tokens the side jobs sent and produced, also apart: folding them
     /// into the calls' context would make the hit rate fiction.
     pub job_context: u64,
@@ -102,7 +119,7 @@ pub struct DayStats {
     pub job_price_estimated_spent: Option<f64>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize)]
 pub struct ProjectStats {
     pub project: String,
     pub calls: u32,
@@ -127,12 +144,143 @@ pub struct ProjectStats {
     pub job_unpriced_calls: u32,
     pub extractions: u32,
     pub titles: u32,
+    /// Brief refreshes among the side jobs.
+    pub briefs: u32,
     pub job_context: u64,
     pub job_output: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_spent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_price_estimated_spent: Option<f64>,
+}
+
+/// One model's row (issue #111): `ProjectStats` field for field, with
+/// the model key in place of the project, so a reader can see what the
+/// thread's model and the utility model each cost. `turns` and `retries`
+/// stay empty: a turn or a retry spans whatever models it used, so they
+/// have no single model to fold into.
+#[derive(Debug, Default, PartialEq, Serialize)]
+pub struct ModelStats {
+    pub model: String,
+    pub calls: u32,
+    pub priced_calls: u32,
+    pub price_estimated_calls: u32,
+    pub unpriced_calls: u32,
+    pub unstamped_calls: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_estimated_spent: Option<f64>,
+    pub peak_context: u64,
+    pub context_total: u64,
+    pub mean_context: u64,
+    pub cache_read: u64,
+    pub hit_rate: f64,
+    pub turns: BTreeMap<String, u32>,
+    pub retries: u32,
+    pub job_calls: u32,
+    pub job_priced_calls: u32,
+    pub job_price_estimated_calls: u32,
+    pub job_unpriced_calls: u32,
+    pub extractions: u32,
+    pub titles: u32,
+    /// Brief refreshes among the side jobs.
+    pub briefs: u32,
+    pub job_context: u64,
+    pub job_output: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_spent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_price_estimated_spent: Option<f64>,
+}
+
+/// One of the ten costliest calls (issue #111): the log's own numbers
+/// for a single `assistant_message` usage, so one huge prompt is visible
+/// beside the threads it hides in.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct CallSpend {
+    /// The thread's full id; the text line shows its first six
+    /// characters.
+    pub id: String,
+    pub project: String,
+    /// `YYYY-MM-DD HH:MM`, UTC.
+    pub created_at: String,
+    /// The model key, as the model table names it.
+    pub model: String,
+    /// The prompt: input plus cache read plus cache write.
+    pub context: u64,
+    pub output: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_estimated_spent: Option<f64>,
+}
+
+/// A call's whole dollar figure for ordering: stamped plus retro-priced,
+/// `Some` when either is.
+fn call_effective(c: &CallSpend) -> Option<f64> {
+    add(c.spent, c.price_estimated_spent)
+}
+
+/// A model row's whole dollar figure: the calls' plus the side jobs',
+/// stamped plus retro-priced (issue #111), the same sum the costliest
+/// threads rank by.
+fn model_effective(m: &ModelStats) -> Option<f64> {
+    add(
+        add(m.spent, m.job_spent),
+        add(m.price_estimated_spent, m.job_price_estimated_spent),
+    )
+}
+
+/// The bounded top ten the walk keeps (issue #111): a call joins it, and
+/// once it holds more than ten the worst is dropped, so a long log costs
+/// ten rows, not thousands.
+#[derive(Debug, Default)]
+pub(crate) struct CallSink {
+    calls: Vec<RankedCall>,
+}
+
+/// A candidate call with the last tie-break the order needs, kept out of
+/// `CallSpend` so the wire shape stays what it is.
+#[derive(Debug)]
+struct RankedCall {
+    spend: CallSpend,
+    /// The event's `seq`, so the order is the same on every run.
+    seq: u64,
+}
+
+impl CallSink {
+    pub(crate) fn push(&mut self, spend: CallSpend, seq: u64) {
+        self.calls.push(RankedCall { spend, seq });
+        if self.calls.len() > 10 {
+            self.calls.sort_by(rank_calls);
+            self.calls.truncate(10);
+        }
+    }
+
+    fn into_sorted(mut self) -> Vec<CallSpend> {
+        self.calls.sort_by(rank_calls);
+        self.calls.into_iter().map(|r| r.spend).collect()
+    }
+}
+
+/// The costliest-calls order (issue #111): priced calls first, by
+/// effective cost descending; then unpriced calls by context descending.
+/// Ties go by context, then the thread id, then the event's seq.
+fn rank_calls(a: &RankedCall, b: &RankedCall) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let context = b.spend.context.cmp(&a.spend.context);
+    let id_seq = a.spend.id.cmp(&b.spend.id).then_with(|| a.seq.cmp(&b.seq));
+    match (call_effective(&a.spend), call_effective(&b.spend)) {
+        (Some(x), Some(y)) => y
+            .partial_cmp(&x)
+            .unwrap_or(Ordering::Equal)
+            .then(context)
+            .then(id_seq),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => context.then(id_seq),
+    }
 }
 
 /// The sum of two optional dollar figures: `Some` when either is,
@@ -157,7 +305,7 @@ fn effective_report(t: &ThreadReport) -> Option<f64> {
     add(t.spent, t.price_estimated_spent)
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize)]
 pub struct ThreadSpend {
     pub id: String,
     pub project: String,
@@ -209,6 +357,8 @@ pub struct ThreadReport {
     pub job_unpriced_calls: u32,
     pub extractions: u32,
     pub titles: u32,
+    /// Brief refreshes among the side jobs.
+    pub briefs: u32,
     pub job_context: u64,
     pub job_output: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -227,8 +377,7 @@ pub struct ThreadReport {
     pub slept_secs: Option<u64>,
 }
 
-/// `stats --issue <n>` (issue #40): every thread whose first own-user
-/// message names that issue, with a total over them.
+/// `stats --issue <n>`: threads that name the issue or belong to its run.
 #[derive(Debug, Serialize)]
 pub struct IssueReport {
     pub issue: u64,
@@ -265,6 +414,8 @@ pub struct IssueTotals {
     pub job_unpriced_calls: u32,
     pub extractions: u32,
     pub titles: u32,
+    /// Brief refreshes among the side jobs.
+    pub briefs: u32,
     pub job_context: u64,
     pub job_output: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -303,6 +454,7 @@ impl IssueTotals {
             total.job_unpriced_calls += t.job_unpriced_calls;
             total.extractions += t.extractions;
             total.titles += t.titles;
+            total.briefs += t.briefs;
             total.job_context += t.job_context;
             total.job_output += t.job_output;
             sum(&mut total.job_spent, t.job_spent);
@@ -321,7 +473,7 @@ impl IssueTotals {
 
 /// What one call's dollars are (issue #40).
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Cost {
+pub(crate) enum Cost {
     /// The runtime's `cost_usd` stamp, exact.
     Stamped(f64),
     /// No stamp, but the config's table knows the call's model or
@@ -389,7 +541,7 @@ impl PriceBook {
     /// The table for one call: its `model` (exact) first, then its
     /// `profile` name, then — only for a call that carries neither — the
     /// `--assume-profile` table. `None` means unpriced.
-    fn table(&self, u: &Usage) -> Option<Prices> {
+    pub(crate) fn table(&self, u: &Usage) -> Option<Prices> {
         if let Some(model) = u.model.as_deref()
             && let Some(prices) = self.by_model.get(model)
         {
@@ -411,7 +563,7 @@ impl PriceBook {
 /// dollars from guessed tokens are fiction, whatever the table says. A
 /// stamped cost is kept exactly as it is. Otherwise the config's current
 /// table prices the call, and the result is marked estimated.
-fn classify_cost(u: &Usage, book: &PriceBook) -> Cost {
+pub(crate) fn classify_cost(u: &Usage, book: &PriceBook) -> Cost {
     if u.estimated {
         return Cost::Unpriced;
     }
@@ -431,12 +583,33 @@ fn is_unstamped(u: &Usage) -> bool {
     !u.estimated && u.model.is_none() && u.profile.is_none()
 }
 
+/// The model table's key for one usage line (issue #111): its `model`
+/// when it names one, else its `profile` name, else `assumed <name>`
+/// when `--assume-profile` priced a line that names neither, else
+/// `(unknown)`. The key says which table priced the call and never
+/// hides a call behind a blank name.
+fn model_key(u: &Usage, book: &PriceBook) -> String {
+    if let Some(model) = u.model.as_deref() {
+        return model.to_owned();
+    }
+    if let Some(profile) = u.profile.as_deref() {
+        return format!("profile {profile}");
+    }
+    // Neither field: only `--assume-profile` can price it, and a
+    // runtime-estimated line or a stamped one with no name is unpriced.
+    match (&book.assumed, u.estimated, u.cost_usd) {
+        (Some((name, _)), false, None) => format!("assumed {name}"),
+        _ => "(unknown)".to_owned(),
+    }
+}
+
 /// `aigentic stats --since 7d --json`. `base` is the threads directory
 /// before the per-project split; `project` narrows to one project (the
 /// global `--project`), `None` covering every project on the machine.
 /// `book` is the config's price tables (issue #40).
 pub fn run(
     base: &Path,
+    workspaces: &[Workspace],
     project: Option<&str>,
     since: Option<&str>,
     json: bool,
@@ -446,7 +619,7 @@ pub fn run(
         Some(arg) => Some(parse_since(arg, OffsetDateTime::now_utc())?),
         None => None,
     };
-    let stats = collect(base, project, cutoff, book)?;
+    let stats = collect(base, workspaces, project, cutoff, book)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else {
@@ -474,44 +647,14 @@ pub fn parse_since(arg: &str, now: OffsetDateTime) -> anyhow::Result<OffsetDateT
     Ok(date.midnight().assume_utc())
 }
 
-/// Every project directory under `base`, `--project` narrowing to one.
-/// `_none` is the directory for work outside a project: it is a real
-/// group, not something to hide. A named project with no threads is an
-/// empty group, not an error.
-fn groups(base: &Path, project: Option<&str>) -> anyhow::Result<Vec<(String, PathBuf)>> {
-    let mut groups: Vec<(String, PathBuf)> = Vec::new();
-    match std::fs::read_dir(base) {
-        Ok(entries) => {
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                if project.is_some_and(|want| want != name) {
-                    continue;
-                }
-                groups.push((name.to_owned(), path));
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("reading {}", base.display())),
-    }
-    if let Some(want) = project
-        && !groups.iter().any(|(name, _)| name == want)
-    {
-        groups.push((want.to_owned(), base.join(want)));
-    }
-    groups.sort();
-    Ok(groups)
-}
-
-/// Walk every project directory under `base` and fold each thread's
-/// events into the day, project and top-thread totals.
+/// Walk every log under `base` — the flat directory and any legacy
+/// project directory a migration left behind (#9, #83) — and fold each
+/// thread into the totals of the project its own lines name. A log that
+/// can be read but says nothing about its project is `(no project)`:
+/// a real group, not something to hide.
 pub fn collect(
     base: &Path,
+    workspaces: &[Workspace],
     project: Option<&str>,
     cutoff: Option<OffsetDateTime>,
     book: &PriceBook,
@@ -522,32 +665,54 @@ pub fn collect(
     };
 
     let mut days: BTreeMap<String, Accum> = BTreeMap::new();
-    let mut projects: Vec<ProjectStats> = Vec::new();
+    let mut by_project: BTreeMap<String, Accum> = BTreeMap::new();
+    let mut models: BTreeMap<String, Accum> = BTreeMap::new();
+    let mut calls = CallSink::default();
     let mut threads: Vec<ThreadSpend> = Vec::new();
 
-    for (name, dir) in groups(base, project)? {
-        let mut acc = Accum::default();
-        for id in thread_ids(&dir) {
-            match ThreadLog::open(&dir, id).and_then(|log| log.read_all()) {
-                Ok(events) => {
-                    let mut thread = Accum::default();
-                    let meta = absorb(&mut acc, &mut thread, &events, cutoff, &mut days, book);
-                    // #40: a thread with no call inside the window is not
-                    // a row. Its title is a label, but a row is a total.
-                    // #46: an extraction inside the window is a total
-                    // too, so a thread that only extracted is still a
-                    // row — with 0 calls and its side-job money.
-                    if thread.calls > 0 || thread.job_calls > 0 {
-                        threads.push(thread.into_spend(id.to_string(), &name, meta.title));
-                    }
-                }
-                Err(_) => stats.unreadable += 1,
+    for found in threads_index::catalogue(base) {
+        let Ok(events) = found.read() else {
+            // An unreadable log has no lines to attribute it by, so it
+            // counts whenever the filter cannot be shown to exclude it:
+            // with no `--project`, or when its legacy directory is the
+            // requested project.
+            if project.is_none() || found.legacy.as_deref() == project {
+                stats.unreadable += 1;
             }
+            continue;
+        };
+        let name = attributed(&found, &events, workspaces);
+        if project.is_some_and(|want| want != name) {
+            continue;
         }
-        projects.push(ProjectStats {
-            project: name,
-            ..acc.into_project()
-        });
+        let acc = by_project.entry(name.clone()).or_default();
+        let mut thread = Accum::default();
+        let id = found.id.to_string();
+        let meta = absorb(
+            acc,
+            &mut thread,
+            WindowSinks {
+                models: &mut models,
+                thread_id: &id,
+                project_name: &name,
+                calls: &mut calls,
+            },
+            &events,
+            cutoff,
+            &mut days,
+            book,
+        );
+        // #40: a thread with no call inside the window is not a row. Its
+        // title is a label, but a row is a total. #46: an extraction
+        // inside the window is a total too, so a thread that only
+        // extracted is still a row — with 0 calls and its side-job money.
+        if thread.calls > 0 || thread.job_calls > 0 {
+            threads.push(thread.into_spend(found.id.to_string(), &name, meta.title));
+        }
+    }
+    // A named project with no threads is an empty group, not an error.
+    if let Some(want) = project {
+        by_project.entry(want.to_owned()).or_default();
     }
 
     // Dearest first on the *effective* spend (stamped + retro-priced),
@@ -573,16 +738,80 @@ pub fn collect(
     });
     threads.truncate(5);
     stats.threads = threads;
-    stats.projects = projects;
+    stats.projects = project_rows(by_project);
+    // #111: a project with nothing in the window — no call, no side job,
+    // no retry, no turn — is not a row. On 2026-10-07 about 22 empty
+    // temp projects led the report. Dropping them changes no total: every
+    // summary figure is summed over the days, not the projects. The one
+    // named by `--project` is kept even when empty, as its own group.
+    stats.projects.retain(|p| {
+        p.calls > 0
+            || p.job_calls > 0
+            || p.retries > 0
+            || !p.turns.is_empty()
+            || project.is_some_and(|want| want == p.project)
+            // `(no project)` is a real group, not an empty temp project:
+            // a log that names no project is shown as such (see
+            // `attributed`), so it is kept even with nothing inside the
+            // window.
+            || p.project == NO_PROJECT
+    });
+    stats.models = model_rows(models);
+    stats.costliest_calls = calls.into_sorted();
     stats.days = days.into_iter().map(|(day, a)| a.into_day(day)).collect();
     Ok(stats)
 }
 
-/// `aigentic stats --thread <id>` (issue #40): one thread read on its
-/// own, under the same `--since` window as the report. `--project`
-/// narrows the search; the global `--thread` supplies the id.
+/// The project name a found log's events give it, as the label: never an
+/// empty string.
+fn attributed(found: &Found, events: &[Event], workspaces: &[Workspace]) -> String {
+    let name = threads_index::project_of(events, found.legacy.as_deref(), workspaces);
+    threads_index::label(name.as_deref()).to_owned()
+}
+
+/// One row per project, by name, with `(no project)` last.
+fn project_rows(by_project: BTreeMap<String, Accum>) -> Vec<ProjectStats> {
+    let mut rows: Vec<(String, Accum)> = by_project.into_iter().collect();
+    rows.sort_by(|(a, _), (b, _)| {
+        (a == NO_PROJECT)
+            .cmp(&(b == NO_PROJECT))
+            .then_with(|| a.cmp(b))
+    });
+    rows.into_iter()
+        .map(|(name, acc)| ProjectStats {
+            project: name,
+            ..acc.into_project()
+        })
+        .collect()
+}
+
+/// One row per model, dearest first (issue #111): effective spend
+/// (calls plus side jobs), a priced model before an unpriced one, then
+/// calls, then the key, so the order is the same on every run.
+fn model_rows(models: BTreeMap<String, Accum>) -> Vec<ModelStats> {
+    let mut rows: Vec<ModelStats> = models
+        .into_iter()
+        .map(|(name, acc)| ModelStats {
+            model: name,
+            ..acc.into_model()
+        })
+        .collect();
+    rows.sort_by(|a, b| match (model_effective(a), model_effective(b)) {
+        (Some(x), Some(y)) => y
+            .partial_cmp(&x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.calls.cmp(&a.calls))
+            .then_with(|| a.model.cmp(&b.model)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => b.calls.cmp(&a.calls).then_with(|| a.model.cmp(&b.model)),
+    });
+    rows
+}
+
 pub fn run_thread(
     base: &Path,
+    workspaces: &[Workspace],
     project: Option<&str>,
     id: Ulid,
     since: Option<&str>,
@@ -593,7 +822,7 @@ pub fn run_thread(
         Some(arg) => Some(parse_since(arg, OffsetDateTime::now_utc())?),
         None => None,
     };
-    let report = collect_thread(base, project, id, cutoff, book)?;
+    let report = collect_thread(base, workspaces, project, id, cutoff, book)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -602,10 +831,11 @@ pub fn run_thread(
     Ok(())
 }
 
-/// `aigentic stats --issue <n>` (issue #40): every thread whose first
-/// own-user message names that issue, costliest first, with a total.
+/// `aigentic stats --issue <n>`: manually named threads, plus matching
+/// run leads and their step threads, costliest first, with a total.
 pub fn run_issue(
     base: &Path,
+    workspaces: &[Workspace],
     project: Option<&str>,
     issue: u64,
     since: Option<&str>,
@@ -616,7 +846,7 @@ pub fn run_issue(
         Some(arg) => Some(parse_since(arg, OffsetDateTime::now_utc())?),
         None => None,
     };
-    let report = collect_issue(base, project, issue, cutoff, book)?;
+    let report = collect_issue(base, workspaces, project, issue, cutoff, book)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -625,28 +855,46 @@ pub fn run_issue(
     Ok(())
 }
 
-/// Read one thread's log and fold it. An id that no project holds is an
-/// error naming it, so a typo never reads as an empty report.
+/// Read one thread's log and fold it: the id is looked for flat first,
+/// then in the legacy project directories. An id no log holds is an
+/// error naming it, so a typo never reads as an empty report. A thread
+/// attributed to another project than `--project` asks for is an error
+/// naming both.
 fn collect_thread(
     base: &Path,
+    workspaces: &[Workspace],
     project: Option<&str>,
     id: Ulid,
     cutoff: Option<OffsetDateTime>,
     book: &PriceBook,
 ) -> anyhow::Result<ThreadReport> {
-    for (name, dir) in groups(base, project)? {
-        if !dir.join(format!("{id}.jsonl")).is_file() {
+    for found in threads_index::catalogue(base) {
+        if found.id != id {
             continue;
         }
-        let events = ThreadLog::open(&dir, id)
-            .and_then(|log| log.read_all())
-            .with_context(|| format!("reading {}/{id}.jsonl", dir.display()))?;
+        let events = found
+            .read()
+            .with_context(|| format!("reading {}", found.path().display()))?;
+        let name = attributed(&found, &events, workspaces);
+        if let Some(want) = project
+            && want != name
+        {
+            bail!("thread {id} is in {name}, not {want}");
+        }
         let mut thread = Accum::default();
         let mut dropped = Accum::default();
+        let mut dropped_models = BTreeMap::new();
+        let mut dropped_calls = CallSink::default();
         let mut dropped_days = BTreeMap::new();
         let meta = absorb(
             &mut dropped,
             &mut thread,
+            WindowSinks {
+                models: &mut dropped_models,
+                thread_id: &id.to_string(),
+                project_name: &name,
+                calls: &mut dropped_calls,
+            },
             &events,
             cutoff,
             &mut dropped_days,
@@ -657,42 +905,80 @@ fn collect_thread(
     bail!("no thread {id} found under {}", base.display())
 }
 
-/// Every thread whose first own-user message names `issue`, folded.
-/// `--thread`'s walk, one project at a time.
+/// Every manually named thread, run lead, and child of a matching run,
+/// folded with the same totals as the other stats views.
 fn collect_issue(
     base: &Path,
+    workspaces: &[Workspace],
     project: Option<&str>,
     issue: u64,
     cutoff: Option<OffsetDateTime>,
     book: &PriceBook,
 ) -> anyhow::Result<IssueReport> {
     let mut threads: Vec<ThreadReport> = Vec::new();
-    for (name, dir) in groups(base, project)? {
-        for id in thread_ids(&dir) {
-            let Ok(events) = ThreadLog::open(&dir, id).and_then(|log| log.read_all()) else {
-                continue;
-            };
-            let mut thread = Accum::default();
-            let mut dropped = Accum::default();
-            let mut dropped_days = BTreeMap::new();
-            let meta = absorb(
-                &mut dropped,
-                &mut thread,
-                &events,
-                cutoff,
-                &mut dropped_days,
-                book,
-            );
-            if !names_issue(&meta, issue) {
-                continue;
-            }
-            // The window applies here too: a matched thread with no call
-            // inside it has no row, exactly as in the main report (and,
-            // since #46, no extraction inside it either).
-            if thread.calls == 0 && thread.job_calls == 0 {
-                continue;
-            }
-            threads.push(thread.into_report(id.to_string(), &name, meta));
+    let mut run_leads = HashSet::new();
+    let mut candidates = Vec::new();
+    for found in threads_index::catalogue(base) {
+        let Ok(events) = found.read() else {
+            continue;
+        };
+        let run_issue = events.iter().find_map(|event| {
+            (event.kind == EventKind::RunStarted)
+                .then(|| serde_json::from_value::<RunStartedPayload>(event.payload.clone()).ok())
+                .flatten()
+                .map(|payload| payload.issue)
+        });
+        if run_issue == Some(issue) {
+            run_leads.insert(found.id);
+        }
+        let parent_thread = events.iter().find_map(|event| {
+            (event.kind == EventKind::ThreadStarted)
+                .then(|| serde_json::from_value::<ThreadStartedPayload>(event.payload.clone()).ok())
+                .flatten()
+                .and_then(|payload| payload.parent_thread)
+        });
+        let name = attributed(&found, &events, workspaces);
+        if project.is_some_and(|want| want != name) {
+            continue;
+        }
+        let mut thread = Accum::default();
+        let mut dropped = Accum::default();
+        let mut dropped_models = BTreeMap::new();
+        let mut dropped_calls = CallSink::default();
+        let mut dropped_days = BTreeMap::new();
+        let meta = absorb(
+            &mut dropped,
+            &mut thread,
+            WindowSinks {
+                models: &mut dropped_models,
+                thread_id: &found.id.to_string(),
+                project_name: &name,
+                calls: &mut dropped_calls,
+            },
+            &events,
+            cutoff,
+            &mut dropped_days,
+            book,
+        );
+        let direct_match = run_issue == Some(issue) || names_issue(&meta, issue);
+        if !direct_match && parent_thread.is_none() {
+            continue;
+        }
+        // The window applies here too: a matched thread with no call
+        // inside it has no row, exactly as in the main report (and,
+        // since #46, no extraction inside it either).
+        if thread.calls == 0 && thread.job_calls == 0 {
+            continue;
+        }
+        candidates.push((
+            thread.into_report(found.id.to_string(), &name, meta),
+            parent_thread,
+            direct_match,
+        ));
+    }
+    for (thread, parent_thread, direct_match) in candidates {
+        if direct_match || parent_thread.is_some_and(|parent| run_leads.contains(&parent)) {
+            threads.push(thread);
         }
     }
     threads.sort_by(|a, b| match (effective_report(a), effective_report(b)) {
@@ -714,32 +1000,19 @@ fn collect_issue(
     })
 }
 
-fn thread_ids(dir: &Path) -> Vec<Ulid> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut ids: Vec<Ulid> = entries
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-        .filter_map(|p| p.file_stem()?.to_str()?.parse().ok())
-        .collect();
-    ids.sort_unstable_by(|a, b| b.cmp(a));
-    ids
-}
-
 /// The side jobs a log can carry (issues #46, #49): the line names its
 /// parts, and both feed one count because both are calls the loop made
 /// for its own bookkeeping, not steps of a turn.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum SideJob {
+pub(crate) enum SideJob {
     Extraction,
     Title,
+    Brief,
 }
 
 /// One group's running totals — a day or a project, folded the same way.
-#[derive(Default)]
-struct Accum {
+#[derive(Debug, Default)]
+pub(crate) struct Accum {
     /// The thread's summed `wall_secs` and `slept_secs` over the
     /// `turn_ended` lines that carried them (issue #47).
     wall_secs: Option<u64>,
@@ -767,6 +1040,7 @@ struct Accum {
     /// `job_calls` split by kind: how many extractions, how many titles.
     extractions: u32,
     titles: u32,
+    briefs: u32,
     job_context: u64,
     job_output: u64,
     job_spent: Option<f64>,
@@ -774,7 +1048,7 @@ struct Accum {
 }
 
 impl Accum {
-    fn add_call(&mut self, context: u64, cache_read: u64, cost: Cost) {
+    pub(crate) fn add_call(&mut self, context: u64, cache_read: u64, cost: Cost) {
         self.calls += 1;
         self.context_total += context;
         self.cache_read += cache_read;
@@ -798,23 +1072,24 @@ impl Accum {
     /// ranks by it. The day and project tables print the two separately,
     /// so their `spent` stays the calls' and a reader can still see what
     /// the main loop cost on its own.
-    fn row_spent(&self) -> Option<f64> {
+    pub(crate) fn row_spent(&self) -> Option<f64> {
         add(self.spent, self.job_spent)
     }
 
     /// The same sum for the retro-priced dollars.
-    fn row_estimated(&self) -> Option<f64> {
+    pub(crate) fn row_estimated(&self) -> Option<f64> {
         add(self.price_estimated_spent, self.job_price_estimated_spent)
     }
 
     /// One side-job line — a `memory_extracted`, or a `thread_renamed`
     /// with a usage since #49 — the same three price outcomes as a call,
     /// into the job counters.
-    fn add_job(&mut self, job: SideJob, context: u64, output: u64, cost: Cost) {
+    pub(crate) fn add_job(&mut self, job: SideJob, context: u64, output: u64, cost: Cost) {
         self.job_calls += 1;
         match job {
             SideJob::Extraction => self.extractions += 1,
             SideJob::Title => self.titles += 1,
+            SideJob::Brief => self.briefs += 1,
         }
         self.job_context += context;
         self.job_output += output;
@@ -854,11 +1129,46 @@ impl Accum {
             job_unpriced_calls: self.job_unpriced_calls,
             extractions: self.extractions,
             titles: self.titles,
+            briefs: self.briefs,
             job_context: self.job_context,
             job_output: self.job_output,
             job_spent: self.job_spent,
             job_price_estimated_spent: self.job_price_estimated_spent,
             project: String::new(),
+        }
+    }
+
+    /// One model's row (issue #111): `ProjectStats` field for field, as
+    /// `into_project` builds it, with the model key filled in by the
+    /// caller.
+    fn into_model(self) -> ModelStats {
+        ModelStats {
+            calls: self.calls,
+            priced_calls: self.priced_calls,
+            price_estimated_calls: self.price_estimated_calls,
+            unpriced_calls: self.unpriced_calls,
+            unstamped_calls: self.unstamped_calls,
+            spent: self.spent,
+            price_estimated_spent: self.price_estimated_spent,
+            peak_context: self.peak_context,
+            mean_context: mean(self.context_total, self.calls),
+            hit_rate: hit_rate(self.cache_read, self.context_total),
+            context_total: self.context_total,
+            cache_read: self.cache_read,
+            turns: self.turns,
+            retries: self.retries,
+            job_calls: self.job_calls,
+            job_priced_calls: self.job_priced_calls,
+            job_price_estimated_calls: self.job_price_estimated_calls,
+            job_unpriced_calls: self.job_unpriced_calls,
+            extractions: self.extractions,
+            titles: self.titles,
+            briefs: self.briefs,
+            job_context: self.job_context,
+            job_output: self.job_output,
+            job_spent: self.job_spent,
+            job_price_estimated_spent: self.job_price_estimated_spent,
+            model: String::new(),
         }
     }
 
@@ -884,6 +1194,7 @@ impl Accum {
             job_unpriced_calls: self.job_unpriced_calls,
             extractions: self.extractions,
             titles: self.titles,
+            briefs: self.briefs,
             job_context: self.job_context,
             job_output: self.job_output,
             job_spent: self.job_spent,
@@ -940,6 +1251,7 @@ impl Accum {
             job_unpriced_calls: self.job_unpriced_calls,
             extractions: self.extractions,
             titles: self.titles,
+            briefs: self.briefs,
             job_context: self.job_context,
             job_output: self.job_output,
             job_spent: self.job_spent,
@@ -984,6 +1296,42 @@ struct ThreadMeta {
     tool_errors: u32,
 }
 
+/// A call queued for replay into the project, the day and the model
+/// once the thread is fully folded (issue #111 added the model and the
+/// costliest-calls sink).
+struct QueuedCall {
+    model: String,
+    day: String,
+    context: u64,
+    cache_read: u64,
+    output: u64,
+    cost: Cost,
+    unstamped: bool,
+    stamp: String,
+    seq: u64,
+}
+
+/// A side job queued for the same replay, under the model that ran it.
+struct QueuedJob {
+    model: String,
+    day: String,
+    context: u64,
+    output: u64,
+    cost: Cost,
+    job: SideJob,
+}
+
+// #111: the two outputs that are neither the project nor the day — the
+// model table and the costliest-calls sink. `collect` keeps them;
+// `collect_thread` and `collect_issue` pass throwaways, so `--thread`
+// and `--issue` are unchanged.
+struct WindowSinks<'a> {
+    models: &'a mut BTreeMap<String, Accum>,
+    thread_id: &'a str,
+    project_name: &'a str,
+    calls: &'a mut CallSink,
+}
+
 /// Fold one thread's events into its own totals, its project's, and —
 /// for events in the window — its day's. Since #40 the window gates the
 /// project and the thread as well; only a thread's labels are read from
@@ -991,20 +1339,30 @@ struct ThreadMeta {
 fn absorb(
     project: &mut Accum,
     thread: &mut Accum,
+    sinks: WindowSinks<'_>,
     events: &[aigentic_runtime::aigentic_core::Event],
     cutoff: Option<OffsetDateTime>,
     days: &mut BTreeMap<String, Accum>,
     book: &PriceBook,
 ) -> ThreadMeta {
+    let WindowSinks {
+        models,
+        thread_id,
+        project_name,
+        calls: sink,
+    } = sinks;
     let mut meta = ThreadMeta::default();
     let mut renamed: Option<String> = None;
     let mut own_user_seen = false;
-    // The project and the days are the same window partitioned two ways,
-    // so each accepted call is replayed into both once the thread is
-    // fully folded. The side jobs — extractions and, since #49, titled
-    // calls — are replayed the same way, with their own counters.
-    let mut calls: Vec<(String, u64, u64, Cost, bool)> = Vec::new();
-    let mut job_days: Vec<(String, u64, u64, Cost, SideJob)> = Vec::new();
+    // The project, the days and the models are the same window
+    // partitioned three ways, so each accepted call is replayed into all
+    // three once the thread is fully folded (issue #111 added the
+    // model table and the costliest-calls sink; neither folds inline,
+    // which would double-count). The side jobs — extractions and, since
+    // #49, titled calls — are replayed the same way, with their own
+    // counters under the model that ran them.
+    let mut calls: Vec<QueuedCall> = Vec::new();
+    let mut job_days: Vec<QueuedJob> = Vec::new();
     let mut retry_days: Vec<String> = Vec::new();
     let mut turn_days: Vec<(String, String)> = Vec::new();
 
@@ -1041,7 +1399,19 @@ fn absorb(
                 if unstamped {
                     thread.unstamped_calls += 1;
                 }
-                calls.push((day, context, u.cache_read_tokens, cost, unstamped));
+                let model = model_key(&u, book);
+                let stamp = event.created_at.format(&Rfc3339).unwrap_or_default();
+                calls.push(QueuedCall {
+                    model,
+                    day,
+                    context,
+                    cache_read: u.cache_read_tokens,
+                    output: u.output_tokens,
+                    cost,
+                    unstamped,
+                    stamp,
+                    seq: event.seq,
+                });
             }
             EventKind::MemoryExtracted => {
                 // #46: the extraction is a priced call the log made on
@@ -1065,7 +1435,41 @@ fn absorb(
                     usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
                 let cost = classify_cost(&usage, book);
                 thread.add_job(SideJob::Extraction, context, usage.output_tokens, cost);
-                job_days.push((day, context, usage.output_tokens, cost, SideJob::Extraction));
+                job_days.push(QueuedJob {
+                    model: model_key(&usage, book),
+                    day,
+                    context,
+                    output: usage.output_tokens,
+                    cost,
+                    job: SideJob::Extraction,
+                });
+            }
+            EventKind::BriefRefreshed => {
+                // A brief refresh is a side job, priced and counted the
+                // way an extraction is.
+                if !in_window {
+                    continue;
+                }
+                let Ok(p) = serde_json::from_value::<BriefRefreshedPayload>(event.payload.clone())
+                else {
+                    continue;
+                };
+                let mut usage = p.usage;
+                if usage.model.is_none() {
+                    usage.model = Some(p.model);
+                }
+                let context =
+                    usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
+                let cost = classify_cost(&usage, book);
+                thread.add_job(SideJob::Brief, context, usage.output_tokens, cost);
+                job_days.push(QueuedJob {
+                    model: model_key(&usage, book),
+                    day,
+                    context,
+                    output: usage.output_tokens,
+                    cost,
+                    job: SideJob::Brief,
+                });
             }
             EventKind::ProviderRetried => {
                 if in_window {
@@ -1130,7 +1534,14 @@ fn absorb(
                     usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
                 let cost = classify_cost(&usage, book);
                 thread.add_job(SideJob::Title, context, usage.output_tokens, cost);
-                job_days.push((day, context, usage.output_tokens, cost, SideJob::Title));
+                job_days.push(QueuedJob {
+                    model: model_key(&usage, book),
+                    day,
+                    context,
+                    output: usage.output_tokens,
+                    cost,
+                    job: SideJob::Title,
+                });
             }
             EventKind::SkillLoaded => {
                 // Only a slash command in the client counts, and only
@@ -1167,7 +1578,18 @@ fn absorb(
         }
     }
 
-    for (day, context, cache_read, cost, unstamped) in calls {
+    for q in calls {
+        let QueuedCall {
+            model,
+            day,
+            context,
+            cache_read,
+            output,
+            cost,
+            unstamped,
+            stamp,
+            seq,
+        } = q;
         project.add_call(context, cache_read, cost);
         if unstamped {
             project.unstamped_calls += 1;
@@ -1177,10 +1599,44 @@ fn absorb(
         if unstamped {
             d.unstamped_calls += 1;
         }
+        models
+            .entry(model.clone())
+            .or_default()
+            .add_call(context, cache_read, cost);
+        let (spent, estimated) = match cost {
+            Cost::Stamped(usd) => (Some(usd), None),
+            Cost::Retro(usd) => (None, Some(usd)),
+            Cost::Unpriced => (None, None),
+        };
+        sink.push(
+            CallSpend {
+                id: thread_id.to_owned(),
+                project: project_name.to_owned(),
+                created_at: short_when(&stamp),
+                model,
+                context,
+                output,
+                spent,
+                price_estimated_spent: estimated,
+            },
+            seq,
+        );
     }
-    for (day, context, output, cost, job) in job_days {
+    for q in job_days {
+        let QueuedJob {
+            model,
+            day,
+            context,
+            output,
+            cost,
+            job,
+        } = q;
         project.add_job(job, context, output, cost);
         days.entry(day)
+            .or_default()
+            .add_job(job, context, output, cost);
+        models
+            .entry(model)
             .or_default()
             .add_job(job, context, output, cost);
     }
@@ -1246,12 +1702,23 @@ fn hashed_issue_number(text: &str) -> Option<u64> {
 
 /// A cost cell: stamped, estimated, both, or `-`. A guessed dollar is
 /// never dressed up as a measured one (`$` vs `~$`, issue #40).
-fn money(stamped: Option<f64>, estimated: Option<f64>) -> String {
+pub(crate) fn money(stamped: Option<f64>, estimated: Option<f64>) -> String {
     match (stamped, estimated) {
         (Some(a), Some(b)) => format!("${a:.4}+~${b:.4}"),
         (Some(a), None) => format!("${a:.4}"),
         (None, Some(b)) => format!("~${b:.4}"),
         (None, None) => "-".into(),
+    }
+}
+
+/// The `YYYY-MM-DD HH:MM`, UTC, the costliest-calls table shows for an
+/// event's RFC 3339 `created_at`. A value too short to hold them — which
+/// the log never writes — comes back as it is rather than panicking.
+fn short_when(created_at: &str) -> String {
+    if created_at.len() >= 16 {
+        format!("{} {}", &created_at[..10], &created_at[11..16])
+    } else {
+        created_at.to_owned()
     }
 }
 
@@ -1293,13 +1760,16 @@ fn cost_line(
 /// The side jobs' parts, in the line's own wording: `1 title`,
 /// `2 extractions`, or both. Empty only when there are none — no caller
 /// prints it then.
-fn job_parts(extractions: u32, titles: u32) -> String {
+fn job_parts(extractions: u32, titles: u32, briefs: u32) -> String {
     let mut parts = Vec::new();
     if extractions > 0 {
         parts.push(format!("{extractions} extraction{}", plural(extractions)));
     }
     if titles > 0 {
         parts.push(format!("{titles} title{}", plural(titles)));
+    }
+    if briefs > 0 {
+        parts.push(format!("{briefs} brief{}", plural(briefs)));
     }
     parts.join(", ")
 }
@@ -1323,13 +1793,14 @@ fn side_line(
     unpriced: u32,
     extractions: u32,
     titles: u32,
+    briefs: u32,
     context: u64,
     output: u64,
 ) -> String {
     let detail = format!(
         "{priced} priced, {price_estimated} estimated, {unpriced} unpriced; {}, \
          in {context} out {output}",
-        job_parts(extractions, titles),
+        job_parts(extractions, titles, briefs),
     );
     if stamped > 0.0 && estimated > 0.0 {
         format!("side jobs  ${stamped:.4} + ~${estimated:.4} ({detail})")
@@ -1398,6 +1869,7 @@ pub fn render_thread(t: &ThreadReport) -> String {
                 t.job_unpriced_calls,
                 t.extractions,
                 t.titles,
+                t.briefs,
                 t.job_context,
                 t.job_output
             )
@@ -1484,6 +1956,7 @@ pub fn render_issue(report: &IssueReport) -> String {
                 total.job_unpriced_calls,
                 total.extractions,
                 total.titles,
+                total.briefs,
                 total.job_context,
                 total.job_output
             )
@@ -1567,6 +2040,7 @@ pub fn render(stats: &Stats) -> String {
     let jobs: u32 = stats.days.iter().map(|d| d.job_calls).sum();
     let extractions: u32 = stats.days.iter().map(|d| d.extractions).sum();
     let titles: u32 = stats.days.iter().map(|d| d.titles).sum();
+    let briefs: u32 = stats.days.iter().map(|d| d.briefs).sum();
     let job_priced: u32 = stats.days.iter().map(|d| d.job_priced_calls).sum();
     let job_price_estimated: u32 = stats.days.iter().map(|d| d.job_price_estimated_calls).sum();
     let job_unpriced: u32 = stats.days.iter().map(|d| d.job_unpriced_calls).sum();
@@ -1599,6 +2073,7 @@ pub fn render(stats: &Stats) -> String {
                 job_unpriced,
                 extractions,
                 titles,
+                briefs,
                 job_context,
                 job_output
             )
@@ -1664,6 +2139,29 @@ pub fn render(stats: &Stats) -> String {
             ));
         }
     }
+    // #111: what the money went on, by model. The thread's model and the
+    // utility model are priced very differently, so the same window read
+    // by model answers a question the project table cannot. The layout
+    // is the project table's, and a window with no side job renders
+    // without the `jobs` column exactly as before.
+    if !stats.models.is_empty() {
+        out.push_str(&format!(
+            "\n{:<32} {:>5}{job_header} {:>10} {:>18} {:>9} {:>6}\n",
+            "model", "calls", "priced", "cost", "peak", "hit"
+        ));
+        for m in &stats.models {
+            let cell = side_cell(jobs > 0, m.job_spent, m.job_price_estimated_spent);
+            out.push_str(&format!(
+                "{:<32} {:>5}{cell} {:>10} {:>18} {:>9} {:>6.0}%\n",
+                m.model,
+                m.calls,
+                m.priced_calls,
+                money(m.spent, m.price_estimated_spent),
+                m.peak_context,
+                m.hit_rate * 100.0
+            ));
+        }
+    }
     if !stats.threads.is_empty() {
         out.push_str("\ncostliest threads\n");
         for t in &stats.threads {
@@ -1677,8 +2175,333 @@ pub fn render(stats: &Stats) -> String {
             ));
         }
     }
+    if !stats.costliest_calls.is_empty() {
+        out.push_str("\ncostliest calls\n");
+        for c in &stats.costliest_calls {
+            let id = c.id.chars().take(6).collect::<String>();
+            out.push_str(&format!(
+                "  {}  {id}  {}  {}  in {}  out {}  {}\n",
+                c.created_at,
+                c.project,
+                c.model,
+                c.context,
+                c.output,
+                money(c.spent, c.price_estimated_spent)
+            ));
+        }
+    }
     if stats.unreadable > 0 {
         out.push_str(&format!("\n{} thread(s) unreadable\n", stats.unreadable));
+    }
+    out
+}
+
+/// `aigentic stats --decisions` (issue #74): the decision record — how
+/// many decisions of each kind the harness proposed, and how the
+/// operator answered them. No producer writes the events yet, so on a
+/// machine built today this prints `no decisions recorded`.
+pub fn run_decisions(
+    base: &Path,
+    workspaces: &[Workspace],
+    project: Option<&str>,
+    since: Option<&str>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let cutoff = match since {
+        Some(arg) => Some(parse_since(arg, OffsetDateTime::now_utc())?),
+        None => None,
+    };
+    let report = collect_decisions(base, workspaces, project, cutoff)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_decisions(&report));
+    }
+    Ok(())
+}
+
+/// The decision record, and what `--json` prints.
+#[derive(Debug, Default, Serialize)]
+pub struct DecisionReport {
+    /// The window's start, RFC 3339, when `--since` was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// One row per kind with a proposal in the window, in
+    /// `DecisionKind`'s declaration order.
+    pub kinds: Vec<DecisionKindStats>,
+    /// Answers that named no proposal, or answered one twice, or did not
+    /// parse: counted, never guessed.
+    pub orphans: u32,
+    /// Threads whose files could not be read; counted so a figure is
+    /// never silently short (the same count `collect` makes).
+    pub unreadable: u32,
+}
+
+/// One kind's row. `yes`, `no`, `corrected` and `withdrawn` count the
+/// answers by what they said, whichever author wrote them; `rate` and
+/// `last_30` count only the operator's own answers, so a `withdrawn` the
+/// system wrote never flatters the record.
+#[derive(Debug, Serialize)]
+pub struct DecisionKindStats {
+    pub kind: DecisionKind,
+    /// True for #85's start-up proposals (a `startup-` call id), which
+    /// get their own row so the model's own `project` record isn't
+    /// diluted by them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub startup: bool,
+    pub proposed: u32,
+    pub yes: u32,
+    pub no: u32,
+    pub corrected: u32,
+    pub withdrawn: u32,
+    pub pending: u32,
+    /// `yes / (yes + no + corrected)` over the operator's answers, as a
+    /// whole percentage truncated (never rounded up, so a record tested
+    /// at 95% is never read as more); absent when nobody answered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate: Option<u32>,
+    /// The same ratio over the 30 most recent proposals a person
+    /// answered; absent when there are none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_30: Option<u32>,
+}
+
+/// Fold every walked thread's decisions and gather the proposals inside
+/// the window. A proposal counts when **the proposal** is inside it,
+/// with whatever answer it has: an answer inside the window to a
+/// proposal before it is left out.
+pub fn collect_decisions(
+    base: &Path,
+    workspaces: &[Workspace],
+    project: Option<&str>,
+    cutoff: Option<OffsetDateTime>,
+) -> anyhow::Result<DecisionReport> {
+    let mut report = DecisionReport {
+        since: cutoff.map(|c| c.format(&Rfc3339).unwrap_or_default()),
+        ..DecisionReport::default()
+    };
+    let mut records: Vec<DecisionRecord> = Vec::new();
+    for found in threads_index::catalogue(base) {
+        let Ok(events) = found.read() else {
+            // The same rule `collect` counts by: an unreadable log has
+            // no lines to attribute it by, so it counts unless the
+            // filter can be shown to exclude it.
+            if project.is_none() || found.legacy.as_deref() == project {
+                report.unreadable += 1;
+            }
+            continue;
+        };
+        if project.is_some_and(|want| want != attributed(&found, &events, workspaces)) {
+            continue;
+        }
+        let fold = decision_records(&events);
+        report.orphans += fold.orphans as u32;
+        records.extend(fold.records);
+    }
+    if let Some(cutoff) = cutoff {
+        records.retain(|r| r.at >= cutoff);
+    }
+    report.kinds = kind_rows(&records);
+    Ok(report)
+}
+
+/// The decisions table's narrowest name column: what it was before
+/// start-up rows (issue #85), so a table of plain rows is unchanged.
+const MIN_NAME_WIDTH: usize = 14;
+
+/// The 30 most recent answers `last 30` is taken over: ADR 0002's "the
+/// last 30 proposals of that kind that a person answered".
+const LAST_N: usize = 30;
+
+/// One row per `(kind, startup)` that has a proposal, each kind's
+/// start-up row right after its plain one and kinds in `DecisionKind`'s
+/// declaration order.
+///
+/// A subset with no proposals has no row: a kind whose plain subset is
+/// empty but whose start-up subset isn't prints the start-up row alone,
+/// so there is no all-zero row and no empty slice reaches `percent`.
+fn kind_rows(records: &[DecisionRecord]) -> Vec<DecisionKindStats> {
+    let mut rows = Vec::new();
+    for kind in ALL_KINDS {
+        for startup in [false, true] {
+            let of_kind: Vec<&DecisionRecord> = records
+                .iter()
+                .filter(|r| r.kind == kind && r.startup == startup)
+                .collect();
+            if of_kind.is_empty() {
+                continue;
+            }
+            rows.push(kind_row(kind, startup, &of_kind));
+        }
+    }
+    rows
+}
+
+/// One `(kind, startup)`'s figures: the counts by what each answer said,
+/// then `rate` and `last_30` over the operator's own answers.
+fn kind_row(kind: DecisionKind, startup: bool, of_kind: &[&DecisionRecord]) -> DecisionKindStats {
+    let mut row = DecisionKindStats {
+        kind,
+        startup,
+        proposed: of_kind.len() as u32,
+        yes: 0,
+        no: 0,
+        corrected: 0,
+        withdrawn: 0,
+        pending: 0,
+        rate: None,
+        last_30: None,
+    };
+    // The operator's own answers, kept apart from the counts above:
+    // `rate` is ADR 0002's "from the operator's own answers".
+    let (mut person_yes, mut person_no, mut person_corrected) = (0u32, 0u32, 0u32);
+    let mut answered: Vec<&DecisionRecord> = Vec::new();
+    for record in of_kind {
+        let Some(answer) = &record.answer else {
+            row.pending += 1;
+            continue;
+        };
+        match answer.answer {
+            DecisionAnswer::Yes => row.yes += 1,
+            DecisionAnswer::No => row.no += 1,
+            DecisionAnswer::Corrected => row.corrected += 1,
+            DecisionAnswer::Withdrawn => row.withdrawn += 1,
+        }
+        if !is_person(&answer.by) {
+            continue;
+        }
+        match answer.answer {
+            DecisionAnswer::Yes => {
+                person_yes += 1;
+                answered.push(record);
+            }
+            DecisionAnswer::No => {
+                person_no += 1;
+                answered.push(record);
+            }
+            DecisionAnswer::Corrected => {
+                person_corrected += 1;
+                answered.push(record);
+            }
+            // `withdrawn` closes a proposal nobody answered, so it
+            // is no part of what a person's record was.
+            DecisionAnswer::Withdrawn => {}
+        }
+    }
+    row.rate = percent(person_yes, person_yes + person_no + person_corrected);
+    // The most recent by proposal time, the proposal's id settling a
+    // tie, as the costliest-threads order does.
+    answered.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.id.cmp(&a.id)));
+    answered.truncate(LAST_N);
+    row.last_30 = percent(
+        answered
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.answer.as_ref().map(|a| a.answer),
+                    Some(DecisionAnswer::Yes)
+                )
+            })
+            .count() as u32,
+        answered.len() as u32,
+    );
+    row
+}
+
+/// Every kind, in declaration order: a new variant fails to compile here
+/// until it is given its place in the report.
+const ALL_KINDS: [DecisionKind; 6] = [
+    DecisionKind::Project,
+    DecisionKind::Job,
+    DecisionKind::Ticket,
+    DecisionKind::Knowledge,
+    DecisionKind::Route,
+    DecisionKind::WorkingSet,
+];
+
+/// A row's name: the kind, plus `(start-up)` for #85's proposals, which
+/// are the person's start-up question rather than the model's own.
+fn row_name(row: &DecisionKindStats) -> String {
+    if row.startup {
+        format!("{} (start-up)", kind_name(row.kind))
+    } else {
+        kind_name(row.kind).to_owned()
+    }
+}
+
+fn kind_name(kind: DecisionKind) -> &'static str {
+    match kind {
+        DecisionKind::Project => "project",
+        DecisionKind::Job => "job",
+        DecisionKind::Ticket => "ticket",
+        DecisionKind::Knowledge => "knowledge",
+        DecisionKind::Route => "route",
+        DecisionKind::WorkingSet => "working_set",
+    }
+}
+
+/// `Some(0)` when nobody answered at all, so the caller can print `-`
+/// rather than a rate nobody earned.
+fn percent(yes: u32, total: u32) -> Option<u32> {
+    (total > 0).then(|| yes * 100 / total)
+}
+
+fn is_person(author: &Author) -> bool {
+    matches!(author, Author::User(_))
+}
+
+fn percent_text(rate: Option<u32>) -> String {
+    match rate {
+        Some(rate) => format!("{rate}%"),
+        None => "-".to_owned(),
+    }
+}
+
+/// The report as the fixed-width text `stats` prints.
+pub fn render_decisions(report: &DecisionReport) -> String {
+    let mut out = String::new();
+    match &report.since {
+        Some(since) => out.push_str(&format!("proposals since {since} (with their answers)\n")),
+        None => out.push_str("proposals: all threads (with their answers)\n"),
+    }
+    if report.kinds.is_empty() {
+        out.push_str("no decisions recorded\n");
+    } else {
+        // The name column is as wide as the longest name printed, so
+        // `project (start-up)` lines up with the rest (issue #85), and
+        // never narrower than the 14 it always was, so a table of plain
+        // rows reads as it did before (#85's review).
+        let name_width = report
+            .kinds
+            .iter()
+            .map(|k| row_name(k).chars().count())
+            .chain(std::iter::once(MIN_NAME_WIDTH))
+            .max()
+            .unwrap_or(MIN_NAME_WIDTH);
+        out.push_str(&format!(
+            "\n{:<name_width$} {:>8} {:>5} {:>5} {:>10} {:>10} {:>7} {:>6} {:>8}\n",
+            "kind", "proposed", "yes", "no", "corrected", "withdrawn", "pending", "rate", "last 30"
+        ));
+        for k in &report.kinds {
+            out.push_str(&format!(
+                "{:<name_width$} {:>8} {:>5} {:>5} {:>10} {:>10} {:>7} {:>6} {:>8}\n",
+                row_name(k),
+                k.proposed,
+                k.yes,
+                k.no,
+                k.corrected,
+                k.withdrawn,
+                k.pending,
+                percent_text(k.rate),
+                percent_text(k.last_30)
+            ));
+        }
+    }
+    if report.orphans > 0 {
+        out.push_str(&format!("\n{} orphan answers\n", report.orphans));
+    }
+    if report.unreadable > 0 {
+        out.push_str(&format!("\n{} thread(s) unreadable\n", report.unreadable));
     }
     out
 }
@@ -1686,6 +2509,14 @@ pub fn render(stats: &Stats) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::threads_index::LEGACY_NONE_PROJECT;
+    use std::path::PathBuf;
+
+    use aigentic_runtime::aigentic_core::UserId;
+    use aigentic_runtime::aigentic_log::{
+        ProjectSwitchedPayload, RunStartedPayload, ThreadStartedPayload,
+    };
     use serde_json::json;
     use time::macros::datetime;
 
@@ -2116,7 +2947,7 @@ api_key_env = "TENSORX_API_KEY"
         let base = f.dir.path();
         // Only the first thread is priced, so the check has a spent sum
         // and a mixture to prove both branches.
-        let stats = collect(base, None, None, &no_prices()).unwrap();
+        let stats = collect(base, &[], None, None, &no_prices()).unwrap();
 
         let calls: u32 = stats.days.iter().map(|d| d.calls).sum();
         let priced: u32 = stats.days.iter().map(|d| d.priced_calls).sum();
@@ -2192,7 +3023,7 @@ api_key_env = "TENSORX_API_KEY"
         // The fixture's second day is 2026-09-23: a cutoff inside it
         // drops 2026-09-22's day.
         let cutoff = parse_since("2026-09-23", datetime!(2026-09-24 00:00:00 UTC)).unwrap();
-        let stats = collect(f.dir.path(), None, Some(cutoff), &no_prices()).unwrap();
+        let stats = collect(f.dir.path(), &[], None, Some(cutoff), &no_prices()).unwrap();
         let days: Vec<&str> = stats.days.iter().map(|d| d.day.as_str()).collect();
         assert_eq!(days, vec!["2026-09-23"], "{stats:?}");
         assert_eq!(stats.days[0].calls, 1);
@@ -2225,7 +3056,7 @@ api_key_env = "TENSORX_API_KEY"
         // `Nd` is now minus N whole days; a week back keeps both days.
         let week = parse_since("7d", datetime!(2026-09-24 12:00:00 UTC)).unwrap();
         assert_eq!(week, datetime!(2026-09-17 12:00:00 UTC));
-        let stats = collect(f.dir.path(), None, Some(week), &no_prices()).unwrap();
+        let stats = collect(f.dir.path(), &[], None, Some(week), &no_prices()).unwrap();
         assert_eq!(stats.days.len(), 2);
         assert_eq!(
             stats.projects.iter().map(|p| p.calls).sum::<u32>(),
@@ -2247,7 +3078,7 @@ api_key_env = "TENSORX_API_KEY"
     #[test]
     fn costliest_threads_rank_by_effective_spend_then_calls_with_titles() {
         let f = fixture();
-        let stats = collect(f.dir.path(), None, None, &no_prices()).unwrap();
+        let stats = collect(f.dir.path(), &[], None, None, &no_prices()).unwrap();
         // The fixture sorted in-test by spend, unpriced last.
         let mut expected: Vec<(String, Option<f64>, u32)> = vec![
             ("alpha".to_owned(), Some(0.75), 2),
@@ -2331,7 +3162,7 @@ api_key_env = "TENSORX_API_KEY"
         write_thread(&base, guessy, &guessy_lines);
         write_thread(&base, stamped, &stamped_lines);
 
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let mixed_retro = expected_cost(PRICED_CONFIG, "tensorx", &mixed_lines[2]);
         let guessy_retro = expected_cost(PRICED_CONFIG, "flash", &guessy_lines[1]);
         assert!(
@@ -2431,7 +3262,7 @@ api_key_env = "TENSORX_API_KEY"
             ],
         );
 
-        let stats = collect(dir.path(), None, None, &no_prices()).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &no_prices()).unwrap();
         let title = |id: Ulid| {
             stats
                 .threads
@@ -2488,7 +3319,7 @@ api_key_env = "TENSORX_API_KEY"
     fn one_thread_reads_back_every_field_from_its_lines() {
         let (dir, id, lines) = single_thread_fixture();
         let book = book_of(PRICED_CONFIG);
-        let report = collect_thread(dir.path(), None, id, None, &book).unwrap();
+        let report = collect_thread(dir.path(), &[], None, id, None, &book).unwrap();
 
         assert_eq!(report.id, id.to_string());
         assert_eq!(report.project, "alpha");
@@ -2549,7 +3380,7 @@ api_key_env = "TENSORX_API_KEY"
         // The window gates the report too: a cutoff past the thread
         // leaves its labels but no calls.
         let cutoff = Some(datetime!(2026-09-28 00:00:00 UTC));
-        let after = collect_thread(dir.path(), None, id, cutoff, &book).unwrap();
+        let after = collect_thread(dir.path(), &[], None, id, cutoff, &book).unwrap();
         assert_eq!(after.calls, 0);
         assert_eq!(after.sweeps, 0);
         assert_eq!(after.tool_errors, 0);
@@ -2558,14 +3389,14 @@ api_key_env = "TENSORX_API_KEY"
         // An id no project holds is an error naming it, never an empty
         // report.
         let missing = Ulid::generate();
-        let err = collect_thread(dir.path(), None, missing, None, &book)
+        let err = collect_thread(dir.path(), &[], None, missing, None, &book)
             .unwrap_err()
             .to_string();
         assert!(err.contains(&missing.to_string()), "{err}");
 
         // `--project` narrows the search: the same id is not in `beta`.
-        assert!(collect_thread(dir.path(), Some("beta"), id, None, &book).is_err());
-        assert!(collect_thread(dir.path(), Some("alpha"), id, None, &book).is_ok());
+        assert!(collect_thread(dir.path(), &[], Some("beta"), id, None, &book).is_err());
+        assert!(collect_thread(dir.path(), &[], Some("alpha"), id, None, &book).is_ok());
     }
 
     /// T15 (issue #47): a thread whose turns measured themselves reports
@@ -2598,7 +3429,7 @@ api_key_env = "TENSORX_API_KEY"
                 measured_turn_ended("2026-09-27T12:40:20Z", "done", second_wall, 0, 0, "on"),
             ],
         );
-        let report = collect_thread(dir.path(), None, measured, None, &book).unwrap();
+        let report = collect_thread(dir.path(), &[], None, measured, None, &book).unwrap();
         let wall = first_wall + second_wall;
         assert_eq!(report.wall_secs, Some(wall));
         assert_eq!(report.slept_secs, Some(slept));
@@ -2627,7 +3458,7 @@ api_key_env = "TENSORX_API_KEY"
                 turn_ended("2026-09-27T12:00:00Z", "done"),
             ],
         );
-        let report = collect_thread(dir.path(), None, old, None, &book).unwrap();
+        let report = collect_thread(dir.path(), &[], None, old, None, &book).unwrap();
         assert_eq!(report.wall_secs, None);
         assert_eq!(report.slept_secs, None);
         let text = render_thread(&report);
@@ -2644,7 +3475,7 @@ api_key_env = "TENSORX_API_KEY"
                 measured_turn_ended("2026-09-27T12:12:00Z", "done", 120, 0, 0, "on"),
             ],
         );
-        let report = collect_thread(dir.path(), None, awake, None, &book).unwrap();
+        let report = collect_thread(dir.path(), &[], None, awake, None, &book).unwrap();
         assert_eq!(report.wall_secs, Some(120));
         assert_eq!(report.slept_secs, Some(0));
         let text = render_thread(&report);
@@ -2757,6 +3588,141 @@ api_key_env = "TENSORX_API_KEY"
         (dir, plain, skill, model_skill, next_line, bare)
     }
 
+    fn issue_run_started(at: &str, issue: u64) -> serde_json::Value {
+        json!({
+            "kind": "run_started",
+            "author": {"kind": "agent", "id": "runner"},
+            "payload": serde_json::to_value(RunStartedPayload {
+                issue,
+                workflow: "test".into(),
+                version: 1,
+                content_hash: "test".into(),
+                budget_usd: 10.0,
+            })
+            .unwrap(),
+            "created_at": at,
+        })
+    }
+
+    fn issue_thread_started(at: &str, parent_thread: Option<Ulid>) -> serde_json::Value {
+        json!({
+            "kind": "thread_started",
+            "author": {"kind": "agent", "id": "runner"},
+            "payload": serde_json::to_value(ThreadStartedPayload {
+                project: Some("alpha".into()),
+                root: PathBuf::from("alpha"),
+                created_by: Author::User(UserId("steve".into())),
+                parent_thread,
+                step: parent_thread.map(|_| "implement".into()),
+                front: false,
+                job: false,
+            })
+            .unwrap(),
+            "created_at": at,
+        })
+    }
+
+    #[test]
+    fn an_issue_search_includes_run_leads_and_their_step_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let lead = id_at(1);
+        let first_child = id_at(2);
+        let second_child = id_at(3);
+        let other_lead = id_at(4);
+        let other_child = id_at(5);
+
+        // The catalogue visits newer ULIDs first, so both children are
+        // read before their lead. Association must not depend on order.
+        write_thread(
+            &base,
+            lead,
+            &[
+                issue_thread_started("2026-09-27T09:00:00Z", None),
+                issue_run_started("2026-09-27T09:00:01Z", 71),
+                call(
+                    "2026-09-27T09:00:02Z",
+                    10,
+                    0,
+                    10,
+                    Some(0.25),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+            ],
+        );
+        for (id, cost, at) in [
+            (first_child, 0.5, "2026-09-27T09:10:00Z"),
+            (second_child, 0.75, "2026-09-27T09:20:00Z"),
+        ] {
+            write_thread(
+                &base,
+                id,
+                &[
+                    issue_thread_started(at, Some(lead)),
+                    call(at, 10, 0, 10, Some(cost), Some("z-ai/glm-5.3"), None),
+                ],
+            );
+        }
+
+        write_thread(
+            &base,
+            other_lead,
+            &[
+                issue_thread_started("2026-09-27T09:30:00Z", None),
+                issue_run_started("2026-09-27T09:30:01Z", 72),
+                call(
+                    "2026-09-27T09:30:02Z",
+                    10,
+                    0,
+                    10,
+                    Some(4.0),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+            ],
+        );
+        write_thread(
+            &base,
+            other_child,
+            &[
+                issue_thread_started("2026-09-27T09:40:00Z", Some(other_lead)),
+                call(
+                    "2026-09-27T09:40:01Z",
+                    10,
+                    0,
+                    10,
+                    Some(8.0),
+                    Some("z-ai/glm-5.3"),
+                    None,
+                ),
+            ],
+        );
+
+        let report = collect_issue(dir.path(), &[], None, 71, None, &no_prices()).unwrap();
+        assert_eq!(report.total.threads, 3, "{:?}", report.threads);
+        assert_eq!(report.total.calls, 3, "{:?}", report.threads);
+        assert_eq!(report.total.spent, Some(1.5), "{:?}", report.threads);
+        for (id, spent) in [(lead, 0.25), (first_child, 0.5), (second_child, 0.75)] {
+            let thread = report
+                .threads
+                .iter()
+                .find(|thread| thread.id == id.to_string())
+                .unwrap_or_else(|| panic!("missing run thread {id}"));
+            assert_eq!(thread.calls, 1);
+            assert_eq!(thread.spent, Some(spent));
+        }
+        assert!(
+            !report
+                .threads
+                .iter()
+                .any(|thread| thread.id == other_lead.to_string()
+                    || thread.id == other_child.to_string()),
+            "another issue's run must stay out of the report: {:?}",
+            report.threads
+        );
+    }
+
     #[test]
     fn an_issue_search_matches_the_first_message_and_never_a_substring() {
         let (dir, plain, skill, model_skill, past_title, bare) = issue_fixture();
@@ -2770,7 +3736,7 @@ api_key_env = "TENSORX_API_KEY"
         };
 
         // (a) `#40` anywhere in the first message matches.
-        let report = collect_issue(dir.path(), None, 40, None, &book).unwrap();
+        let report = collect_issue(dir.path(), &[], None, 40, None, &book).unwrap();
         assert!(
             ids(&report).contains(&plain.to_string()),
             "{:?}",
@@ -2822,7 +3788,7 @@ api_key_env = "TENSORX_API_KEY"
             ],
         );
         assert!(
-            collect_issue(dir2.path(), None, 40, None, &book)
+            collect_issue(dir2.path(), &[], None, 40, None, &book)
                 .unwrap()
                 .threads
                 .is_empty()
@@ -2830,14 +3796,14 @@ api_key_env = "TENSORX_API_KEY"
         // `#400` names 400, not 40 — the digits are one reference, so
         // the boundary rule can never split them into 4 and 00.
         assert_eq!(
-            collect_issue(dir2.path(), None, 400, None, &book)
+            collect_issue(dir2.path(), &[], None, 400, None, &book)
                 .unwrap()
                 .threads
                 .len(),
             1
         );
         assert!(
-            collect_issue(dir.path(), None, 4, None, &book)
+            collect_issue(dir.path(), &[], None, 4, None, &book)
                 .unwrap()
                 .threads
                 .is_empty(),
@@ -2878,14 +3844,14 @@ api_key_env = "TENSORX_API_KEY"
         write_thread(&dir.path().join("alpha"), first, &lines);
         let book = no_prices();
         assert_eq!(
-            collect_issue(dir.path(), None, 40, None, &book)
+            collect_issue(dir.path(), &[], None, 40, None, &book)
                 .unwrap()
                 .threads
                 .len(),
             1
         );
         assert!(
-            collect_issue(dir.path(), None, 44, None, &book)
+            collect_issue(dir.path(), &[], None, 44, None, &book)
                 .unwrap()
                 .threads
                 .is_empty(),
@@ -2912,7 +3878,7 @@ api_key_env = "TENSORX_API_KEY"
             ],
         );
         assert_eq!(
-            collect_issue(dir2.path(), None, 40, None, &book)
+            collect_issue(dir2.path(), &[], None, 40, None, &book)
                 .unwrap()
                 .threads
                 .len(),
@@ -2923,7 +3889,7 @@ api_key_env = "TENSORX_API_KEY"
     #[test]
     fn json_round_trips_the_same_totals() {
         let f = fixture();
-        let stats = collect(f.dir.path(), None, None, &no_prices()).unwrap();
+        let stats = collect(f.dir.path(), &[], None, None, &no_prices()).unwrap();
         let text = serde_json::to_string(&stats).unwrap();
         let back: serde_json::Value = serde_json::from_str(&text).unwrap();
         let day = &back["days"][0];
@@ -2943,12 +3909,12 @@ api_key_env = "TENSORX_API_KEY"
     #[test]
     fn one_project_narrows_the_walk() {
         let f = fixture();
-        let stats = collect(f.dir.path(), Some("beta"), None, &no_prices()).unwrap();
+        let stats = collect(f.dir.path(), &[], Some("beta"), None, &no_prices()).unwrap();
         assert_eq!(stats.projects.len(), 1);
         assert_eq!(stats.projects[0].project, "beta");
         assert_eq!(stats.projects[0].calls, 1);
         // A project with no threads is an empty report, not an error.
-        let none = collect(f.dir.path(), Some("gamma"), None, &no_prices()).unwrap();
+        let none = collect(f.dir.path(), &[], Some("gamma"), None, &no_prices()).unwrap();
         assert_eq!(none.projects[0].calls, 0);
     }
 
@@ -2961,7 +3927,7 @@ api_key_env = "TENSORX_API_KEY"
             b"{not json",
         )
         .unwrap();
-        let stats = collect(f.dir.path(), None, None, &no_prices()).unwrap();
+        let stats = collect(f.dir.path(), &[], None, None, &no_prices()).unwrap();
         assert_eq!(stats.unreadable, 1, "{stats:?}");
         // And the readable thread is still fully counted.
         assert_eq!(stats.projects.iter().map(|p| p.calls).sum::<u32>(), 3);
@@ -3019,7 +3985,7 @@ api_key_env = "TENSORX_API_KEY"
         ];
         let project = dir.path().join("alpha");
         write_thread(&project, id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let day = &stats.days[0];
 
         assert_eq!(day.calls, 5);
@@ -3064,7 +4030,7 @@ api_key_env = "TENSORX_API_KEY"
         );
 
         // No table at all: nothing is guessed, and nothing is claimed.
-        let none = collect(dir.path(), None, None, &no_prices()).unwrap();
+        let none = collect(dir.path(), &[], None, None, &no_prices()).unwrap();
         assert_eq!(none.days[0].price_estimated_calls, 0, "{:?}", none.days[0]);
         assert!(none.days[0].price_estimated_spent.is_none());
         assert_eq!(none.days[0].priced_calls, 1);
@@ -3086,6 +4052,7 @@ api_key_env = "TENSORX_API_KEY"
         // Without the flag: unpriced, and said to predate model stamping.
         let stats = collect(
             dir.path(),
+            &[],
             None,
             None,
             &PriceBook::from_config(&config, None).unwrap(),
@@ -3103,7 +4070,7 @@ api_key_env = "TENSORX_API_KEY"
         // With it: the named profile's table prices it, flagged estimated,
         // and the unstamped line goes away.
         let book = PriceBook::from_config(&config, Some("tensorx")).unwrap();
-        let stats = collect(dir.path(), None, None, &book).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book).unwrap();
         let expected = expected_cost(PRICED_CONFIG, "tensorx", &lines[1]);
         assert_eq!(stats.days[0].price_estimated_calls, 1);
         assert_eq!(stats.days[0].unstamped_calls, 0);
@@ -3158,7 +4125,7 @@ api_key_env = "TENSORX_API_KEY"
             ),
         ];
         write_thread(&dir.path().join("alpha"), id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let day = &stats.days[0];
 
         assert_eq!(day.calls, 1);
@@ -3205,7 +4172,7 @@ api_key_env = "TENSORX_API_KEY"
             payload_only_extraction("2026-09-28T10:00:02Z", "some/other-model", 900, 90),
         ];
         write_thread(&dir.path().join("alpha"), id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let day = &stats.days[0];
 
         let retro = expected_memory_cost(PRICED_CONFIG, &lines[1]);
@@ -3239,6 +4206,46 @@ api_key_env = "TENSORX_API_KEY"
         assert_eq!(stats.threads[0].price_estimated_spent, Some(retro));
     }
 
+    /// A brief refresh is a side job: `stats` counts it, prices it from
+    /// its own stamp, and names it on the side-jobs line.
+    #[test]
+    fn a_brief_refresh_is_a_side_job_with_its_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Ulid::generate();
+        let lines = vec![
+            user("2026-09-28T11:00:00Z", "write the notes"),
+            json!({
+                "kind": "brief_refreshed",
+                "author": {"kind": "system"},
+                "payload": {
+                    "through_seq": 1,
+                    "old_hash": "a",
+                    "new_hash": "b",
+                    "model": "deepseek/deepseek-v4.1-flash",
+                    "usage": {
+                        "input_tokens": 900,
+                        "output_tokens": 60,
+                        "cache_read_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "estimated": false,
+                        "cost_usd": 0.0125,
+                        "model": "deepseek/deepseek-v4.1-flash",
+                    },
+                },
+                "created_at": "2026-09-28T11:00:02Z",
+            }),
+        ];
+        write_thread(&dir.path().join("alpha"), id, &lines);
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let day = &stats.days[0];
+        assert_eq!((day.job_calls, day.briefs), (1, 1));
+        assert_eq!(day.job_spent, Some(0.0125));
+        assert_eq!((day.job_context, day.job_output), (900, 60));
+        let text = render(&stats);
+        assert!(text.contains("side jobs  $0.0125 ("), "{text}");
+        assert!(text.contains("; 1 brief, in 900 out 60)"), "{text}");
+    }
+
     /// T7 (issue #46): the two lines a window with extractions adds. The
     /// measured and the guessed dollars keep #40's `$a + ~$b` split, and
     /// the total is the two halves added by class.
@@ -3268,7 +4275,7 @@ api_key_env = "TENSORX_API_KEY"
             payload_only_extraction("2026-09-28T11:00:03Z", "z-ai/glm-5.3", 800, 100),
         ];
         write_thread(&dir.path().join("alpha"), id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let retro = expected_memory_cost(PRICED_CONFIG, &lines[3]);
         let day = &stats.days[0];
         let side_jobs = [&lines[2], &lines[3]];
@@ -3319,7 +4326,7 @@ api_key_env = "TENSORX_API_KEY"
                 lines[1].clone(),
             ],
         );
-        let none = collect(plain.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let none = collect(plain.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let text = render(&none);
         assert!(!text.contains("side jobs"), "{text}");
         assert!(!text.contains("total "), "{text}");
@@ -3367,7 +4374,7 @@ api_key_env = "TENSORX_API_KEY"
                 ),
             ],
         );
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
 
         // Dearest first: the side-job-only thread's 0.30 beats the
         // turn's 0.05, and its `calls` still says 0.
@@ -3400,6 +4407,520 @@ api_key_env = "TENSORX_API_KEY"
         );
     }
 
+    /// T1 (issue #111): the model table folds every call and side job
+    /// under the model that ran it, keeps the calls' and the side jobs'
+    /// dollars apart, and ranks rows by effective spend (a priced row
+    /// before an unpriced one). Every figure is the fixture's own.
+    #[test]
+    fn t1_model_table_folds_calls_and_side_jobs_by_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let one = Ulid::generate();
+        let two = Ulid::generate();
+        let stamped = call(
+            "2026-09-28T10:00:01Z",
+            100,
+            0,
+            10,
+            Some(0.05),
+            Some("z-ai/glm-5.3"),
+            Some("tensorx"),
+        );
+        let retro = call(
+            "2026-09-28T10:00:02Z",
+            200,
+            0,
+            20,
+            None,
+            Some("deepseek/deepseek-v4.1-flash"),
+            Some("flash"),
+        );
+        let unpriced = call(
+            "2026-09-28T10:00:03Z",
+            300,
+            0,
+            30,
+            None,
+            Some("some/other-model"),
+            Some("priceless"),
+        );
+        let profile_only = call(
+            "2026-09-28T10:00:04Z",
+            400,
+            0,
+            40,
+            None,
+            None,
+            Some("flash"),
+        );
+        let nameless = call("2026-09-28T10:00:05Z", 500, 0, 50, None, None, None);
+        write_thread(
+            &base,
+            one,
+            &[
+                user("2026-09-28T10:00:00Z", "calls by model"),
+                stamped,
+                retro.clone(),
+                unpriced,
+                profile_only,
+                nameless,
+            ],
+        );
+        let extraction = stamped_extraction(
+            "2026-09-28T11:00:01Z",
+            "deepseek/deepseek-v4.1-flash",
+            100,
+            0,
+            10,
+            Some(0.30),
+        );
+        let title = titled(
+            "2026-09-28T11:00:02Z",
+            "a title",
+            "deepseek/deepseek-v4.1-flash",
+            50,
+            0,
+            5,
+            Some(0.20),
+        );
+        write_thread(
+            &base,
+            two,
+            &[user("2026-09-28T11:00:00Z", "side jobs"), extraction, title],
+        );
+
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let row = |name: &str| {
+            stats
+                .models
+                .iter()
+                .find(|m| m.model == name)
+                .unwrap_or_else(|| panic!("no {name} row in {:?}", stats.models))
+        };
+
+        // The thread's own model: one stamped call, nothing on the side.
+        let glm = row("z-ai/glm-5.3");
+        assert_eq!((glm.calls, glm.priced_calls, glm.spent), (1, 1, Some(0.05)));
+        assert_eq!(glm.job_calls, 0);
+        assert_eq!(glm.job_spent, None);
+        assert_eq!(glm.peak_context, 100);
+        assert_eq!(glm.hit_rate, hit_rate(0, 100));
+
+        // A retro-priced call: priced from the config's table, marked
+        // estimated. The utility model's own row carries the side jobs,
+        // kept apart from its calls.
+        let retro_cost = expected_cost(PRICED_CONFIG, "flash", &retro);
+        let flash = row("deepseek/deepseek-v4.1-flash");
+        assert_eq!(flash.calls, 1);
+        assert_eq!(flash.price_estimated_calls, 1);
+        assert!((flash.price_estimated_spent.unwrap() - retro_cost).abs() < 1e-12);
+        assert_eq!(flash.job_calls, 2);
+        assert_eq!(flash.extractions, 1);
+        assert_eq!(flash.titles, 1);
+        assert_eq!(flash.job_spent, Some(0.50));
+        assert_eq!(flash.job_context, 150);
+
+        // A line that names a profile but no model is keyed by the
+        // profile; a line with neither says so.
+        let prof = row("profile flash");
+        assert_eq!((prof.calls, prof.price_estimated_calls), (1, 1));
+        let unknown = row("(unknown)");
+        assert_eq!((unknown.calls, unknown.unpriced_calls), (1, 1));
+
+        // Dearest first; the two unpriced rows fall back to calls, then
+        // the key.
+        assert_eq!(
+            stats
+                .models
+                .iter()
+                .map(|m| m.model.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "deepseek/deepseek-v4.1-flash",
+                "z-ai/glm-5.3",
+                "profile flash",
+                "(unknown)",
+                "some/other-model",
+            ]
+        );
+    }
+
+    /// T1 (issue #111), second half: a line that names neither a model
+    /// nor a profile is keyed `assumed <name>` when `--assume-profile`
+    /// priced it, and reads `~$`.
+    #[test]
+    fn t1_a_nameless_line_is_keyed_by_the_assumed_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let id = Ulid::generate();
+        let nameless = call("2026-09-28T10:00:01Z", 500, 0, 50, None, None, None);
+        write_thread(
+            &base,
+            id,
+            &[user("2026-09-28T10:00:00Z", "old line"), nameless.clone()],
+        );
+        let config = Config::parse(PRICED_CONFIG).unwrap();
+
+        // No book: `(unknown)`, unpriced.
+        let stats = collect(dir.path(), &[], None, None, &no_prices()).unwrap();
+        let unknown = stats
+            .models
+            .iter()
+            .find(|m| m.model == "(unknown)")
+            .unwrap_or_else(|| panic!("no (unknown) row in {:?}", stats.models));
+        assert_eq!(
+            (unknown.calls, unknown.unpriced_calls, unknown.spent),
+            (1, 1, None)
+        );
+
+        // `--assume-profile tensorx`: keyed `assumed tensorx`, estimated.
+        let book = PriceBook::from_config(&config, Some("tensorx")).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book).unwrap();
+        let assumed = stats
+            .models
+            .iter()
+            .find(|m| m.model == "assumed tensorx")
+            .unwrap_or_else(|| panic!("no assumed row in {:?}", stats.models));
+        let expected = expected_cost(PRICED_CONFIG, "tensorx", &nameless);
+        assert_eq!(assumed.price_estimated_calls, 1);
+        assert!((assumed.price_estimated_spent.unwrap() - expected).abs() < 1e-12);
+        assert!(
+            render(&stats).contains(&format!("~${expected:.4}")),
+            "{}",
+            render(&stats)
+        );
+    }
+
+    /// T2 (issue #111): the ten costliest calls, priced ones first by
+    /// effective cost descending, each field the event's own; the text
+    /// line shows the id's first six characters and the JSON the full id.
+    #[test]
+    fn t2_ten_costliest_calls_rank_priced_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let id = Ulid::generate();
+        let mut lines = vec![user("2026-10-07T13:00:00Z", "spend")];
+        let mut priced = Vec::new();
+        for n in 1..=14u64 {
+            let at = format!("2026-10-07T14:{n:02}:00Z");
+            let cost = n as f64 / 100.0;
+            let e = call(
+                &at,
+                1000,
+                0,
+                100,
+                Some(cost),
+                Some("z-ai/glm-5.3"),
+                Some("tensorx"),
+            );
+            lines.push(e);
+            priced.push((at, cost));
+        }
+        // Three unpriced calls with far bigger prompts: priced calls
+        // outrank them, so none of these is listed.
+        for (i, ctx) in [900_000u64, 800_000, 700_000].iter().enumerate() {
+            lines.push(call(
+                &format!("2026-10-07T15:0{i}:00Z"),
+                *ctx,
+                0,
+                1,
+                None,
+                Some("some/other-model"),
+                Some("priceless"),
+            ));
+        }
+        write_thread(&base, id, &lines);
+
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        assert_eq!(stats.costliest_calls.len(), 10);
+        // Dearest first: n = 14 down to 5, each field the event's own.
+        for (slot, n) in (5..=14u64).rev().enumerate() {
+            let c = &stats.costliest_calls[slot];
+            let (at, cost) = &priced[(n - 1) as usize];
+            assert_eq!(c.id, id.to_string());
+            assert_eq!(c.project, "alpha");
+            assert_eq!(c.created_at, short_when(at));
+            assert_eq!(c.model, "z-ai/glm-5.3");
+            assert_eq!(c.context, 1000);
+            assert_eq!(c.output, 100);
+            assert!((c.spent.unwrap() - cost).abs() < 1e-12);
+            assert_eq!(c.price_estimated_spent, None);
+        }
+
+        // The text line shows the id's first six characters; the JSON's
+        // `id` is the whole one.
+        let text = render(&stats);
+        assert!(text.contains("costliest calls"), "{text}");
+        let first = text
+            .lines()
+            .skip_while(|l| *l != "costliest calls")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no costliest-calls row in {text}"));
+        let short: String = id.to_string().chars().take(6).collect();
+        assert!(first.contains(&short), "{first}");
+        assert!(!first.contains(&id.to_string()), "{first}");
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["costliest_calls"].as_array().unwrap().len(), 10);
+        assert_eq!(json["costliest_calls"][0]["id"], json!(id.to_string()));
+    }
+
+    /// T2 (issue #111): two calls of equal cost go by the larger prompt
+    /// first.
+    #[test]
+    fn t2_a_tie_gives_the_larger_prompt_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let id = Ulid::generate();
+        write_thread(
+            &base,
+            id,
+            &[
+                user("2026-10-08T09:00:00Z", "tie"),
+                call(
+                    "2026-10-08T09:00:01Z",
+                    100,
+                    0,
+                    1,
+                    Some(0.10),
+                    Some("z-ai/glm-5.3"),
+                    Some("tensorx"),
+                ),
+                call(
+                    "2026-10-08T09:00:02Z",
+                    200,
+                    0,
+                    2,
+                    Some(0.10),
+                    Some("z-ai/glm-5.3"),
+                    Some("tensorx"),
+                ),
+            ],
+        );
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        assert_eq!(stats.costliest_calls.len(), 2);
+        assert_eq!(stats.costliest_calls[0].context, 200);
+        assert_eq!(stats.costliest_calls[1].context, 100);
+    }
+
+    /// T2 (issue #111): an unpriced window lists the largest prompts,
+    /// with `-` where a cost would be.
+    #[test]
+    fn t2_an_unpriced_window_lists_the_largest_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let id = Ulid::generate();
+        let mut lines = vec![user("2026-10-08T10:00:00Z", "unpriced")];
+        for (i, ctx) in [10u64, 300, 20].iter().enumerate() {
+            lines.push(call(
+                &format!("2026-10-08T10:0{i}:01Z"),
+                *ctx,
+                0,
+                1,
+                None,
+                Some("some/other-model"),
+                Some("priceless"),
+            ));
+        }
+        write_thread(&base, id, &lines);
+
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        assert_eq!(
+            stats
+                .costliest_calls
+                .iter()
+                .map(|c| c.context)
+                .collect::<Vec<_>>(),
+            vec![300, 20, 10]
+        );
+        assert!(stats.costliest_calls.iter().all(|c| c.spent.is_none()));
+        assert!(render(&stats).contains("  -  "), "{}", render(&stats));
+    }
+
+    /// T2 (issue #111): a call outside `--since` is not listed.
+    #[test]
+    fn t2_the_window_filters_the_calls_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let id = Ulid::generate();
+        write_thread(
+            &base,
+            id,
+            &[
+                user("2026-10-01T09:00:00Z", "old"),
+                call(
+                    "2026-10-01T09:00:01Z",
+                    100,
+                    0,
+                    1,
+                    Some(0.10),
+                    Some("z-ai/glm-5.3"),
+                    Some("tensorx"),
+                ),
+                call(
+                    "2026-10-08T09:00:01Z",
+                    200,
+                    0,
+                    2,
+                    Some(0.20),
+                    Some("z-ai/glm-5.3"),
+                    Some("tensorx"),
+                ),
+            ],
+        );
+        let cutoff = datetime!(2026-10-05 00:00 UTC);
+        let stats = collect(dir.path(), &[], None, Some(cutoff), &book_of(PRICED_CONFIG)).unwrap();
+        assert_eq!(stats.costliest_calls.len(), 1);
+        assert_eq!(stats.costliest_calls[0].created_at, "2026-10-08 09:00");
+        assert_eq!(stats.costliest_calls[0].context, 200);
+    }
+
+    /// T2 (issue #111): a retro-priced call reads `~$`.
+    #[test]
+    fn t2_a_retro_priced_call_reads_as_estimated() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let id = Ulid::generate();
+        let line = call(
+            "2026-10-08T11:00:01Z",
+            1_000_000,
+            0,
+            1000,
+            None,
+            Some("deepseek/deepseek-v4.1-flash"),
+            Some("flash"),
+        );
+        write_thread(
+            &base,
+            id,
+            &[user("2026-10-08T11:00:00Z", "retro"), line.clone()],
+        );
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let expected = expected_cost(PRICED_CONFIG, "flash", &line);
+        assert_eq!(stats.costliest_calls.len(), 1);
+        assert!((stats.costliest_calls[0].price_estimated_spent.unwrap() - expected).abs() < 1e-12);
+        assert!(
+            render(&stats).contains(&format!("~${expected:.4}")),
+            "{}",
+            render(&stats)
+        );
+    }
+
+    /// T3 (issue #111): a project with nothing in the window is not a
+    /// row; a side-job-only project is; `--project` still shows a named
+    /// empty group.
+    #[test]
+    fn t3_empty_project_rows_are_dropped_but_a_named_one_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        write_thread(
+            &base.join("empty"),
+            Ulid::generate(),
+            &[user("2026-10-09T09:00:00Z", "no calls here")],
+        );
+        write_thread(
+            &base.join("side"),
+            Ulid::generate(),
+            &[
+                user("2026-10-09T09:01:00Z", "only a side job"),
+                stamped_extraction(
+                    "2026-10-09T09:01:01Z",
+                    "deepseek/deepseek-v4.1-flash",
+                    100,
+                    0,
+                    10,
+                    Some(0.30),
+                ),
+            ],
+        );
+        write_thread(
+            &base.join("real"),
+            Ulid::generate(),
+            &[
+                user("2026-10-09T09:02:00Z", "a call"),
+                call(
+                    "2026-10-09T09:02:01Z",
+                    100,
+                    0,
+                    10,
+                    Some(0.05),
+                    Some("z-ai/glm-5.3"),
+                    Some("tensorx"),
+                ),
+            ],
+        );
+
+        let stats = collect(&base, &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        assert_eq!(
+            stats
+                .projects
+                .iter()
+                .map(|p| p.project.as_str())
+                .collect::<Vec<_>>(),
+            vec!["real", "side"],
+        );
+
+        // `--project empty` still shows its own, empty group.
+        let named = collect(&base, &[], Some("empty"), None, &book_of(PRICED_CONFIG)).unwrap();
+        assert_eq!(named.projects.len(), 1);
+        assert_eq!(named.projects[0].project, "empty");
+        assert_eq!(named.projects[0].calls, 0);
+    }
+
+    /// T4 (issue #111): the model and costliest-calls tables render in
+    /// the documented layout, a window with no side job shows no `jobs`
+    /// text anywhere, and `--json` carries both new fields.
+    #[test]
+    fn t4_the_new_tables_render_and_cross_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("alpha");
+        let id = Ulid::generate();
+        let line = call(
+            "2026-10-10T09:00:01Z",
+            1000,
+            0,
+            100,
+            Some(0.05),
+            Some("z-ai/glm-5.3"),
+            Some("tensorx"),
+        );
+        write_thread(&base, id, &[user("2026-10-10T09:00:00Z", "render"), line]);
+
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let text = render(&stats);
+
+        // The model table: the project table's columns.
+        let header = text
+            .lines()
+            .find(|l| l.starts_with("model "))
+            .unwrap_or_else(|| panic!("no model table in {text}"));
+        for column in ["calls", "priced", "cost", "peak", "hit"] {
+            assert!(header.contains(column), "{header}");
+        }
+        let row = text
+            .lines()
+            .find(|l| l.starts_with("z-ai/glm-5.3"))
+            .unwrap_or_else(|| panic!("no model row in {text}"));
+        let m = &stats.models[0];
+        assert!(
+            row.contains(&money(m.spent, m.price_estimated_spent)),
+            "{row}"
+        );
+        assert!(row.contains(&m.peak_context.to_string()), "{row}");
+
+        // No side job: no `jobs` text anywhere.
+        assert!(!text.contains("jobs"), "{text}");
+
+        // The costliest-calls table, and both new fields in JSON.
+        assert!(text.contains("costliest calls"), "{text}");
+        let short: String = id.to_string().chars().take(6).collect();
+        assert!(text.contains(&short), "{text}");
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["models"][0]["model"], json!("z-ai/glm-5.3"));
+        assert_eq!(json["models"][0]["calls"], json!(1));
+        assert_eq!(json["costliest_calls"][0]["context"], json!(1000));
+        assert_eq!(json["costliest_calls"][0]["spent"], json!(0.05));
+    }
+
     /// T9 (issue #46): the drill-down and the issue report show the
     /// side jobs too — the issue's totals include the side jobs of the
     /// build it describes, which is the whole point of the issue.
@@ -3430,7 +4951,7 @@ api_key_env = "TENSORX_API_KEY"
         write_thread(&dir.path().join("alpha"), id, &lines);
         let book = book_of(PRICED_CONFIG);
 
-        let report = collect_thread(dir.path(), None, id, None, &book).unwrap();
+        let report = collect_thread(dir.path(), &[], None, id, None, &book).unwrap();
         assert_eq!((report.calls, report.job_calls), (1, 1));
         assert_eq!(report.job_spent, Some(0.03));
         let u = extraction_usage(&lines[2]);
@@ -3444,7 +4965,7 @@ api_key_env = "TENSORX_API_KEY"
             "{text}"
         );
 
-        let issue = collect_issue(dir.path(), None, 46, None, &book).unwrap();
+        let issue = collect_issue(dir.path(), &[], None, 46, None, &book).unwrap();
         assert_eq!(issue.total.calls, 1);
         assert_eq!(issue.total.job_calls, 1);
         assert_eq!(issue.total.job_spent, Some(0.03));
@@ -3495,7 +5016,7 @@ api_key_env = "TENSORX_API_KEY"
         write_thread(&dir.path().join("alpha"), id, &lines);
         let book = book_of(PRICED_CONFIG);
         let cutoff = parse_since("2026-09-28", datetime!(2026-09-28 12:00:00 UTC)).unwrap();
-        let stats = collect(dir.path(), None, Some(cutoff), &book).unwrap();
+        let stats = collect(dir.path(), &[], None, Some(cutoff), &book).unwrap();
 
         assert_eq!(stats.days.iter().map(|d| d.job_calls).sum::<u32>(), 1);
         let inside = extraction_usage(&lines[3]);
@@ -3546,7 +5067,7 @@ api_key_env = "TENSORX_API_KEY"
             ),
         ];
         write_thread(&dir.path().join("alpha"), id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let day = &stats.days[0];
 
         // The call's own arithmetic, untouched by the title call.
@@ -3630,7 +5151,7 @@ api_key_env = "TENSORX_API_KEY"
             ),
         ];
         write_thread(&dir.path().join("alpha"), id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let day = &stats.days[0];
         assert_eq!(day.job_calls, 2);
         assert_eq!((day.extractions, day.titles), (1, 1));
@@ -3668,7 +5189,7 @@ api_key_env = "TENSORX_API_KEY"
             ),
         ];
         write_thread(&dir.path().join("alpha"), id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let day = &stats.days[0];
 
         let retro = expected_memory_cost(PRICED_CONFIG, &lines[1]);
@@ -3711,7 +5232,7 @@ api_key_env = "TENSORX_API_KEY"
             renamed("2026-09-28T17:00:02Z", "An old title"),
         ];
         write_thread(&dir.path().join("alpha"), id, &lines);
-        let stats = collect(dir.path(), None, None, &book_of(PRICED_CONFIG)).unwrap();
+        let stats = collect(dir.path(), &[], None, None, &book_of(PRICED_CONFIG)).unwrap();
         let day = &stats.days[0];
 
         assert_eq!(day.job_calls, 0);
@@ -3760,7 +5281,7 @@ api_key_env = "TENSORX_API_KEY"
         write_thread(&dir.path().join("alpha"), id, &lines);
         let book = book_of(PRICED_CONFIG);
 
-        let issue = collect_issue(dir.path(), None, 49, None, &book).unwrap();
+        let issue = collect_issue(dir.path(), &[], None, 49, None, &book).unwrap();
         assert_eq!(issue.total.calls, 1);
         assert_eq!(issue.total.job_calls, 1);
         assert_eq!((issue.total.extractions, issue.total.titles), (0, 1));
@@ -3779,5 +5300,1208 @@ api_key_env = "TENSORX_API_KEY"
             )),
             "{text}"
         );
+    }
+
+    // ---- decisions (issue #74) ----
+
+    /// A person, and the system: only a person's answers count in `rate`
+    /// and `last 30`.
+    const PERSON: &str = "steve";
+    const SYS: &str = "system";
+
+    /// One fixture decision: the kind, the proposal's time, and how (and
+    /// by whom) it was answered. The lines are written from the table and
+    /// the expected figures are computed from it, so no number in an
+    /// assertion is hand-written.
+    #[derive(Clone, Copy)]
+    struct DecisionLine {
+        kind: &'static str,
+        at: &'static str,
+        answer: Option<(&'static str, &'static str)>,
+    }
+
+    fn proposed(id: Ulid, at: &str, kind: &str, proposal: &str) -> serde_json::Value {
+        json!({
+            "id": id.to_string(),
+            "kind": "decision_proposed",
+            "author": {"kind": "agent", "id": "assistant"},
+            "payload": {"kind": kind, "proposal": proposal, "reason": "the fixture says so"},
+            "created_at": at,
+        })
+    }
+
+    /// #85's start-up proposal: the same line with a `startup-` call id,
+    /// which is what the fold reads as `startup: true`.
+    fn proposed_startup(id: Ulid, at: &str, kind: &str, proposal: &str) -> serde_json::Value {
+        let mut line = proposed(id, at, kind, proposal);
+        let prefix = aigentic_runtime::aigentic_log::STARTUP_PREFIX;
+        line["payload"]["call_id"] = json!(format!("{prefix}{}", Ulid::generate()));
+        line
+    }
+
+    /// Like `decision_thread`, but every proposal is a start-up one
+    /// (issue #85), so the report gives it its own row.
+    fn startup_thread(project: &Path, table: &[DecisionLine]) {
+        let mut lines = Vec::new();
+        for (n, entry) in table.iter().enumerate() {
+            let proposal = Ulid::generate();
+            lines.push(proposed_startup(
+                proposal,
+                entry.at,
+                entry.kind,
+                &format!("proposal {n}"),
+            ));
+            if let Some((answer, who)) = entry.answer {
+                lines.push(decision_answered(
+                    Ulid::generate(),
+                    entry.at,
+                    proposal,
+                    answer,
+                    who,
+                ));
+            }
+        }
+        write_decisions(project, Ulid::generate(), &lines);
+    }
+
+    fn decision_answered(
+        id: Ulid,
+        at: &str,
+        parent: Ulid,
+        answer: &str,
+        who: &str,
+    ) -> serde_json::Value {
+        let author = if who == SYS {
+            json!({"kind": "system"})
+        } else {
+            json!({"kind": "user", "id": who})
+        };
+        json!({
+            "id": id.to_string(),
+            "kind": "decision_answered",
+            "author": author,
+            "parent_event": parent.to_string(),
+            "payload": {"answer": answer},
+            "created_at": at,
+        })
+    }
+
+    /// A log that keeps the ids it is given: `write_thread` stamps a fresh
+    /// one on every line, but an answer has to name its proposal's id.
+    fn write_decisions(dir: &Path, id: Ulid, lines: &[serde_json::Value]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let text: String = lines
+            .iter()
+            .enumerate()
+            .map(|(seq, line)| {
+                let mut e = line.clone();
+                // A proposal keeps the id its answer points at; any other
+                // line gets one, since every event carries an id.
+                if e["id"].is_null() {
+                    e["id"] = json!(Ulid::generate().to_string());
+                }
+                e["thread_id"] = json!(id.to_string());
+                e["seq"] = json!(seq);
+                format!("{e}\n")
+            })
+            .collect();
+        std::fs::write(dir.join(format!("{id}.jsonl")), text).unwrap();
+    }
+
+    /// Write a table of decisions into one thread under `project`.
+    fn decision_thread(project: &Path, table: &[DecisionLine]) {
+        let mut lines = Vec::new();
+        for (n, entry) in table.iter().enumerate() {
+            let proposal = Ulid::generate();
+            lines.push(proposed(
+                proposal,
+                entry.at,
+                entry.kind,
+                &format!("proposal {n}"),
+            ));
+            if let Some((answer, who)) = entry.answer {
+                lines.push(decision_answered(
+                    Ulid::generate(),
+                    entry.at,
+                    proposal,
+                    answer,
+                    who,
+                ));
+            }
+        }
+        write_decisions(project, Ulid::generate(), &lines);
+    }
+
+    /// The figures a table implies for one kind, recomputed from the table
+    /// rather than written down: proposals, the answers by what they said,
+    /// pending, and the operator's own rate.
+    fn expected_row(
+        table: &[DecisionLine],
+        kind: &str,
+    ) -> (u32, u32, u32, u32, u32, u32, Option<u32>) {
+        let of_kind: Vec<&DecisionLine> = table.iter().filter(|e| e.kind == kind).collect();
+        let (mut yes, mut no, mut corrected, mut withdrawn, mut pending) = (0, 0, 0, 0, 0);
+        for entry in &of_kind {
+            match entry.answer {
+                None => pending += 1,
+                Some((answer, _)) => match answer {
+                    "yes" => yes += 1,
+                    "no" => no += 1,
+                    "corrected" => corrected += 1,
+                    "withdrawn" => withdrawn += 1,
+                    other => panic!("the fixture named no answer: {other}"),
+                },
+            }
+        }
+        // The operator's own rate, over their own yes/no/corrected.
+        let person: Vec<&DecisionLine> = of_kind
+            .iter()
+            .copied()
+            .filter(|e| {
+                e.answer.is_some_and(|(answer, who)| {
+                    who != SYS && matches!(answer, "yes" | "no" | "corrected")
+                })
+            })
+            .collect();
+        let person_yes = person
+            .iter()
+            .filter(|e| e.answer.is_some_and(|(answer, _)| answer == "yes"))
+            .count() as u32;
+        let rate = (!person.is_empty()).then(|| person_yes * 100 / person.len() as u32);
+        (
+            of_kind.len() as u32,
+            yes,
+            no,
+            corrected,
+            withdrawn,
+            pending,
+            rate,
+        )
+    }
+
+    /// T5 (issue #74): `stats --decisions` over two projects — kinds in
+    /// declaration order, one kind nobody answered, a system `withdrawn`
+    /// and a pending proposal.
+    #[test]
+    fn decisions_report_each_kind_in_declaration_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = [
+            DecisionLine {
+                kind: "project",
+                at: "2026-09-22T09:00:00Z",
+                answer: Some(("yes", PERSON)),
+            },
+            DecisionLine {
+                kind: "job",
+                at: "2026-09-22T09:05:00Z",
+                answer: Some(("no", PERSON)),
+            },
+            DecisionLine {
+                kind: "project",
+                at: "2026-09-23T10:00:00Z",
+                answer: Some(("corrected", PERSON)),
+            },
+            DecisionLine {
+                kind: "working_set",
+                at: "2026-09-23T11:00:00Z",
+                answer: Some(("withdrawn", SYS)),
+            },
+            DecisionLine {
+                kind: "project",
+                at: "2026-09-23T12:00:00Z",
+                answer: None,
+            },
+        ];
+        let beta = [
+            DecisionLine {
+                kind: "job",
+                at: "2026-09-24T08:00:00Z",
+                answer: Some(("yes", PERSON)),
+            },
+            DecisionLine {
+                kind: "route",
+                at: "2026-09-24T08:30:00Z",
+                answer: Some(("withdrawn", SYS)),
+            },
+        ];
+        decision_thread(&dir.path().join("alpha"), &alpha);
+        decision_thread(&dir.path().join("beta"), &beta);
+        let all: Vec<DecisionLine> = alpha.iter().chain(beta.iter()).copied().collect();
+
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
+        let names: Vec<&str> = report.kinds.iter().map(|k| kind_name(k.kind)).collect();
+        assert_eq!(
+            names,
+            vec!["project", "job", "route", "working_set"],
+            "declaration order, and no row for a kind with no proposal"
+        );
+        for row in &report.kinds {
+            let name = kind_name(row.kind);
+            let (proposed, yes, no, corrected, withdrawn, pending, rate) = expected_row(&all, name);
+            assert_eq!(
+                (
+                    row.proposed,
+                    row.yes,
+                    row.no,
+                    row.corrected,
+                    row.withdrawn,
+                    row.pending
+                ),
+                (proposed, yes, no, corrected, withdrawn, pending),
+                "{name}"
+            );
+            assert_eq!(row.rate, rate, "{name} rate");
+            assert_eq!(row.last_30, rate, "{name} last 30: fewer than 30 answered");
+        }
+        assert_eq!((report.orphans, report.unreadable), (0, 0));
+
+        let text = render_decisions(&report);
+        assert!(
+            text.contains("proposals: all threads (with their answers)"),
+            "{text}"
+        );
+        for word in [
+            "kind",
+            "proposed",
+            "yes",
+            "corrected",
+            "withdrawn",
+            "pending",
+            "last 30",
+        ] {
+            assert!(
+                text.contains(word),
+                "{word} missing from the header: {text}"
+            );
+        }
+        // The kind nobody answered prints `-` for both ratios.
+        let quiet = text
+            .lines()
+            .find(|l| l.starts_with("working_set"))
+            .expect("a working_set row");
+        assert_eq!(quiet.matches('-').count(), 2, "{text}");
+        // A kind's own figure reaches its row, recomputed from the table.
+        let (_, _, _, _, _, _, rate) = expected_row(&all, "project");
+        let row = text.lines().find(|l| l.starts_with("project")).unwrap();
+        assert!(row.contains(&format!("{}%", rate.unwrap())), "{text}");
+    }
+
+    /// T6 (issue #74): `last 30` takes the 30 most recent proposals a
+    /// person answered, ordering two in the same second by the proposal's
+    /// id, and the rate is truncated.
+    #[test]
+    fn decisions_last_30_takes_the_thirty_most_recent_a_person_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two proposals in the same second: the boundary between the 30
+        // that count and those that do not is decided by the proposal's
+        // id, so the `no` with the smaller id is the one left out.
+        let mut ids: Vec<Ulid> = (0..2).map(|_| Ulid::generate()).collect();
+        ids.sort();
+        let (small, large) = (ids[0], ids[1]);
+        let boundary = "2026-09-24T09:00:00Z";
+        let mut lines = vec![
+            proposed(small, boundary, "project", "not this one"),
+            decision_answered(Ulid::generate(), boundary, small, "no", PERSON),
+            proposed(large, boundary, "project", "this one"),
+            decision_answered(Ulid::generate(), boundary, large, "yes", PERSON),
+        ];
+        // 29 later yes answers, so the 30 most recent are the 29 plus the
+        // larger-id proposal above.
+        let later = 29;
+        for n in 0..later {
+            let at = format!("2026-09-25T10:00:{n:02}Z");
+            let proposal = Ulid::generate();
+            lines.push(proposed(proposal, &at, "project", "later"));
+            lines.push(decision_answered(
+                Ulid::generate(),
+                &at,
+                proposal,
+                "yes",
+                PERSON,
+            ));
+        }
+        // One more `no`, a second earlier and with the largest id of all:
+        // time, not id, keeps it out of the 30.
+        let older = Ulid::generate();
+        lines.push(proposed(older, "2026-09-24T08:00:00Z", "project", "older"));
+        lines.push(decision_answered(
+            Ulid::generate(),
+            "2026-09-24T08:00:00Z",
+            older,
+            "no",
+            PERSON,
+        ));
+        write_decisions(&dir.path().join("alpha"), Ulid::generate(), &lines);
+
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
+        let row = &report.kinds[0];
+        assert_eq!(kind_name(row.kind), "project");
+        let person_yes = later + 1;
+        let person_answers = later + 2 + 1;
+        assert_eq!(row.proposed, person_answers as u32);
+        assert_eq!(
+            row.rate,
+            Some(person_yes as u32 * 100 / person_answers as u32),
+            "truncated over every person answer in the window"
+        );
+        // The 30 that count are all yes: 29 later plus the larger id.
+        let counted_yes = later + 1;
+        assert_eq!(row.last_30, Some(counted_yes as u32 * 100 / 30));
+    }
+
+    /// T7 (issue #74): `--since` keeps proposals inside the window — an
+    /// answer inside it to a proposal before it is left out — and the
+    /// global `--project` narrows the walk.
+    #[test]
+    fn decisions_honour_since_and_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = Ulid::generate();
+        let inside = Ulid::generate();
+        let alpha = vec![
+            proposed(before, "2026-09-21T23:00:00Z", "project", "before"),
+            // The proposal is before the boundary; the answer is inside.
+            decision_answered(
+                Ulid::generate(),
+                "2026-09-23T10:00:00Z",
+                before,
+                "yes",
+                PERSON,
+            ),
+            proposed(inside, "2026-09-23T09:00:00Z", "job", "inside"),
+            decision_answered(
+                Ulid::generate(),
+                "2026-09-23T09:00:01Z",
+                inside,
+                "no",
+                PERSON,
+            ),
+        ];
+        write_decisions(&dir.path().join("alpha"), Ulid::generate(), &alpha);
+        let beta = vec![proposed(
+            Ulid::generate(),
+            "2026-09-23T09:30:00Z",
+            "ticket",
+            "beta",
+        )];
+        write_decisions(&dir.path().join("beta"), Ulid::generate(), &beta);
+        let cutoff = datetime!(2026-09-23 00:00:00 UTC);
+
+        let report = collect_decisions(dir.path(), &[], None, Some(cutoff)).unwrap();
+        let names: Vec<&str> = report.kinds.iter().map(|k| kind_name(k.kind)).collect();
+        assert_eq!(
+            names,
+            vec!["job", "ticket"],
+            "the proposal before the window is out, its answer inside it does not pull it in"
+        );
+
+        let narrowed = collect_decisions(dir.path(), &[], Some("alpha"), Some(cutoff)).unwrap();
+        let names: Vec<&str> = narrowed.kinds.iter().map(|k| kind_name(k.kind)).collect();
+        assert_eq!(names, vec!["job"], "`--project` narrows the walk");
+
+        // Without the window the proposal is back, answered: pairing is by
+        // the whole thread, whatever the window says.
+        let all = collect_decisions(dir.path(), &[], Some("alpha"), None).unwrap();
+        let project = all
+            .kinds
+            .iter()
+            .find(|k| k.kind == DecisionKind::Project)
+            .unwrap();
+        assert_eq!((project.proposed, project.yes, project.pending), (1, 1, 0));
+    }
+
+    /// T8 (issue #74): `--json` carries the table's figures, an orphan
+    /// answer and an unreadable thread are counted, and with nothing to
+    /// report the kind list is empty.
+    #[test]
+    fn decisions_json_matches_the_table_and_counts_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let one = Ulid::generate();
+        let two = Ulid::generate();
+        let lines = vec![
+            proposed(one, "2026-09-24T09:00:00Z", "project", "one"),
+            decision_answered(Ulid::generate(), "2026-09-24T09:00:01Z", one, "yes", PERSON),
+            // An answer naming no proposal is an orphan.
+            decision_answered(
+                Ulid::generate(),
+                "2026-09-24T09:05:00Z",
+                Ulid::generate(),
+                "yes",
+                PERSON,
+            ),
+            proposed(two, "2026-09-24T09:10:00Z", "project", "two"),
+            decision_answered(Ulid::generate(), "2026-09-24T09:10:01Z", two, "no", PERSON),
+        ];
+        let alpha = dir.path().join("alpha");
+        write_decisions(&alpha, Ulid::generate(), &lines);
+        // A thread whose file cannot be read is counted, not swallowed.
+        std::fs::write(
+            alpha.join(format!("{}.jsonl", Ulid::generate())),
+            "not json\n",
+        )
+        .unwrap();
+
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
+        assert_eq!((report.orphans, report.unreadable), (1, 1));
+        let text = render_decisions(&report);
+        assert!(text.contains("1 orphan answers"), "{text}");
+        assert!(text.contains("1 thread(s) unreadable"), "{text}");
+
+        // The fixture answers one proposal yes and one no: half,
+        // truncated, recomputed from those two.
+        let (fixture_yes, fixture_no) = (1u32, 1u32);
+        let row = &report.kinds[0];
+        assert_eq!((row.yes, row.no), (fixture_yes, fixture_no));
+        assert_eq!(
+            row.rate,
+            Some(fixture_yes * 100 / (fixture_yes + fixture_no))
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["kinds"][0]["kind"], "project");
+        assert_eq!(json["kinds"][0]["proposed"], row.proposed);
+        assert_eq!(json["kinds"][0]["rate"], row.rate.unwrap());
+        assert_eq!(json["kinds"][0]["last_30"], row.last_30.unwrap());
+        assert_eq!(json["orphans"], 1);
+        assert_eq!(json["unreadable"], 1);
+
+        // A kind nobody answered carries no ratio key at all.
+        let quiet = DecisionReport {
+            kinds: vec![DecisionKindStats {
+                kind: DecisionKind::Route,
+                startup: false,
+                proposed: 1,
+                yes: 0,
+                no: 0,
+                corrected: 0,
+                withdrawn: 0,
+                pending: 1,
+                rate: None,
+                last_30: None,
+            }],
+            ..DecisionReport::default()
+        };
+        let quiet = serde_json::to_value(&quiet).unwrap();
+        let quiet = quiet["kinds"][0].as_object().unwrap();
+        assert!(!quiet.contains_key("rate"), "{quiet:?}");
+        assert!(!quiet.contains_key("last_30"), "{quiet:?}");
+
+        // With no decisions, an empty kind list with zero counts.
+        let empty = serde_json::to_value(DecisionReport::default()).unwrap();
+        assert_eq!(empty["kinds"], json!([]));
+        assert_eq!(empty["orphans"], 0);
+    }
+
+    /// T9 (issue #74): with no decisions it says so, naming the window as
+    /// `render` names it.
+    #[test]
+    fn decisions_with_none_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        write_thread(
+            &dir.path().join("alpha"),
+            Ulid::generate(),
+            &[user("2026-09-24T09:00:00Z", "no decisions here")],
+        );
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
+        assert!(report.kinds.is_empty());
+        let text = render_decisions(&report);
+        assert!(text.contains("all threads"), "{text}");
+        assert!(text.contains("no decisions recorded"), "{text}");
+
+        let windowed = collect_decisions(
+            dir.path(),
+            &[],
+            None,
+            Some(datetime!(2026-09-23 00:00:00 UTC)),
+        )
+        .unwrap();
+        let text = render_decisions(&windowed);
+        assert!(text.contains("2026-09-23T00:00:00Z"), "{text}");
+        assert!(text.contains("no decisions recorded"), "{text}");
+    }
+
+    // ---- the flat threads directory (issue #83) ----
+
+    /// A `thread_started` line, built from the payload type: `created_by`
+    /// is required, and a hand-written payload that failed to parse
+    /// would be skipped silently, passing a test for the wrong reason.
+    fn thread_started(at: &str, project: Option<&str>, root: &Path) -> serde_json::Value {
+        json!({
+            "kind": "thread_started",
+            "author": {"kind": "agent", "id": "runtime"},
+            "payload": serde_json::to_value(ThreadStartedPayload {
+                project: project.map(str::to_owned),
+                root: root.to_path_buf(),
+                created_by: Author::User(UserId("steve".into())),
+                parent_thread: None,
+                step: None,
+                front: false,
+                job: false,
+            })
+            .unwrap(),
+            "created_at": at,
+        })
+    }
+
+    /// A `project_switched` line, built from the payload type.
+    fn project_switched(at: &str, to: &str, root: &Path) -> serde_json::Value {
+        json!({
+            "kind": "project_switched",
+            "author": {"kind": "agent", "id": "runtime"},
+            "payload": serde_json::to_value(ProjectSwitchedPayload {
+                from: None,
+                to: Some(to.to_owned()),
+                root: root.to_path_buf(),
+                workspace: None,
+            })
+            .unwrap(),
+            "created_at": at,
+        })
+    }
+
+    /// A directory to name in a fixture's `thread_started.root`.
+    fn root_dir(base: &Path, name: &str) -> PathBuf {
+        let root = base.join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// An id the tests can order: `1_700_000_000_000` plus `n` seconds.
+    fn id_at(n: u64) -> Ulid {
+        Ulid::from_parts(1_700_000_000_000 + n * 1_000, n as u128 + 1)
+    }
+
+    /// T1 (issue #83): the flat layout #9 wrote reads exactly like the
+    /// legacy project directories, given logs that name their project.
+    #[test]
+    fn the_flat_layout_reads_like_the_legacy_one() {
+        let flat = tempfile::tempdir().unwrap();
+        let legacy = tempfile::tempdir().unwrap();
+        let root = flat.path().join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let alpha = id_at(0);
+        let beta = id_at(1);
+        // One fixture, built twice: flat with a `thread_started` naming
+        // the project, and in `alpha/` and `beta/` with the same lines.
+        let build = |base: &Path, named: bool| {
+            for (project, id) in [("alpha", alpha), ("beta", beta)] {
+                let dir = if named {
+                    base.to_path_buf()
+                } else {
+                    base.join(project)
+                };
+                let mut lines = vec![
+                    user("2026-09-28T12:00:00Z", "a prompt"),
+                    call("2026-09-28T12:00:01Z", 100, 0, 50, Some(0.25), None, None),
+                ];
+                if named {
+                    lines.insert(
+                        0,
+                        thread_started("2026-09-28T11:59:00Z", Some(project), &root),
+                    );
+                }
+                write_thread(&dir, id, &lines);
+            }
+        };
+        build(flat.path(), true);
+        build(legacy.path(), false);
+
+        let named = collect(flat.path(), &[], None, None, &no_prices()).unwrap();
+        let by_dir = collect(legacy.path(), &[], None, None, &no_prices()).unwrap();
+        assert_eq!(named, by_dir);
+        assert_eq!(
+            named
+                .projects
+                .iter()
+                .map(|p| p.project.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+
+        // A base that is not there is an empty report, not an error.
+        let missing = collect(&flat.path().join("nope"), &[], None, None, &no_prices()).unwrap();
+        assert_eq!(missing, Stats::default());
+        assert_eq!(missing.unreadable, 0);
+    }
+
+    /// T2 (issue #83): a thread that switched projects counts under the
+    /// last project it switched to — in the report, in an issue's rows
+    /// and in the narrowed decision record.
+    #[test]
+    fn a_switched_thread_counts_under_its_last_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_dir(dir.path(), "work");
+        let id = id_at(0);
+        let proposal = Ulid::generate();
+        write_decisions(
+            dir.path(),
+            id,
+            &[
+                thread_started("2026-09-28T09:00:00Z", Some("alpha"), &root),
+                user("2026-09-28T09:00:01Z", "work on #83"),
+                project_switched("2026-09-28T09:01:00Z", "beta", &root),
+                project_switched("2026-09-28T09:02:00Z", "gamma", &root),
+                proposed(proposal, "2026-09-28T09:03:00Z", "project", "a decision"),
+                call("2026-09-28T09:04:00Z", 100, 0, 50, Some(0.25), None, None),
+            ],
+        );
+
+        let stats = collect(dir.path(), &[], None, None, &no_prices()).unwrap();
+        assert_eq!(
+            stats
+                .projects
+                .iter()
+                .map(|p| p.project.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gamma"],
+            "the last switch wins, not the thread_started root"
+        );
+        assert_eq!(stats.projects[0].calls, 1);
+        assert_eq!(stats.threads[0].project, "gamma");
+
+        let issue = collect_issue(dir.path(), &[], None, 83, None, &no_prices()).unwrap();
+        assert_eq!(issue.threads.len(), 1);
+        assert_eq!(issue.threads[0].project, "gamma");
+
+        let target = collect_decisions(dir.path(), &[], Some("gamma"), None).unwrap();
+        assert_eq!(target.kinds.len(), 1);
+        assert_eq!(target.kinds[0].proposed, 1);
+        let origin = collect_decisions(dir.path(), &[], Some("alpha"), None).unwrap();
+        assert!(origin.kinds.is_empty(), "{:?}", origin.kinds);
+        assert_eq!(origin.orphans, 0);
+    }
+
+    /// T3 (issue #83): a mixed tree — flat and legacy, a canary whose
+    /// `thread_started` disagrees with its directory, two logs that can
+    /// be attributed to no project, and an id written twice.
+    #[test]
+    fn a_mixed_tree_is_attributed_from_the_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let outside = root_dir(base, "x");
+        let flat = id_at(0);
+        let legacy = id_at(1);
+        let canary = id_at(2);
+        let outside_named = id_at(3);
+        let outside_bare = id_at(4);
+        let old = id_at(5);
+        let twice = id_at(6);
+
+        write_thread(
+            base,
+            flat,
+            &[
+                thread_started("2026-09-28T08:00:00Z", Some("alpha"), base),
+                user("2026-09-28T08:00:01Z", "flat"),
+                call("2026-09-28T08:00:02Z", 100, 0, 50, Some(0.25), None, None),
+            ],
+        );
+        // The legacy log says nothing about its project: the directory
+        // names it.
+        write_thread(
+            &base.join("alpha"),
+            legacy,
+            &[
+                user("2026-09-28T08:01:00Z", "legacy"),
+                call("2026-09-28T08:01:01Z", 100, 0, 50, None, None, None),
+            ],
+        );
+        // The canary: filed under `alpha/`, its own line says `beta`.
+        write_thread(
+            &base.join("alpha"),
+            canary,
+            &[
+                thread_started("2026-09-28T08:02:00Z", Some("beta"), base),
+                user("2026-09-28T08:02:01Z", "filed under alpha, working in beta"),
+                call("2026-09-28T08:02:02Z", 100, 0, 50, None, None, None),
+            ],
+        );
+        // An old `_none` log whose root is a folder named `x`.
+        write_thread(
+            &base.join(LEGACY_NONE_PROJECT),
+            outside_named,
+            &[
+                thread_started("2026-09-28T08:03:00Z", Some(LEGACY_NONE_PROJECT), &outside),
+                user("2026-09-28T08:03:01Z", "outside, but its root has a name"),
+                call("2026-09-28T08:03:02Z", 100, 0, 50, None, None, None),
+            ],
+        );
+        // And one with no `thread_started` at all: no project.
+        write_thread(
+            &base.join(LEGACY_NONE_PROJECT),
+            outside_bare,
+            &[
+                user("2026-09-28T08:04:00Z", "outside, unnamed"),
+                call("2026-09-28T08:04:01Z", 100, 0, 50, None, None, None),
+            ],
+        );
+        // A pre-phase-4 flat log: no thread_started, no root, no project.
+        write_thread(
+            base,
+            old,
+            &[
+                user("2026-09-28T08:05:00Z", "before phase 4"),
+                call("2026-09-28T08:05:01Z", 100, 0, 50, None, None, None),
+            ],
+        );
+        // One id both flat and in `alpha/`: the flat copy is the one read,
+        // and the two copies differ, so the call count shows which.
+        write_thread(
+            base,
+            twice,
+            &[
+                thread_started("2026-09-28T08:06:00Z", Some("alpha"), base),
+                call("2026-09-28T08:06:01Z", 100, 0, 50, None, None, None),
+                call("2026-09-28T08:06:02Z", 200, 0, 60, None, None, None),
+            ],
+        );
+        write_thread(
+            &base.join("alpha"),
+            twice,
+            &[
+                user("2026-09-28T08:06:00Z", "the copy under alpha/"),
+                call("2026-09-28T08:06:01Z", 100, 0, 50, None, None, None),
+                call("2026-09-28T08:06:02Z", 200, 0, 60, None, None, None),
+                call("2026-09-28T08:06:03Z", 300, 0, 70, None, None, None),
+                call("2026-09-28T08:06:04Z", 400, 0, 80, None, None, None),
+                call("2026-09-28T08:06:05Z", 500, 0, 90, None, None, None),
+            ],
+        );
+
+        let stats = collect(base, &[], None, None, &no_prices()).unwrap();
+        assert_eq!(
+            stats
+                .projects
+                .iter()
+                .map(|p| p.project.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "x", "(no project)"],
+            "the canary counts in beta, and (no project) sorts last"
+        );
+        assert_eq!(stats.unreadable, 0);
+        let calls =
+            |s: &Stats, name: &str| s.projects.iter().find(|p| p.project == name).unwrap().calls;
+        // One call per fixture log, except the id written twice: its flat
+        // copy holds two calls and its `alpha/` copy five, so the count
+        // shows which one was read.
+        assert_eq!(
+            calls(&stats, "alpha"),
+            4,
+            "the flat log, the legacy-named log and the flat copy"
+        );
+        assert_eq!(calls(&stats, "beta"), 1, "the canary follows its own line");
+        assert_eq!(calls(&stats, "x"), 1, "the old root's basename names it");
+        assert_eq!(
+            calls(&stats, NO_PROJECT),
+            2,
+            "the two logs nothing attributes"
+        );
+
+        // `--project "(no project)"` selects exactly those two.
+        let none = collect(base, &[], Some(NO_PROJECT), None, &no_prices()).unwrap();
+        assert_eq!(none.projects.len(), 1);
+        assert_eq!(none.projects[0].project, NO_PROJECT);
+        assert_eq!(none.projects[0].calls, 2);
+        assert_eq!(none.threads.len(), 2);
+        assert_eq!(none.days.len(), 1, "both logs are from the same day");
+        // Nothing is counted twice: the per-project sums are the day's.
+        let total: u32 = stats.projects.iter().map(|p| p.calls).sum();
+        assert_eq!(stats.days.iter().map(|d| d.calls).sum::<u32>(), total);
+    }
+
+    /// T4 (issue #83): `--thread` finds an id in either layout, and a
+    /// `--project` that names another project says which project the
+    /// thread is in.
+    #[test]
+    fn collect_thread_finds_flat_and_legacy_and_names_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let flat = id_at(0);
+        let legacy = id_at(1);
+        let outside = id_at(2);
+        write_thread(
+            base,
+            flat,
+            &[
+                thread_started("2026-09-28T08:00:00Z", Some("alpha"), base),
+                call("2026-09-28T08:00:01Z", 100, 0, 50, Some(0.25), None, None),
+            ],
+        );
+        write_thread(
+            &base.join("alpha"),
+            legacy,
+            &[call(
+                "2026-09-28T08:01:00Z",
+                100,
+                0,
+                50,
+                Some(0.25),
+                None,
+                None,
+            )],
+        );
+        write_thread(
+            base,
+            outside,
+            &[call(
+                "2026-09-28T08:02:00Z",
+                100,
+                0,
+                50,
+                Some(0.25),
+                None,
+                None,
+            )],
+        );
+
+        let book = no_prices();
+        assert_eq!(
+            collect_thread(base, &[], None, flat, None, &book)
+                .unwrap()
+                .project,
+            "alpha"
+        );
+        assert_eq!(
+            collect_thread(base, &[], None, legacy, None, &book)
+                .unwrap()
+                .project,
+            "alpha",
+            "a legacy id is found too, named by its directory"
+        );
+
+        let err = collect_thread(base, &[], Some("beta"), flat, None, &book)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, format!("thread {flat} is in alpha, not beta"));
+
+        let err = collect_thread(base, &[], Some("alpha"), outside, None, &book)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!("thread {outside} is in {NO_PROJECT}, not alpha")
+        );
+
+        let missing = Ulid::generate();
+        let err = collect_thread(base, &[], None, missing, None, &book)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!("no thread {missing} found under {}", base.display())
+        );
+    }
+
+    /// T5 (issue #83): a log that cannot be read has no lines to
+    /// attribute it by, so it counts unless the filter can be shown to
+    /// exclude it.
+    #[test]
+    fn unreadable_logs_count_by_what_can_be_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let good = id_at(0);
+        write_thread(
+            base,
+            good,
+            &[
+                thread_started("2026-09-28T08:00:00Z", Some("alpha"), base),
+                call("2026-09-28T08:00:01Z", 100, 0, 50, Some(0.25), None, None),
+            ],
+        );
+        // A corrupt flat log, and a corrupt `alpha/` one.
+        std::fs::write(base.join(format!("{}.jsonl", id_at(1))), b"{not json").unwrap();
+        std::fs::create_dir_all(base.join("alpha")).unwrap();
+        std::fs::write(
+            base.join("alpha").join(format!("{}.jsonl", id_at(2))),
+            b"{not json",
+        )
+        .unwrap();
+
+        let book = no_prices();
+        let all = collect(base, &[], None, None, &book).unwrap();
+        assert_eq!(all.unreadable, 2, "neither log can be attributed");
+        let alpha = collect(base, &[], Some("alpha"), None, &book).unwrap();
+        assert_eq!(
+            alpha.unreadable, 1,
+            "only the log in alpha/ can be shown to be alpha's"
+        );
+        let beta = collect(base, &[], Some("beta"), None, &book).unwrap();
+        assert_eq!(beta.unreadable, 0);
+        let decisions = collect_decisions(base, &[], Some("alpha"), None).unwrap();
+        assert_eq!(decisions.unreadable, 1, "the same rule for the record");
+    }
+    // ---- start-up proposals (issue #85) ----
+
+    /// T6 (issue #85): the model's `project` proposals and start-up ones
+    /// get their own rows, in that order, each with its own figures, and
+    /// `--json` marks the start-up row alone.
+    #[test]
+    fn t6a_startup_proposals_have_their_own_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = [DecisionLine {
+            kind: "project",
+            at: "2026-10-05T09:00:00Z",
+            answer: Some(("yes", PERSON)),
+        }];
+        let startup = [
+            DecisionLine {
+                kind: "project",
+                at: "2026-10-05T09:05:00Z",
+                answer: Some(("no", PERSON)),
+            },
+            DecisionLine {
+                kind: "project",
+                at: "2026-10-05T09:06:00Z",
+                answer: None,
+            },
+        ];
+        decision_thread(&dir.path().join("model"), &plain);
+        startup_thread(&dir.path().join("start-up"), &startup);
+
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
+        let names: Vec<String> = report.kinds.iter().map(row_name).collect();
+        assert_eq!(
+            names,
+            vec!["project".to_owned(), "project (start-up)".to_owned()],
+            "the start-up row follows the plain one"
+        );
+        for (row, table, name) in [
+            (&report.kinds[0], &plain[..], "project"),
+            (&report.kinds[1], &startup[..], "project (start-up)"),
+        ] {
+            let (proposed, yes, no, corrected, withdrawn, pending, rate) =
+                expected_row(table, "project");
+            assert_eq!(
+                (
+                    row.proposed,
+                    row.yes,
+                    row.no,
+                    row.corrected,
+                    row.withdrawn,
+                    row.pending
+                ),
+                (proposed, yes, no, corrected, withdrawn, pending),
+                "{name}"
+            );
+            assert_eq!(row.rate, rate, "{name} rate");
+            assert_eq!(row.last_30, rate, "{name} last 30: under 30 answered");
+        }
+        assert!(!report.kinds[0].startup, "the plain row");
+        assert!(report.kinds[1].startup, "the start-up row");
+
+        // The model's own record is its own: the plain row's rate comes
+        // from its one `yes`, not from the start-up `no` beside it.
+        assert_eq!(report.kinds[0].yes, 1);
+        assert_eq!(report.kinds[0].no, 0);
+        assert_eq!(report.kinds[1].no, 1);
+
+        let json = serde_json::to_value(&report).unwrap();
+        let rows = json["kinds"].as_array().unwrap();
+        assert!(rows[0].get("startup").is_none(), "{}", rows[0]);
+        assert_eq!(rows[1]["startup"], json!(true));
+    }
+
+    /// T6c (issue #85): the rendered table lines up — the start-up row
+    /// carries the same column count as the plain one, and the header and
+    /// both rows start their first figure in the same column.
+    #[test]
+    fn t6c_the_rendered_table_lines_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = [DecisionLine {
+            kind: "project",
+            at: "2026-10-05T09:00:00Z",
+            answer: Some(("yes", PERSON)),
+        }];
+        let startup = [DecisionLine {
+            kind: "project",
+            at: "2026-10-05T09:05:00Z",
+            answer: Some(("no", PERSON)),
+        }];
+        decision_thread(&dir.path().join("model"), &plain);
+        startup_thread(&dir.path().join("start-up"), &startup);
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
+        let text = render_decisions(&report);
+        let header = text.lines().find(|l| l.starts_with("kind")).unwrap();
+        // `project (start-up)` also starts with `project `, so the plain
+        // row is the one without the suffix.
+        let plain_row = text
+            .lines()
+            .find(|l| l.starts_with("project ") && !l.starts_with("project ("))
+            .unwrap();
+        let startup_row = text
+            .lines()
+            .find(|l| l.starts_with("project (start-up)"))
+            .unwrap();
+        // Every figure after the name, counted the same way.
+        let figures = |line: &str, name: &str| line[name.len()..].split_whitespace().count();
+        assert_eq!(
+            figures(plain_row, "project"),
+            figures(startup_row, "project (start-up)"),
+            "the same figures:\n{text}"
+        );
+        // And the numbers begin in the same column on every line: the
+        // name column is as wide as the longest name printed, so the
+        // header's first figure field starts where each row's does.
+        let name_width = header.find("proposed").unwrap() - 1;
+        for line in [&header, &plain_row, &startup_row] {
+            assert_eq!(line.len(), header.len(), "a fixed-width table:\n{text}");
+        }
+        assert_eq!(
+            &plain_row[..name_width],
+            &format!("{:<name_width$}", "project"),
+            "the plain row's name column:\n{text}"
+        );
+        assert_eq!(
+            &startup_row[..name_width],
+            &format!("{:<name_width$}", "project (start-up)"),
+            "the start-up row's name column, not truncated:\n{text}"
+        );
+        for line in [&plain_row, &startup_row] {
+            assert_eq!(
+                line.as_bytes()[name_width],
+                b' ',
+                "the name column ends where the numbers begin:\n{text}"
+            );
+        }
+    }
+    /// T6b: only start-up proposals: the start-up row alone, and no
+    /// all-zero `project` row beside it.
+    #[test]
+    fn t6b_only_startup_proposals_print_one_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let startup = [DecisionLine {
+            kind: "project",
+            at: "2026-10-05T09:00:00Z",
+            answer: Some(("yes", PERSON)),
+        }];
+        startup_thread(&dir.path().join("start-up"), &startup);
+
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
+        let names: Vec<String> = report.kinds.iter().map(row_name).collect();
+        assert_eq!(names, vec!["project (start-up)".to_owned()]);
+        let (proposed, yes, no, corrected, withdrawn, pending, rate) =
+            expected_row(&startup, "project");
+        let row = &report.kinds[0];
+        assert_eq!(
+            (
+                row.proposed,
+                row.yes,
+                row.no,
+                row.corrected,
+                row.withdrawn,
+                row.pending
+            ),
+            (proposed, yes, no, corrected, withdrawn, pending)
+        );
+        assert_eq!(row.rate, rate);
+        let text = render_decisions(&report);
+        assert!(!text.lines().any(|l| l == "project"), "{text}");
+        assert!(text.contains("project (start-up)"), "{text}");
+    }
+
+    /// T5 (issue #121): a start-up ask's pair lands in `project`'s
+    /// `startup` row — `yes` when the person took the offered project,
+    /// `corrected` when they went elsewhere — with no pending proposal
+    /// and no orphan. The lines are built from the payload types
+    /// `record_startup_ask` writes, so the fixture cannot drift from the
+    /// event shape.
+    #[test]
+    fn t5_a_startup_ask_answer_counts_in_the_project_startup_row() {
+        use aigentic_runtime::aigentic_log::{
+            DecisionAnsweredPayload, DecisionProposedPayload, DecisionStage, STARTUP_PREFIX,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let offered = "web";
+        // One answer takes the offered project, the other goes elsewhere.
+        for (n, chosen) in ["web", "api"].into_iter().enumerate() {
+            let proposal = Ulid::generate();
+            // The call id's shape is the writer's: the start-up prefix and
+            // an `ask-` marker.
+            let call_id = format!("{STARTUP_PREFIX}ask-{}", Ulid::generate());
+            let at = format!("2026-10-0{}T09:00:00Z", n + 5);
+            let proposed = json!({
+                "id": proposal.to_string(),
+                "kind": "decision_proposed",
+                "author": {"kind": "system"},
+                "payload": serde_json::to_value(DecisionProposedPayload {
+                    kind: DecisionKind::Project,
+                    proposal: offered.to_owned(),
+                    target: None,
+                    reason: "which project to start in".to_owned(),
+                    call_id: Some(call_id),
+                    job: None,
+                    stage: DecisionStage::Ask,
+                })
+                .unwrap(),
+                "created_at": at,
+            });
+            let (answer, correction) = if chosen == offered {
+                (DecisionAnswer::Yes, None)
+            } else {
+                (DecisionAnswer::Corrected, Some(chosen.to_owned()))
+            };
+            let answered = json!({
+                "id": Ulid::generate().to_string(),
+                "kind": "decision_answered",
+                "author": {"kind": "user", "id": PERSON},
+                "parent_event": proposal.to_string(),
+                "payload": serde_json::to_value(DecisionAnsweredPayload {
+                    answer,
+                    correction,
+                    note: None,
+                })
+                .unwrap(),
+                "created_at": at,
+            });
+            write_decisions(
+                &dir.path().join(format!("start-{n}")),
+                Ulid::generate(),
+                &[proposed, answered],
+            );
+        }
+
+        let report = collect_decisions(dir.path(), &[], None, None).unwrap();
+        assert_eq!(report.orphans, 0, "the answer names its proposal");
+        let names: Vec<String> = report.kinds.iter().map(row_name).collect();
+        assert_eq!(names, vec!["project (start-up)".to_owned()]);
+        let row = &report.kinds[0];
+        assert_eq!(
+            (
+                row.proposed,
+                row.yes,
+                row.no,
+                row.corrected,
+                row.withdrawn,
+                row.pending
+            ),
+            (2, 1, 0, 1, 0, 0)
+        );
+        // One of the two was taken as offered.
+        assert_eq!(row.rate, Some(50));
+    }
+
+    /// #85's review: a table with plain rows only keeps the 14-wide
+    /// name column it always had.
+    #[test]
+    fn a_plain_decisions_table_keeps_its_name_column() {
+        let report = DecisionReport {
+            kinds: vec![DecisionKindStats {
+                kind: DecisionKind::Project,
+                proposed: 1,
+                yes: 1,
+                no: 0,
+                corrected: 0,
+                withdrawn: 0,
+                pending: 0,
+                rate: Some(100),
+                last_30: Some(100),
+                startup: false,
+            }],
+            ..DecisionReport::default()
+        };
+        let text = render_decisions(&report);
+        let header = text.lines().find(|l| l.starts_with("kind")).unwrap();
+        // `kind` padded to the column, one space, then `proposed`,
+        // which fills its own 8-wide column exactly.
+        assert_eq!(header.find("proposed"), Some(MIN_NAME_WIDTH + 1), "{text}");
     }
 }

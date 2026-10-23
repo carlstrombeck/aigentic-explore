@@ -14,8 +14,19 @@ use aigentic_core::{Author, ContentBlock, Event, RiskClass, ToolCall};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-/// Sent in `Hello`; a mismatch is refused with both numbers.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Sent in `Hello`; a mismatch is refused with both numbers. Version 2
+/// adds `Build`/`AnswerCheckpoint` and `Response::Run`; version 3 adds
+/// `AnswerSwitch` and `ThreadState::AwaitingSwitch`, so a version-2
+/// client is refused rather than left never seeing the switch it is
+/// asked to answer; version 4 adds `Front`/`NewFront` and
+/// `Response::Front`; version 5 lets `ListThreads` omit its project;
+/// version 6 adds `Notice::RunStatus`, which an older client cannot
+/// decode; version 7 adds `RunPhase::Stopped`, which an older client
+/// would render as a move; version 8 adds `Jobs`/`JobRow`, so a client
+/// that cannot show today's builds must refuse rather than misread one;
+/// version 9 adds `Notice::Job`, which carries a background job's asks to
+/// the front thread, so a client that could not answer them must refuse.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// One line on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -70,10 +81,56 @@ pub enum Request {
         token: String,
     },
     ListProjects,
+    /// Every thread of `project`, or — with no project (issue #86) —
+    /// every thread of every project the caller holds a role in, the
+    /// caller's front thread first, then each run's threads, then the
+    /// rest grouped by workspace. The daemon judges the roles of a
+    /// project-less listing per project.
     ListThreads {
-        project: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+    },
+    /// Today's builds and what each is doing. With no project the daemon
+    /// judges the roles per row's project, like a project-less listing;
+    /// with one it needs `read` there. A build another daemon drives
+    /// lists with no state and no cost.
+    Jobs {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
     },
     CreateThread {
+        project: String,
+    },
+    /// The user's front thread (issue #84): the newest thread they made
+    /// with `front` set, or a new one in `project` when they have none
+    /// or the old one can't be opened. The handler judges the roles:
+    /// `read` in the front thread's project to resume, `write` in the
+    /// requested project to create.
+    ///
+    /// `here` is the folder's own project (issue #92), from `--project`
+    /// or the folder's `aigentic.toml`; a plain launch sends it so the
+    /// daemon may offer to switch to it when the front thread is
+    /// somewhere else. `None` from an old client or a bare folder, and
+    /// an old daemon ignores it.
+    ///
+    /// `asked` is the start-up ask's answer (issue #121), sent when the
+    /// client asked which project to work in before opening a thread: a
+    /// client that asked sends `project = chosen` and `here = chosen`
+    /// too. Optional, so an old client's frame is the same as before and
+    /// an old daemon ignores the key. There is no `PROTOCOL_VERSION`
+    /// bump: `here` was added by #92 the same way, and nothing here
+    /// refuses an unknown field — an old daemon then drops the answer,
+    /// and the pair is simply absent from its log.
+    Front {
+        project: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        here: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asked: Option<StartAsk>,
+    },
+    /// A new front thread in `project` (issue #84), replacing whatever
+    /// was front; the old one stays listed.
+    NewFront {
         project: String,
     },
     /// The events since `from_seq`, then a live subscription.
@@ -123,6 +180,14 @@ pub enum Request {
         call_id: String,
         text: String,
     },
+    /// Answer a `suggest_project` proposal (issue #7), read from
+    /// `ThreadState::AwaitingSwitch`; needs `write` in the thread's
+    /// project, and for a `yes` in the target too.
+    AnswerSwitch {
+        thread: Ulid,
+        call_id: String,
+        answer: SwitchReply,
+    },
     Pin {
         thread: Ulid,
         text: String,
@@ -156,6 +221,45 @@ pub enum Request {
         thread: Ulid,
         report: ReportKind,
     },
+    /// The start-up ask's light listing (issue #121): this user's
+    /// threads, from the daemon's index alone — no thread's log body is
+    /// read. `ListThreads` is unchanged; the ask uses this so a bare
+    /// launch does not parse every log on disk.
+    StartRows,
+    /// Start a run for `issue` in `project`, or resume the unfinished one
+    /// (issue #58). Refused unless the user has `approve`: a build pushes
+    /// to the main branch. `workflow` defaults to the bundled `build`.
+    Build {
+        project: String,
+        issue: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow: Option<String>,
+    },
+    /// Answer the open checkpoint of a run's lead. Which words are
+    /// accepted is the gate's own decision: its ask lists the options it
+    /// offered, and the daemon refuses any other word. The lead is the
+    /// run's own thread, not a project thread.
+    AnswerCheckpoint {
+        lead: Ulid,
+        gate: String,
+        answer: CheckpointAnswer,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        amendment: Option<String>,
+    },
+}
+
+/// A human's answer at a run's checkpoint (issue #58). Mirrors the log's
+/// `CheckpointAnswer` rather than take an edge to `log` (AGENTS.md); the
+/// serde shape is identical, so the same word crosses the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointAnswer {
+    Go,
+    Amend,
+    Retry,
+    Stop,
+    /// Raised a run's budget; the amendment carries the new figure.
+    Raise,
 }
 
 /// The text reports the REPL prints, rendered by the daemon so every
@@ -190,8 +294,33 @@ pub enum Response {
     Threads {
         threads: Vec<ThreadInfo>,
     },
+    /// The answer to `StartRows` (issue #121): the same rows as
+    /// `ListThreads`, without reading a log. `ListThreads` still carries
+    /// the whole `ThreadInfo`.
+    StartRows {
+        rows: Vec<StartRow>,
+    },
+    /// The reply to `Jobs`: today's builds, newest first.
+    Jobs {
+        rows: Vec<JobRow>,
+    },
     Thread {
         thread: ThreadInfo,
+    },
+    /// The reply to `Front` (issue #84): the front thread, and how it
+    /// was arrived at. `Replaced` names why the old one could not be
+    /// opened, in words a banner can print; the old thread stays
+    /// listed.
+    Front {
+        thread: ThreadInfo,
+        outcome: FrontOutcome,
+    },
+    /// The reply to `Build` (issue #58): the run's lead thread.
+    /// `resumed` says an unfinished run was picked up rather than a new
+    /// one started. The session subscribes this client to the lead.
+    Run {
+        lead: Ulid,
+        resumed: bool,
     },
     /// The reply to `Open`: the state now, the events since `from_seq`,
     /// and the thread's permission mode, with the identity the footer
@@ -200,6 +329,11 @@ pub enum Response {
     Opened {
         state: ThreadState,
         events: Vec<Event>,
+        /// Set when the thread belongs to a run (issue #58): a lead, or
+        /// one of its steps' children. Such a thread is served read-only,
+        /// because the run alone writes its log.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<RunThread>,
         #[serde(default)]
         mode: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -226,6 +360,51 @@ pub enum Response {
     Error {
         message: String,
     },
+}
+
+/// The start-up ask's answer (issue #121): the client asked which
+/// project to work in before opening a front thread, and the person
+/// answered. `offered` is row 1, the one Enter takes — the client's
+/// guess and the default; `chosen` is where they settled; `reason` is
+/// the ladder's own words for why it asked, recorded on the proposal.
+/// The daemon logs the pair as a `project` decision, and a `chosen`
+/// that differs from `offered` moves the thread before it opens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartAsk {
+    pub offered: String,
+    pub chosen: String,
+    pub reason: String,
+}
+
+impl StartAsk {
+    /// The line a client prints when a sent answer did not land (issue
+    /// #121, finding 2): the daemon resumes a busy front thread where it
+    /// is, silently. The reply's row is built after any move the answer
+    /// applied (spec v2 decision 4), so a project that differs from
+    /// `chosen` means the answer was ignored. `None` when the answer
+    /// was applied — or when the row's project is unknown.
+    pub fn ignored_note(&self, thread: &ThreadInfo) -> Option<String> {
+        let project = thread.project.as_deref()?;
+        (project != self.chosen).then(|| {
+            format!(
+                "[the front thread is busy in {project}; resumed it there — your choice was not applied]"
+            )
+        })
+    }
+}
+
+/// How a `Front` request was answered (issue #84).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FrontOutcome {
+    /// The user's existing front thread, opened where it was.
+    Resumed,
+    /// The user had none: this is the first one.
+    First,
+    /// The old front thread could not be opened; this is a new one, and
+    /// `reason` says why the old one could not be, in words a banner
+    /// can print.
+    Replaced { reason: String },
 }
 
 /// The reply to `Hello`.
@@ -288,6 +467,16 @@ pub enum Notice {
         window: u64,
         turn_elapsed_ms: Option<u64>,
         queued: u32,
+        /// The whole thread, as if nothing had been stubbed or summarised
+        /// (issue #99): the status line's `thread` figure. `None` from a
+        /// daemon before #99, and an older client ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_tokens: Option<u64>,
+        /// How many builds the daemon drives right now: its own count, the
+        /// same on every thread it sends a line for. A daemon that does not
+        /// send one leaves the key off, which reads as `0`.
+        #[serde(default)]
+        working: u32,
     },
     /// A remark for the person that is not an event (a rules file that
     /// could not be written).
@@ -295,6 +484,99 @@ pub enum Notice {
         thread: Ulid,
         text: String,
     },
+    /// A followed run's line: where it is, pushed at most once every two
+    /// seconds while someone watches its lead.
+    RunStatus {
+        thread: Ulid,
+        status: RunStatus,
+    },
+    /// A background job's own notice, forwarded to the front thread it
+    /// reports to: its asks, the answers that settle them, and its state.
+    /// `thread` is the front, `job` the job's own thread, which a
+    /// `Decide` or `AnswerHuman` for the ask is sent to, and `number` the
+    /// job's place among the front's jobs, counted from 1 in start order.
+    Job {
+        thread: Ulid,
+        job: Ulid,
+        number: u32,
+        notice: Box<Notice>,
+    },
+}
+
+/// A run's status line, as the daemon pushes it. Mirrors the runtime's
+/// own fold, which `api` cannot see.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunStatus {
+    pub issue: u64,
+    pub phase: RunPhase,
+    pub idle_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum RunPhase {
+    Step {
+        step: String,
+        attempt: u32,
+        elapsed_secs: u64,
+        calls: u32,
+        cost_usd: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checklist: Option<RunChecklist>,
+    },
+    Gate {
+        gate: String,
+    },
+    Move {
+        what: String,
+    },
+    /// The run's own turn ended in an error and the run has not ended:
+    /// a later step supersedes it, and the next build resumes the run.
+    Stopped {
+        reason: String,
+    },
+}
+
+/// The checklist figure, as on the wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunChecklist {
+    pub done: usize,
+    pub total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
+}
+
+/// A thread a run owns (issue #58). The daemon serves it read-only:
+/// the run is its only writer, whichever client asks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunThread {
+    /// A run's lead thread: the issue it builds.
+    Lead {
+        /// The issue the run was asked for.
+        issue: u64,
+    },
+    /// A step's child thread, under its run's lead.
+    Child {
+        /// The run's lead.
+        lead: Ulid,
+        /// The workflow step the child works.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step: Option<String>,
+    },
+}
+
+/// What a listing row is (issue #86), so a client can draw the groups
+/// without asking again. A row is the caller's own front thread, a
+/// thread a run owns, or an ordinary one; another person's front thread
+/// is an ordinary one.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadKind {
+    #[default]
+    Thread,
+    Front,
+    Run(RunThread),
 }
 
 /// Where a thread is, for the state line and the listings.
@@ -321,6 +603,32 @@ pub enum ThreadState {
         question: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         questions: Vec<AskedQuestion>,
+    },
+    /// A `suggest_project` proposal waits for someone with `write`
+    /// (issue #7). `workspace` is the daemon's label for the target.
+    AwaitingSwitch {
+        call_id: String,
+        project: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
+        reason: String,
+    },
+}
+
+/// A person's answer to a switch proposal (issue #7). Mirrors the
+/// runtime's `SwitchAnswer` rather than take an edge to it (AGENTS.md).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "answer", rename_all = "snake_case")]
+pub enum SwitchReply {
+    Yes,
+    No,
+    /// The person named where the work belongs instead.
+    Corrected {
+        to: String,
+    },
+    /// Nobody answered it: `exec`'s decline, or a client giving up.
+    Withdrawn {
+        note: String,
     },
 }
 
@@ -360,6 +668,24 @@ pub struct ProjectInfo {
     pub threads: u64,
 }
 
+/// One `StartRows` row (issue #121): what the start-up ask needs to
+/// draw its list, and nothing a log body has to be read for. The
+/// daemon builds it from its index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartRow {
+    pub id: Ulid,
+    /// The thread's project, as the daemon knows it.
+    pub project: String,
+    /// `thread_started.root`, when the log recorded one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<PathBuf>,
+    /// The workspace naming that project, if one does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// This user's front thread (`thread_started.front`, issue #84).
+    pub front: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThreadInfo {
     pub id: Ulid,
@@ -372,6 +698,60 @@ pub struct ThreadInfo {
     /// The last `thread_renamed` title; absent before phase 6.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The workspace naming this row's project (issue #86): absent when
+    /// no workspace names it, so a client groups by the `None` group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// What this row is (issue #86). A version-4 row has no `kind` and
+    /// decodes as an ordinary thread.
+    #[serde(default)]
+    pub kind: ThreadKind,
+}
+
+/// One `Jobs` row: a build started today. Its state and its cost are
+/// absent when this daemon is not the one running it, since it states
+/// only what it can read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobRow {
+    /// The build's lead thread.
+    pub id: Ulid,
+    /// The issue the build works; `None` on a row that is not a build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u64>,
+    /// What the table shows for the row, `build #<issue>`.
+    pub what: String,
+    pub project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<JobState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+/// What a `Jobs` row's build is doing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum JobState {
+    Running,
+    /// Parked at a checkpoint: it waits on a person, not on the model.
+    WaitingOnYou,
+    Done,
+    /// The run's turn ended in an error and the run has not ended.
+    Stopped {
+        reason: String,
+    },
+}
+
+impl JobState {
+    /// The table's words for the state: `running`, `waiting on you`,
+    /// `done`, or `stopped: <reason>`.
+    pub fn words(&self) -> String {
+        match self {
+            Self::Running => "running".to_owned(),
+            Self::WaitingOnYou => "waiting on you".to_owned(),
+            Self::Done => "done".to_owned(),
+            Self::Stopped { reason } => format!("stopped: {reason}"),
+        }
+    }
 }
 
 /// A line that could not be read.
@@ -434,6 +814,33 @@ mod tests {
         Ulid::from_parts(1_700_000_000_000, 1)
     }
 
+    /// A thread row, for the replies that carry one.
+    fn info() -> ThreadInfo {
+        ThreadInfo {
+            id: thread(),
+            project: Some("p".into()),
+            date: "2026-09-22".into(),
+            events: 9,
+            first_line: "What's next?".into(),
+            state: ThreadState::Idle,
+            title: None,
+            workspace: None,
+            kind: ThreadKind::Thread,
+        }
+    }
+
+    /// A `Jobs` row, for the reply that carries one.
+    fn job_row() -> JobRow {
+        JobRow {
+            id: thread(),
+            issue: Some(29),
+            what: "build #29".into(),
+            project: "p".into(),
+            state: Some(JobState::Running),
+            cost_usd: Some(0.5),
+        }
+    }
+
     fn every_request() -> Vec<Request> {
         vec![
             Request::Hello {
@@ -442,10 +849,30 @@ mod tests {
             },
             Request::ListProjects,
             Request::ListThreads {
-                project: "p".into(),
+                project: Some("p".into()),
             },
+            // Issue #86: no project means every project the caller may
+            // read, so the frame carries none.
+            Request::ListThreads { project: None },
+            Request::Jobs {
+                project: Some("p".into()),
+            },
+            // A project-less ask names nothing to judge: the daemon
+            // judges each row's project.
+            Request::Jobs { project: None },
+            // Issue #121: the ask's light listing, which takes no
+            // fields at all.
+            Request::StartRows,
             Request::CreateThread {
                 project: "p".into(),
+            },
+            Request::Front {
+                project: "p".into(),
+                here: Some("q".into()),
+                asked: None,
+            },
+            Request::NewFront {
+                project: "q".into(),
             },
             Request::Open {
                 thread: thread(),
@@ -475,6 +902,30 @@ mod tests {
                 call_id: "c2".into(),
                 text: "yes".into(),
             },
+            Request::AnswerSwitch {
+                thread: thread(),
+                call_id: "c3".into(),
+                answer: SwitchReply::Yes,
+            },
+            Request::AnswerSwitch {
+                thread: thread(),
+                call_id: "c3".into(),
+                answer: SwitchReply::No,
+            },
+            Request::AnswerSwitch {
+                thread: thread(),
+                call_id: "c3".into(),
+                answer: SwitchReply::Corrected {
+                    to: "customer X".into(),
+                },
+            },
+            Request::AnswerSwitch {
+                thread: thread(),
+                call_id: "c3".into(),
+                answer: SwitchReply::Withdrawn {
+                    note: "exec declines proposals".into(),
+                },
+            },
             Request::Pin {
                 thread: thread(),
                 text: "Use Swedish.".into(),
@@ -492,39 +943,73 @@ mod tests {
                 thread: thread(),
                 report: ReportKind::Policy,
             },
+            Request::Build {
+                project: "p".into(),
+                issue: 58,
+                workflow: Some("build".into()),
+            },
+            Request::AnswerCheckpoint {
+                lead: thread(),
+                gate: "brief".into(),
+                answer: CheckpointAnswer::Stop,
+                amendment: None,
+            },
         ]
     }
 
     fn every_response() -> Vec<Response> {
-        let info = ProjectInfo {
+        let project_info = ProjectInfo {
             name: "p".into(),
             root: PathBuf::from("/srv/p"),
             role: Some("approve".into()),
             threads: 2,
         };
-        let thread_info = ThreadInfo {
-            id: thread(),
-            project: Some("p".into()),
-            date: "2026-09-22".into(),
-            events: 9,
-            first_line: "What's next?".into(),
-            state: ThreadState::Idle,
-            title: None,
-        };
+        let thread_info = info();
         vec![
             Response::Welcome(Welcome {
                 user: "steve".into(),
-                projects: vec![info.clone()],
+                projects: vec![project_info.clone()],
                 server: "aigentic 0.1.0".into(),
             }),
             Response::Projects {
-                projects: vec![info],
+                projects: vec![project_info],
             },
             Response::Threads {
                 threads: vec![thread_info.clone()],
             },
+            Response::StartRows {
+                rows: vec![StartRow {
+                    id: thread(),
+                    project: "p".into(),
+                    root: Some(PathBuf::from("/srv/p")),
+                    workspace: Some("ws".into()),
+                    front: true,
+                }],
+            },
+            Response::Jobs {
+                rows: vec![job_row()],
+            },
+            Response::Jobs { rows: Vec::new() },
             Response::Thread {
+                thread: thread_info.clone(),
+            },
+            Response::Front {
+                thread: thread_info.clone(),
+                outcome: FrontOutcome::Resumed,
+            },
+            Response::Front {
+                thread: thread_info.clone(),
+                outcome: FrontOutcome::First,
+            },
+            Response::Front {
                 thread: thread_info,
+                outcome: FrontOutcome::Replaced {
+                    reason: "you no longer have a role in p".into(),
+                },
+            },
+            Response::Run {
+                lead: thread(),
+                resumed: true,
             },
             Response::Opened {
                 state: ThreadState::Running {
@@ -532,6 +1017,7 @@ mod tests {
                     queued: 1,
                 },
                 events: vec![event()],
+                run: Some(RunThread::Lead { issue: 58 }),
                 mode: "manual".into(),
                 profile: Some("flash".into()),
                 model: "deepseek-v4.1-flash".into(),
@@ -589,6 +1075,15 @@ mod tests {
                     }],
                 },
             },
+            Notice::State {
+                thread: thread(),
+                state: ThreadState::AwaitingSwitch {
+                    call_id: "c3".into(),
+                    project: "aigentic-web".into(),
+                    workspace: Some("~/aigentic-web".into()),
+                    reason: "the message is about the site".into(),
+                },
+            },
             Notice::Mode {
                 thread: thread(),
                 mode: "auto".into(),
@@ -599,7 +1094,119 @@ mod tests {
                 model: "deepseek-v4.1-flash".into(),
                 effort: Some("50".into()),
             },
+            Notice::Usage {
+                thread: thread(),
+                tokens_in_window: 48_000,
+                window: 120_000,
+                turn_elapsed_ms: Some(1_200),
+                queued: 1,
+                thread_tokens: Some(2_100_000),
+                working: 2,
+            },
+            Notice::Usage {
+                thread: thread(),
+                tokens_in_window: 48_000,
+                window: 120_000,
+                turn_elapsed_ms: None,
+                queued: 0,
+                thread_tokens: None,
+                working: 0,
+            },
         ]
+    }
+
+    /// T3 (issue #99): `thread_tokens` is optional both ways. A `usage`
+    /// line from a daemon before #99 has no such key and decodes to
+    /// `None`, and `None` is left off the wire, so an older client reads
+    /// exactly the line it always did.
+    #[test]
+    fn usage_carries_the_thread_figure_when_there_is_one() {
+        let with = Notice::Usage {
+            thread: thread(),
+            tokens_in_window: 48_000,
+            window: 120_000,
+            turn_elapsed_ms: None,
+            queued: 0,
+            thread_tokens: Some(2_100_000),
+            working: 0,
+        };
+        let line = encode(&Frame::notice(with.clone()));
+        assert!(line.contains("\"thread_tokens\":2100000"), "{line}");
+        assert_eq!(decode(&line).unwrap(), Frame::notice(with));
+
+        let without = Notice::Usage {
+            thread: thread(),
+            tokens_in_window: 48_000,
+            window: 120_000,
+            turn_elapsed_ms: None,
+            queued: 0,
+            thread_tokens: None,
+            working: 0,
+        };
+        let line = encode(&Frame::notice(without.clone()));
+        assert!(!line.contains("thread_tokens"), "{line}");
+        // That is the line a daemon before #99 writes, and it decodes to
+        // `None`.
+        assert_eq!(decode(&line).unwrap(), Frame::notice(without));
+    }
+
+    /// The pair this ticket adds is additive both ways. A
+    /// `usage` line from an older daemon has no `working` key and decodes
+    /// to `0`; a row whose state and cost this daemon cannot read leaves
+    /// both keys off; and a reason with a colon in it survives the round
+    /// trip.
+    #[test]
+    fn the_wire_tolerates_a_usage_without_the_count_and_round_trips_a_row() {
+        let empty = JobRow {
+            state: None,
+            cost_usd: None,
+            ..job_row()
+        };
+        let line = encode(&Frame::request(1, Request::Jobs { project: None }));
+        assert!(!line.contains("project"), "{line}");
+        assert_eq!(
+            decode(&line).unwrap(),
+            Frame::request(1, Request::Jobs { project: None })
+        );
+        let bare = serde_json::to_string(&empty).unwrap();
+        assert!(!bare.contains("state"), "{bare}");
+        assert!(!bare.contains("cost_usd"), "{bare}");
+        assert_eq!(serde_json::from_str::<JobRow>(&bare).unwrap(), empty);
+
+        let stopped = JobRow {
+            state: Some(JobState::Stopped {
+                reason: "no such label".into(),
+            }),
+            ..job_row()
+        };
+        let round = serde_json::to_string(&stopped).unwrap();
+        assert_eq!(serde_json::from_str::<JobRow>(&round).unwrap(), stopped);
+
+        let counting = Notice::Usage {
+            thread: thread(),
+            tokens_in_window: 48_000,
+            window: 120_000,
+            turn_elapsed_ms: None,
+            queued: 0,
+            thread_tokens: None,
+            working: 3,
+        };
+        let line = encode(&Frame::notice(counting.clone()));
+        assert_eq!(decode(&line).unwrap(), Frame::notice(counting), "{line}");
+
+        // What a daemon that does not count sends: the same line with the
+        // key dropped.
+        let mut older: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(older["notice"]["working"], 3, "{older}");
+        older["notice"]
+            .as_object_mut()
+            .expect("a notice is a JSON object")
+            .remove("working");
+        let older: Notice = serde_json::from_value(older["notice"].clone()).unwrap();
+        let Notice::Usage { working, .. } = older else {
+            panic!("a usage line decodes as usage");
+        };
+        assert_eq!(working, 0);
     }
 
     #[test]
@@ -622,6 +1229,271 @@ mod tests {
             assert_eq!(line.matches('\n').count(), 1, "{line}");
             assert_eq!(decode(&line).unwrap(), frame, "{line}");
         }
+    }
+
+    #[test]
+    fn the_retry_answer_crosses_the_wire_as_one_word() {
+        assert_eq!(
+            serde_json::to_value(CheckpointAnswer::Retry).unwrap(),
+            json!("retry")
+        );
+        let request = Request::AnswerCheckpoint {
+            lead: thread(),
+            gate: "checks_failed".into(),
+            answer: CheckpointAnswer::Retry,
+            amendment: None,
+        };
+        let frame = Frame::request(1, request.clone());
+        let line = encode(&frame);
+        assert!(line.ends_with('\n'));
+        assert_eq!(line.matches('\n').count(), 1, "{line}");
+        assert!(line.contains("\"answer\":\"retry\""), "{line}");
+        assert_eq!(decode(&line).unwrap(), frame);
+    }
+
+    /// T2 (issue #84): the front thread's requests and reply are on the
+    /// wire and the outcome is tagged by kind. The protocol's number is
+    /// pinned by T1 (issue #86), which raised it to 5.
+    #[test]
+    fn the_front_requests_and_their_reply_are_on_the_wire() {
+        let line = encode(&Frame::request(
+            1,
+            Request::Front {
+                project: "p".into(),
+                here: None,
+                asked: None,
+            },
+        ));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["request"]["kind"], "front");
+        assert_eq!(v["request"]["project"], "p");
+
+        let line = encode(&Frame::request(
+            2,
+            Request::NewFront {
+                project: "p".into(),
+            },
+        ));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["request"]["kind"], "new_front");
+
+        // The three outcomes, each through the codec, tagged by kind.
+        for (outcome, kind) in [
+            (FrontOutcome::Resumed, "resumed"),
+            (FrontOutcome::First, "first"),
+            (
+                FrontOutcome::Replaced {
+                    reason: "gone".into(),
+                },
+                "replaced",
+            ),
+        ] {
+            let frame = Frame::response(
+                3,
+                Response::Front {
+                    thread: info(),
+                    outcome: outcome.clone(),
+                },
+            );
+            let line = encode(&frame);
+            assert_eq!(decode(&line).unwrap(), frame, "{line}");
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["response"]["kind"], "front");
+            assert_eq!(v["response"]["outcome"]["kind"], kind);
+        }
+    }
+
+    /// T1 (issue #92): `Front`'s `here` is an additive optional field. A
+    /// frame carrying it round-trips; one without it is serialised with
+    /// no `here` key at all and a frame that predates the field decodes
+    /// as `here: None`, the old client's frame.
+    #[test]
+    fn t1_front_here_round_trips_and_the_old_frame_still_decodes() {
+        let with = Frame::request(
+            1,
+            Request::Front {
+                project: "p".into(),
+                here: Some("q".into()),
+                asked: None,
+            },
+        );
+        let line = encode(&with);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["request"]["here"], "q");
+        assert_eq!(decode(&line).unwrap(), with, "{line}");
+
+        let without = Frame::request(
+            2,
+            Request::Front {
+                project: "p".into(),
+                here: None,
+                asked: None,
+            },
+        );
+        let line = encode(&without);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(v["request"].get("here").is_none(), "{line}");
+        assert_eq!(decode(&line).unwrap(), without, "{line}");
+
+        // An old client's frame, with no `here` key at all.
+        let old = decode(r#"{"id":3,"request":{"kind":"front","project":"p"}}"#).unwrap();
+        assert_eq!(
+            old.body,
+            Body::Request(Request::Front {
+                project: "p".into(),
+                here: None,
+                asked: None,
+            })
+        );
+    }
+
+    /// T7 (issue #121): `Front`'s `asked` is an additive optional field
+    /// like #92's `here`. A frame carrying it round-trips; one without
+    /// it is serialised with no `asked` key at all; and a frame that
+    /// predates the field decodes as `asked: None`.
+    ///
+    /// No `PROTOCOL_VERSION` bump: `here` was added the same way and
+    /// nothing here refuses an unknown field. The consequence is that an
+    /// older daemon ignores `asked`, so the decision pair is absent from
+    /// its log and the client cannot tell.
+    #[test]
+    fn t7_front_asked_round_trips_and_the_old_frame_still_decodes() {
+        assert_eq!(PROTOCOL_VERSION, 9, "the job notice moved it");
+        let asked = StartAsk {
+            offered: "web".into(),
+            chosen: "api".into(),
+            reason: "started in a folder that names no project".into(),
+        };
+        let with = Frame::request(
+            1,
+            Request::Front {
+                project: "api".into(),
+                here: Some("api".into()),
+                asked: Some(asked.clone()),
+            },
+        );
+        let line = encode(&with);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["request"]["asked"]["offered"], "web");
+        assert_eq!(v["request"]["asked"]["chosen"], "api");
+        assert_eq!(v["request"]["asked"]["reason"], asked.reason);
+        assert_eq!(decode(&line).unwrap(), with, "{line}");
+
+        let without = Frame::request(
+            2,
+            Request::Front {
+                project: "p".into(),
+                here: None,
+                asked: None,
+            },
+        );
+        let line = encode(&without);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(v["request"].get("asked").is_none(), "{line}");
+        assert_eq!(decode(&line).unwrap(), without, "{line}");
+
+        // An old client's frame, with no `asked` key at all.
+        let old = decode(r#"{"id":3,"request":{"kind":"front","project":"p"}}"#).unwrap();
+        assert_eq!(
+            old.body,
+            Body::Request(Request::Front {
+                project: "p".into(),
+                here: None,
+                asked: None,
+            })
+        );
+    }
+
+    /// T1 (issue #86): `ListThreads` may omit its project, at protocol 5.
+    /// A frame with a project round-trips and carries it; one without is
+    /// serialised with no `project` key at all, and an old client's frame
+    /// (which always named one) still decodes.
+    #[test]
+    fn t1_list_threads_project_is_optional_on_the_wire() {
+        assert_eq!(PROTOCOL_VERSION, 9, "the job notice moved it");
+        let some = Frame::request(
+            1,
+            Request::ListThreads {
+                project: Some("p".into()),
+            },
+        );
+        let line = encode(&some);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["request"]["kind"], "list_threads");
+        assert_eq!(v["request"]["project"], "p");
+        assert_eq!(decode(&line).unwrap(), some, "{line}");
+
+        let none = Frame::request(2, Request::ListThreads { project: None });
+        let line = encode(&none);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["request"]["kind"], "list_threads");
+        assert!(v["request"].get("project").is_none(), "{line}");
+        assert_eq!(decode(&line).unwrap(), none, "{line}");
+
+        // A version-4 client's frame, which always named a project.
+        let old = decode(r#"{"id":3,"request":{"kind":"list_threads","project":"p"}}"#).unwrap();
+        assert_eq!(
+            old.body,
+            Body::Request(Request::ListThreads {
+                project: Some("p".into()),
+            })
+        );
+    }
+
+    /// T1 (issue #86): a version-4 row, with no `workspace` and no
+    /// `kind`, decodes with `None` and an ordinary thread.
+    #[test]
+    fn t1_a_version_four_thread_row_decodes_with_defaults() {
+        let line = format!(
+            r#"{{"id":"{}","project":"p","date":"2026-09-22","events":9,"first_line":"What's next?","state":{{"state":"idle"}}}}"#,
+            thread()
+        );
+        let row: ThreadInfo = serde_json::from_str(&line).unwrap();
+        assert_eq!(row.workspace, None);
+        assert_eq!(row.kind, ThreadKind::Thread);
+        assert_eq!(row.id, thread());
+        assert_eq!(row.project.as_deref(), Some("p"));
+    }
+
+    /// T1 (issue #86): the three kinds' JSON, pinned. `Run` carries the
+    /// run's thread shapes, `Front` and `Thread` are plain strings, and a
+    /// row of each round-trips.
+    #[test]
+    fn t1_thread_kinds_on_the_wire() {
+        let lead = RunThread::Lead { issue: 86 };
+        let child = RunThread::Child {
+            lead: thread(),
+            step: Some("implement".into()),
+        };
+        for (kind, json) in [
+            (ThreadKind::Thread, serde_json::json!("thread")),
+            (ThreadKind::Front, serde_json::json!("front")),
+            (
+                ThreadKind::Run(lead.clone()),
+                serde_json::json!({"run": {"lead": {"issue": 86}}}),
+            ),
+            (
+                ThreadKind::Run(child.clone()),
+                serde_json::json!({"run": {"child": {"lead": thread().to_string(), "step": "implement"}}}),
+            ),
+        ] {
+            let value = serde_json::to_value(&kind).unwrap();
+            assert_eq!(value, json);
+            let back: ThreadKind = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(back, kind, "{json}");
+        }
+        // A row carrying one, through a whole frame.
+        let row = ThreadInfo {
+            kind: ThreadKind::Run(lead),
+            workspace: Some("w".into()),
+            ..info()
+        };
+        let frame = Frame::response(1, Response::Thread { thread: row });
+        let line = encode(&frame);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["response"]["thread"]["kind"]["run"]["lead"]["issue"], 86);
+        assert_eq!(v["response"]["thread"]["workspace"], "w");
+        assert_eq!(decode(&line).unwrap(), frame, "{line}");
     }
 
     #[test]
@@ -666,6 +1538,7 @@ mod tests {
             Response::Opened {
                 state: ThreadState::Idle,
                 events: vec![],
+                run: None,
                 mode: "auto".into(),
                 profile: Some("flash".into()),
                 model: "deepseek-v4.1-flash".into(),
@@ -684,11 +1557,13 @@ mod tests {
                 profile,
                 model,
                 effort,
+                run,
                 ..
             }) => {
                 assert!(profile.is_none());
                 assert_eq!(model, "unknown", "a daemon that sends no model");
                 assert!(effort.is_none());
+                assert!(run.is_none(), "a daemon that sends no run");
             }
             other => panic!("wrong body: {other:?}"),
         }
@@ -698,6 +1573,7 @@ mod tests {
             Response::Opened {
                 state: ThreadState::Idle,
                 events: vec![],
+                run: None,
                 mode: "auto".into(),
                 profile: None,
                 model: "unknown".into(),
@@ -756,9 +1632,124 @@ mod tests {
     fn an_unknown_kind_fails_naming_the_protocol() {
         let err = decode(r#"{"id":1,"request":{"kind":"teleport","thread":"x"}}"#).unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("protocol 1"), "{text}");
+        // The message names the version this side speaks, so the literal
+        // follows the constant rather than the bump.
+        assert!(
+            text.contains(&format!("protocol {PROTOCOL_VERSION}")),
+            "{text}"
+        );
         assert!(text.contains("teleport"), "{text}");
         assert!(decode("not json").is_err());
         assert!(decode("").is_err());
+    }
+
+    /// The run-status notice round-trips, its four phase shapes are
+    /// tagged `step`/`gate`/`move`/`stopped`, and a frame with an unknown tag fails
+    /// to decode whole rather than as one skipped frame — which is why the
+    /// version had to move.
+    #[test]
+    fn the_run_status_notice_round_trips_and_an_unknown_kind_does_not_decode() {
+        let thread = thread();
+        let step = Frame::notice(Notice::RunStatus {
+            thread,
+            status: RunStatus {
+                issue: 139,
+                phase: RunPhase::Step {
+                    step: "spec".into(),
+                    attempt: 1,
+                    elapsed_secs: 192,
+                    calls: 72,
+                    cost_usd: 0.51,
+                    checklist: Some(RunChecklist {
+                        done: 2,
+                        total: 6,
+                        active: Some("Map the code".into()),
+                    }),
+                },
+                idle_secs: 12,
+            },
+        });
+        let line = encode(&step);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["notice"]["kind"], "run_status");
+        assert_eq!(v["notice"]["status"]["phase"]["phase"], "step");
+        assert_eq!(decode(&line).unwrap(), step, "{line}");
+
+        let gate = Frame::notice(Notice::RunStatus {
+            thread,
+            status: RunStatus {
+                issue: 139,
+                phase: RunPhase::Gate {
+                    gate: "decide".into(),
+                },
+                idle_secs: 0,
+            },
+        });
+        let line = encode(&gate);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["notice"]["status"]["phase"]["phase"], "gate");
+        assert_eq!(decode(&line).unwrap(), gate, "{line}");
+
+        let moved = Frame::notice(Notice::RunStatus {
+            thread,
+            status: RunStatus {
+                issue: 139,
+                phase: RunPhase::Move {
+                    what: "following fix".into(),
+                },
+                idle_secs: 0,
+            },
+        });
+        let line = encode(&moved);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["notice"]["status"]["phase"]["phase"], "move");
+        assert_eq!(decode(&line).unwrap(), moved, "{line}");
+
+        let stopped = Frame::notice(Notice::RunStatus {
+            thread,
+            status: RunStatus {
+                issue: 139,
+                phase: RunPhase::Stopped {
+                    reason: "turn: provider_error: HTTP 400".into(),
+                },
+                idle_secs: 0,
+            },
+        });
+        let line = encode(&stopped);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["notice"]["status"]["phase"]["phase"], "stopped");
+        assert_eq!(decode(&line).unwrap(), stopped, "{line}");
+
+        // A frame from a client that knows the kind's name but not its
+        // shape, and one that knows neither: both fail whole.
+        assert!(
+            decode(r#"{"notice":{"kind":"run_status","thread":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":{"issue":1,"phase":{"phase":"teleported"},"idle_secs":0}}}"#).is_err()
+        );
+        assert_eq!(PROTOCOL_VERSION, 9, "the job notice moved it");
+    }
+
+    /// A job's ask reaches the front thread inside one frame that names
+    /// both threads, so a client answers the job's thread, not the front.
+    #[test]
+    fn a_job_notice_carries_the_jobs_own_notice_and_both_threads() {
+        let front = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let job = Ulid::from_string("01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap();
+        let frame = Frame::notice(Notice::Job {
+            thread: front,
+            job,
+            number: 2,
+            notice: Box::new(Notice::State {
+                thread: job,
+                state: ThreadState::Idle,
+            }),
+        });
+        let line = encode(&frame);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["notice"]["kind"], "job");
+        assert_eq!(v["notice"]["thread"], front.to_string());
+        assert_eq!(v["notice"]["job"], job.to_string());
+        assert_eq!(v["notice"]["number"], 2);
+        assert_eq!(v["notice"]["notice"]["kind"], "state");
+        assert_eq!(decode(&line).unwrap(), frame, "{line}");
     }
 }

@@ -7,7 +7,9 @@
 mod roles;
 mod rules;
 mod shell;
+mod step;
 
+use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
 
 use aigentic_core::{RiskClass, ToolCall};
@@ -15,10 +17,13 @@ use serde::{Deserialize, Serialize};
 
 pub use roles::{Participants, Role, needs};
 pub use rules::{
-    Decision, MEMORY_PREFIX, MEMORY_REASON, Riskiest, Rule, default_bash_allow, default_rules,
-    prefix_of, riskiest_segment,
+    Decision, MEMORY_HOME_RULE, MEMORY_PREFIX, MEMORY_REASON, Riskiest, Rule, default_bash_allow,
+    default_rules, prefix_of, riskiest_segment,
 };
-pub use shell::main_segment;
+pub use shell::{
+    Kind, ScanSegment, WriteTarget, main_segment, scan, write_targets, write_targets_from,
+};
+pub use step::{DenyParseError, StepOverlay};
 
 /// What policy says about one call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,13 +32,57 @@ pub enum Outcome {
     Allow { rule: String },
     /// Append `permission_requested` and ask the approver.
     Ask { reason: String },
+    /// The same, for a file tool reaching outside the boundary: [`Ask`]
+    /// carrying `boundary: true`, the reason, and the canonical path it
+    /// would reach. The runtime tells the two apart: a mode never waves
+    /// this one through, a step refuses it, and a session grant covers
+    /// only this path's own directory (issue #124). `path` is `None` for
+    /// a relative path with no directory to resolve it against: nothing
+    /// can be proven inside, so it asks and no grant answers it.
+    ///
+    /// [`Ask`]: Outcome::Ask
+    AskBoundary {
+        reason: String,
+        path: Option<PathBuf>,
+    },
     /// Refuse with an error tool result naming `rule` and, when the rule
     /// has one, its `reason`.
     Deny { rule: String, reason: String },
 }
 
+/// The file boundary (issue #124): the directories a file tool reaches
+/// without asking a person. Every root is canonical, so a symlink in a
+/// path is judged by where it lands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Boundary {
+    pub roots: Vec<PathBuf>,
+}
+
+impl Boundary {
+    /// Whether canonical `path` is a root or below one. Compared by
+    /// component, so `/tmp/x` is not inside `/tmp/xyz`.
+    pub fn is_inside(&self, path: &Path) -> bool {
+        self.roots.iter().any(|r| is_root_or_below(path, r))
+    }
+}
+
+/// Whether canonical `path` is `root` or below it. Compared by component,
+/// so `/tmp/x` is not inside `/tmp/xyz`.
+fn is_root_or_below(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
+}
+
+/// The file tools the boundary checks. `bash` and the MCP tools that take
+/// a path are not confined: they reach the whole disk until the sandbox
+/// (`docs/PLAN-phase3.md` section 15 item 6).
+pub const FILE_TOOLS: [&str; 5] = ["read_file", "write_file", "edit_file", "list_dir", "grep"];
+
 /// The rule set and bash allow patterns. `rules` is evaluated first match
-/// wins; a call matching no rule asks.
+/// wins; a call matching no rule asks. A rule is **narrower than the
+/// boundary, never wider** (issue #124): it can only decide a call inside
+/// a boundary root, because a rule that would allow an outside path never
+/// sees one — `Policy::decide` returns `AskBoundary` before reading the
+/// table. `[policy] allow_paths` is the one way to add a root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
     pub rules: Vec<Rule>,
@@ -54,6 +103,15 @@ pub struct Policy {
     pub allowed_prefixes: Vec<String>,
     #[serde(skip)]
     pub rules_file: Option<PathBuf>,
+    /// The file boundary (issue #124). Empty, nothing is inside, so every
+    /// checked call asks.
+    #[serde(skip)]
+    pub boundary: Boundary,
+    /// The person's and each workspace's memory folder, canonical: the
+    /// model may not write under one, whatever the rules say. Empty, no
+    /// home refuses anything.
+    #[serde(skip)]
+    pub memory_homes: Vec<PathBuf>,
 }
 
 impl Default for Policy {
@@ -72,6 +130,8 @@ impl Policy {
             cwd: None,
             allowed_prefixes: Vec::new(),
             rules_file: None,
+            boundary: Boundary::default(),
+            memory_homes: Vec::new(),
         }
     }
 
@@ -104,19 +164,173 @@ impl Policy {
         }
     }
 
-    /// Where `path_prefix` rules are anchored and relative paths resolve.
+    /// Where `path_prefix` rules are anchored, relative paths resolve,
+    /// and the first boundary root. Call it before
+    /// [`with_boundary_roots`](Self::with_boundary_roots), which appends.
     pub fn with_root(mut self, root: &Path, cwd: &Path) -> Self {
         self.root = Some(root.to_path_buf());
         self.cwd = Some(cwd.to_path_buf());
+        self.boundary = Boundary {
+            roots: vec![canonicalise(root)],
+        };
         self
+    }
+
+    /// The rest of the file boundary (issue #124): the temp directory, the
+    /// skill folders, `[policy] allow_paths`. Every root is canonicalised
+    /// here, so a caller may hand over a path that does not exist yet or
+    /// that leads through a symlink.
+    pub fn with_boundary_roots(mut self, roots: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.boundary
+            .roots
+            .extend(roots.into_iter().map(|r| canonicalise(&r)));
+        self
+    }
+
+    /// The boundary's roots, canonical, in the order they were set.
+    pub fn boundary_roots(&self) -> &[PathBuf] {
+        &self.boundary.roots
+    }
+
+    /// The memory folders the model may not write under: the person's and
+    /// each workspace's. Every home is canonicalised here, and appends,
+    /// like [`with_boundary_roots`](Self::with_boundary_roots), so a
+    /// later call can only refuse more. A home already held is not added
+    /// twice, so the daemon's policy and a thread's runtime, each of
+    /// which names the homes it can see, end with the same list.
+    pub fn with_memory_homes(mut self, homes: impl IntoIterator<Item = PathBuf>) -> Self {
+        for home in homes {
+            let home = canonicalise(&home);
+            if !self.memory_homes.contains(&home) {
+                self.memory_homes.push(home);
+            }
+        }
+        self
+    }
+
+    /// The memory homes, canonical, in the order they were set.
+    pub fn memory_homes(&self) -> &[PathBuf] {
+        &self.memory_homes
+    }
+
+    /// The memory home a call would write under, canonical, or `None`
+    /// when it writes under none of them. A read is never a hit: only
+    /// `write_file`, `edit_file` and the files a `bash` command line
+    /// writes are read.
+    fn memory_home_target(&self, call: &ToolCall, cwd: Option<&Path>) -> Option<PathBuf> {
+        if self.memory_homes.is_empty() {
+            return None;
+        }
+        match call.name.as_str() {
+            "write_file" | "edit_file" => {
+                let path = match self.boundary_target(call, cwd) {
+                    Some(Ok(path)) => path,
+                    // An unchecked or unresolvable call reaches no home.
+                    _ => return None,
+                };
+                self.home_holding(&path)
+            }
+            "bash" => self.bash_home_target(call, cwd),
+            _ => None,
+        }
+    }
+
+    /// The home a `bash` command line writes under, or `None` when it
+    /// writes under none of them. Every write target
+    /// [`shell::write_targets_from`] finds is resolved the way the command
+    /// line itself would — a leading `~` is `$HOME`, a relative word is the
+    /// directory in effect where it appears, `cd` words included — and the
+    /// first home held by a target in that order answers.
+    fn bash_home_target(&self, call: &ToolCall, cwd: Option<&Path>) -> Option<PathBuf> {
+        let command = call.args.get("command")?.as_str()?;
+        for target in shell::write_targets_from(command, cwd.or(self.cwd.as_deref())) {
+            for resolved in self.readings(&target) {
+                if let Some(home) = self.home_holding(&resolved) {
+                    return Some(home);
+                }
+            }
+        }
+        None
+    }
+
+    /// What one write target can name, each canonical: the word the lexer
+    /// read, and, past its leading `~`, the path that expands to. The
+    /// lexer has already dropped a variable's own text, so `$VAR/…` is
+    /// never expanded to a value — a target the shell would resolve at
+    /// run time stays a word no home can be proven to hold. A relative
+    /// word resolves against the directory in effect where it appears,
+    /// and one with no directory to resolve it against answers with
+    /// nothing, since there is nothing to prove.
+    fn readings(&self, target: &WriteTarget) -> Vec<PathBuf> {
+        let mut words = vec![PathBuf::from(&target.word)];
+        if let Some(expanded) = expand_home(&target.word) {
+            words.push(expanded);
+        }
+        words
+            .iter()
+            .filter_map(|word| {
+                if word.is_absolute() {
+                    Some(canonicalise(word))
+                } else {
+                    target
+                        .cwd
+                        .as_deref()
+                        .map(|cwd| canonicalise(&cwd.join(word)))
+                }
+            })
+            .collect()
+    }
+
+    /// The first configured home holding `path`, compared by component
+    /// as [`Boundary::is_inside`], so `…/memory-notes.md` is not one.
+    fn home_holding(&self, path: &Path) -> Option<PathBuf> {
+        self.memory_homes
+            .iter()
+            .find(|home| is_root_or_below(path, home.as_path()))
+            .cloned()
+    }
+
+    /// The path a checked call will reach, canonical, or `None` when the
+    /// boundary does not check it: a tool outside [`FILE_TOOLS`], or a
+    /// `read_file`/`write_file`/`edit_file` call with no `path` (the tool
+    /// rejects that before touching disk). `Err` carries the path as
+    /// given when a relative one has no directory to resolve against:
+    /// nothing can be proven inside, so it is treated as outside.
+    fn boundary_target(
+        &self,
+        call: &ToolCall,
+        cwd: Option<&Path>,
+    ) -> Option<Result<PathBuf, String>> {
+        if !FILE_TOOLS.contains(&call.name.as_str()) {
+            return None;
+        }
+        let raw = match call.args.get("path").and_then(|p| p.as_str()) {
+            Some(raw) => raw,
+            // `list_dir` and `grep` take the working directory with no
+            // `path` at all; the other three have no call left to check.
+            None if call.name == "list_dir" || call.name == "grep" => ".",
+            None => return None,
+        };
+        if Path::new(raw).is_absolute() {
+            return Some(Ok(canonicalise(Path::new(raw))));
+        }
+        match cwd.or(self.cwd.as_deref()) {
+            Some(cwd) => Some(Ok(canonicalise(&cwd.join(raw)))),
+            // No directory to resolve it against: fail closed rather
+            // than judge a relative path against the process's own.
+            None => Some(Err(raw.to_owned())),
+        }
     }
 
     /// The call's `path` argument relative to the project root with `/`
     /// separators, or `None` when there is no such argument or the path
     /// lies outside the root. Lexical only: nothing is touched on disk.
-    pub fn project_path(&self, call: &ToolCall) -> Option<String> {
+    /// `cwd` is the runtime's live working directory, so a rule still
+    /// matches after a `cd` inside the project; `None` falls back to the
+    /// one this policy was built with.
+    pub fn project_path(&self, call: &ToolCall, cwd: Option<&Path>) -> Option<String> {
         let raw = call.args.get("path")?.as_str()?;
-        let (Some(root), Some(cwd)) = (&self.root, &self.cwd) else {
+        let (Some(root), Some(cwd)) = (&self.root, cwd.or(self.cwd.as_deref())) else {
             return Some(raw.replace('\\', "/"));
         };
         let joined = if Path::new(raw).is_absolute() {
@@ -150,7 +364,37 @@ impl Policy {
 
     /// First matching rule wins. No rule matching is `Ask`, so a class
     /// added later can never run silently.
-    pub fn decide(&self, call: &ToolCall, class: RiskClass) -> Outcome {
+    ///
+    /// A write under a memory home is `Deny` before anything else: the
+    /// person's and each workspace's folder are the harness's own, and no
+    /// rule, mode or grant may allow one.
+    ///
+    /// A file tool reaching outside the boundary is `AskBoundary` before
+    /// any rule is read (issue #124): no rule, no mode and no session
+    /// grant may allow an outside path without a person, and the runtime
+    /// refuses one in a step. `cwd` is the runtime's live working
+    /// directory.
+    pub fn decide(&self, call: &ToolCall, class: RiskClass, cwd: Option<&Path>) -> Outcome {
+        if let Some(path) = self.memory_home_target(call, cwd) {
+            return Outcome::Deny {
+                rule: MEMORY_HOME_RULE.to_owned(),
+                reason: format!("{MEMORY_REASON}: {}", path.display()),
+            };
+        }
+        if let Some(target) = self.boundary_target(call, cwd) {
+            let outside = match target {
+                Ok(path) if self.boundary.is_inside(&path) => None,
+                Ok(path) => Some((path.display().to_string(), Some(path))),
+                // As given: there is nothing canonical to show.
+                Err(raw) => Some((raw, None)),
+            };
+            if let Some((shown, path)) = outside {
+                return Outcome::AskBoundary {
+                    reason: format!("outside this project: {shown}"),
+                    path,
+                };
+            }
+        }
         for rule in &self.rules {
             if !rule.tool_matches(&call.name) {
                 continue;
@@ -159,7 +403,7 @@ impl Policy {
                 continue;
             }
             if let Some(prefix) = &rule.path_prefix {
-                let Some(path) = self.project_path(call) else {
+                let Some(path) = self.project_path(call, cwd) else {
                     continue;
                 };
                 let prefix = prefix.trim_start_matches("./");
@@ -236,6 +480,132 @@ fn normalise(path: &Path) -> PathBuf {
     out
 }
 
+/// `~` and `~/…` as the process's home, the way `[policy] allow_paths`
+/// reads them. Another `~name` names a user, and an unset `HOME` names
+/// nothing: both answer `None`, so the word stands as written.
+fn expand_home(word: &str) -> Option<PathBuf> {
+    let rest = word.strip_prefix('~')?;
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return None;
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(rest.trim_start_matches('/')))
+}
+
+/// How many symlink hops a hand resolution follows before giving up,
+/// the kernel's own limit.
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// A path no boundary root contains. Resolution answers with it when it
+/// cannot say where a path lands — a symlink chain past
+/// [`MAX_SYMLINK_HOPS`], or a loop — so the call asks instead of being
+/// judged inside.
+fn unresolvable() -> PathBuf {
+    PathBuf::from("/")
+}
+
+/// The canonical form of `path`, for the boundary's containment checks:
+/// symlinks resolved, so a link out of the project is judged by where it
+/// lands, and a path that does not exist yet answers with its nearest
+/// real ancestor plus the rest. `link/..` is the *link's* own parent
+/// directory, as the kernel reads it, because the whole path is
+/// canonicalised in one call when it exists.
+///
+/// Only the part below the deepest prefix that exists is walked. A
+/// component `canonicalize()` cannot follow — a symlink whose target
+/// does not exist — is read by [`std::fs::read_link`] and its target
+/// spliced in, so a dangling link is judged by where it points. Past
+/// [`MAX_SYMLINK_HOPS`] hops, or on a loop, the answer is
+/// [`unresolvable`].
+pub fn canonicalise(path: &Path) -> PathBuf {
+    // Each component as its own one-step path, so a symlink target read
+    // later can be spliced in front of what is still to come.
+    let mut pending: VecDeque<PathBuf> = path
+        .components()
+        .map(|c| PathBuf::from(c.as_os_str()))
+        .collect();
+    // The deepest prefix that exists, canonicalised in one call; the
+    // components below it are what the walk has left to do.
+    let mut below: Vec<PathBuf> = Vec::new();
+    let mut out = loop {
+        let candidate: PathBuf = pending.iter().collect();
+        if let Ok(real) = candidate.canonicalize() {
+            break real;
+        }
+        match pending.pop_back() {
+            Some(component) => below.push(component),
+            None => break PathBuf::new(),
+        }
+    };
+    let mut pending: VecDeque<PathBuf> = below.into_iter().rev().collect();
+
+    // `true` while the prefix does not exist: nothing under a missing
+    // directory can exist either, so the walk stops asking the disk —
+    // until a `..` climbs back to a directory that does.
+    let mut missing = false;
+    let mut hops = 0usize;
+    while let Some(step) = pending.pop_front() {
+        match step.components().next() {
+            Some(Component::Prefix(prefix)) => {
+                out.push(prefix.as_os_str());
+                missing = false;
+            }
+            Some(Component::RootDir) => {
+                out.push(Component::RootDir.as_os_str());
+                missing = false;
+            }
+            // `.` is the prefix itself.
+            Some(Component::CurDir) => continue,
+            // `..` names the parent of whatever the prefix is *called*,
+            // whether or not it exists, as the kernel reads it.
+            Some(Component::ParentDir) => {
+                out.pop();
+                missing = false;
+                continue;
+            }
+            Some(Component::Normal(name)) => out.push(name),
+            None => continue,
+        }
+        if missing {
+            continue;
+        }
+        if let Ok(real) = out.canonicalize() {
+            out = real;
+            continue;
+        }
+        let symlink = out
+            .symlink_metadata()
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if !symlink {
+            missing = true;
+            continue;
+        }
+        hops += 1;
+        if hops > MAX_SYMLINK_HOPS {
+            return unresolvable();
+        }
+        let Ok(target) = std::fs::read_link(&out) else {
+            return unresolvable();
+        };
+        // The link's own name is gone; a relative target resolves
+        // against the link's parent, an absolute one from the root.
+        out.pop();
+        if target.is_absolute() {
+            out = PathBuf::new();
+        }
+        let target: Vec<PathBuf> = target
+            .components()
+            .map(|c| PathBuf::from(c.as_os_str()))
+            .collect();
+        for step in target.into_iter().rev() {
+            pending.push_front(step);
+        }
+        missing = false;
+    }
+    out
+}
+
 /// `command`'s leading words equal `pattern`'s words, and the rest of
 /// the line is read-only by the same rules: the matcher that backs
 /// the allow rule, which classifies a command line one segment at a
@@ -269,33 +639,33 @@ mod tests {
     fn the_default_table() {
         let p = Policy::defaults();
         assert_eq!(
-            p.decide(&call("pin", json!({})), RiskClass::Safe),
+            p.decide(&call("pin", json!({})), RiskClass::Safe, None),
             allow("class safe")
         );
         assert_eq!(
-            p.decide(&call("read_file", json!({})), RiskClass::Read),
+            p.decide(&call("read_file", json!({})), RiskClass::Read, None),
             allow("class read")
         );
         assert_eq!(
-            p.decide(&bash("cargo test -p x"), RiskClass::Exec),
+            p.decide(&bash("cargo test -p x"), RiskClass::Exec, None),
             allow("bash allow-pattern cargo test")
         );
         assert!(matches!(
-            p.decide(&bash("rm -rf target"), RiskClass::Exec),
+            p.decide(&bash("rm -rf target"), RiskClass::Exec, None),
             Outcome::Ask { reason } if reason == "class exec: anything else in a shell"
         ));
         assert!(matches!(
-            p.decide(&call("write_file", json!({})), RiskClass::Write),
+            p.decide(&call("write_file", json!({})), RiskClass::Write, None),
             Outcome::Ask { reason } if reason.starts_with("class write")
         ));
         assert!(matches!(
-            p.decide(&call("mcp.docs.search", json!({})), RiskClass::Network),
+            p.decide(&call("mcp.docs.search", json!({})), RiskClass::Network, None),
             Outcome::Ask { reason } if reason.starts_with("class network")
         ));
         // An MCP tool a human downgraded to read still allows: class rules
         // come first. Only an unknown class reaches the `mcp.*` row.
         assert_eq!(
-            p.decide(&call("mcp.docs.search", json!({})), RiskClass::Read),
+            p.decide(&call("mcp.docs.search", json!({})), RiskClass::Read, None),
             allow("class read")
         );
     }
@@ -311,7 +681,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            p.decide(&call("write_file", json!({})), RiskClass::Write),
+            p.decide(&call("write_file", json!({})), RiskClass::Write, None),
             allow("class write")
         );
         let p = Policy::configured(
@@ -319,7 +689,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            p.decide(&bash("cargo test"), RiskClass::Exec),
+            p.decide(&bash("cargo test"), RiskClass::Exec, None),
             Outcome::Deny {
                 rule: "tool bash".into(),
                 reason: "no shell here".into()
@@ -331,7 +701,11 @@ mod tests {
             None,
         );
         assert_eq!(
-            p.decide(&call("mcp.docs.search", json!({})), RiskClass::Network),
+            p.decide(
+                &call("mcp.docs.search", json!({})),
+                RiskClass::Network,
+                None
+            ),
             allow("tool mcp.docs.*")
         );
     }
@@ -341,13 +715,13 @@ mod tests {
         let p = Policy::defaults();
         for pattern in default_bash_allow() {
             assert_eq!(
-                p.decide(&bash(&pattern), RiskClass::Exec),
+                p.decide(&bash(&pattern), RiskClass::Exec, None),
                 allow(&format!("bash allow-pattern {pattern}")),
                 "{pattern}"
             );
             let with_flag = format!("{pattern} --flag");
             assert_eq!(
-                p.decide(&bash(&with_flag), RiskClass::Exec),
+                p.decide(&bash(&with_flag), RiskClass::Exec, None),
                 allow(&format!("bash allow-pattern {pattern}")),
                 "{with_flag}"
             );
@@ -357,7 +731,59 @@ mod tests {
         // (#15).
         assert!(command_matches("cat some/path", "cat"));
         assert!(command_matches("grep -n x some/path", "grep"));
+        assert!(command_matches(
+            "git rev-list --count 3e99082..HEAD",
+            "git rev-list"
+        ));
         assert!(!command_matches("git branch some/path", "git branch"));
+        assert!(command_matches(
+            "git grep -n verdict -- crates/",
+            "git grep"
+        ));
+        assert!(!command_matches("git grep -O vim verdict", "git grep"));
+        assert!(!command_matches(
+            "git grep --open-files-in-pager=vim verdict",
+            "git grep"
+        ));
+        assert!(!command_matches(
+            "git grep --textconv -n verdict",
+            "git grep"
+        ));
+        assert!(default_bash_allow().contains(&"git reflog".to_owned()));
+        assert!(command_matches("git reflog -8", "git reflog"));
+        assert!(command_matches("git reflog show HEAD", "git reflog"));
+        assert!(command_matches("git reflog --all", "git reflog"));
+        assert!(!command_matches(
+            "git reflog expire --expire=now --all",
+            "git reflog"
+        ));
+        assert!(!command_matches("git reflog delete HEAD@{1}", "git reflog"));
+        assert!(!command_matches("git reflog drop HEAD@{1}", "git reflog"));
+        assert!(matches!(
+            Policy::defaults().decide(
+                &bash("git reflog expire --expire=now --all"),
+                RiskClass::Exec,
+                None
+            ),
+            Outcome::Ask { .. }
+        ));
+    }
+
+    /// The public matcher, the one that backs the allow rule and the
+    /// `/allow` menu, reports the row the line matched and only that row.
+    /// A row written with a global option still matches its own line as
+    /// written.
+    #[test]
+    fn a_git_allow_row_matches_past_a_harmless_global_option() {
+        assert!(command_matches("git --no-pager log -5", "git log"));
+        assert!(command_matches("git -P diff", "git diff"));
+        assert!(command_matches("git --no-pager reflog -8", "git reflog"));
+        assert!(!command_matches(
+            "git --no-pager branch -D topic",
+            "git branch"
+        ));
+        assert!(!command_matches("git -c core.pager=sh log -5", "git log"));
+        assert!(command_matches("git --no-pager log -5", "git --no-pager"));
     }
 
     #[test]
@@ -389,7 +815,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    p.decide(&bash(command), RiskClass::Exec),
+                    p.decide(&bash(command), RiskClass::Exec, None),
                     Outcome::Ask { .. }
                 ),
                 "{command:?}"
@@ -401,11 +827,11 @@ mod tests {
     fn configured_bash_allow_replaces_the_defaults() {
         let p = Policy::configured(vec![], Some(vec!["pnpm test".into()]));
         assert_eq!(
-            p.decide(&bash("pnpm test --watch=false"), RiskClass::Exec),
+            p.decide(&bash("pnpm test --watch=false"), RiskClass::Exec, None),
             allow("bash allow-pattern pnpm test")
         );
         assert!(matches!(
-            p.decide(&bash("cargo test"), RiskClass::Exec),
+            p.decide(&bash("cargo test"), RiskClass::Exec, None),
             Outcome::Ask { .. }
         ));
     }
@@ -414,7 +840,7 @@ mod tests {
     fn a_bash_call_without_a_command_falls_through_to_exec() {
         let p = Policy::defaults();
         assert!(matches!(
-            p.decide(&call("bash", json!({})), RiskClass::Exec),
+            p.decide(&call("bash", json!({})), RiskClass::Exec, None),
             Outcome::Ask { reason } if reason.starts_with("class exec")
         ));
     }
@@ -428,9 +854,11 @@ mod tests {
             rules_file: None,
             root: None,
             cwd: None,
+            boundary: crate::Boundary::default(),
+            memory_homes: vec![],
         };
         assert!(matches!(
-            p.decide(&call("x", json!({})), RiskClass::Safe),
+            p.decide(&call("x", json!({})), RiskClass::Safe, None),
             Outcome::Ask { reason } if reason == "no rule matches x (class safe)"
         ));
     }
@@ -471,7 +899,7 @@ mod tests {
                 "../../.aigentic/./memory/x.md",
             ] {
                 assert_eq!(
-                    p.decide(&call(tool, json!({"path": path})), RiskClass::Write),
+                    p.decide(&call(tool, json!({"path": path})), RiskClass::Write, None),
                     Outcome::Deny {
                         rule: format!("tool {tool} path .aigentic/memory/"),
                         reason: MEMORY_REASON.into()
@@ -482,17 +910,33 @@ mod tests {
             for path in [
                 "/repo/.aigentic/knowledge/x.md",
                 "../../docs/memory.md",
-                "/elsewhere/.aigentic/memory/facts.md",
                 "../../.aigentic/memory-notes.md",
             ] {
                 assert!(
                     matches!(
-                        p.decide(&call(tool, json!({"path": path})), RiskClass::Write),
+                        p.decide(&call(tool, json!({"path": path})), RiskClass::Write, None),
                         Outcome::Ask { .. }
                     ),
                     "{tool} {path}"
                 );
             }
+            // A path outside the root is the boundary's before the memory
+            // deny's (issue #124): the deny only ever spoke about the
+            // project's own `.aigentic/memory/`.
+            assert!(
+                matches!(
+                    p.decide(
+                        &call(
+                            tool,
+                            json!({"path": "/elsewhere/.aigentic/memory/facts.md"})
+                        ),
+                        RiskClass::Write,
+                        None
+                    ),
+                    Outcome::AskBoundary { .. }
+                ),
+                "{tool} outside"
+            );
         }
         assert!(matches!(
             p.decide(
@@ -500,28 +944,37 @@ mod tests {
                     "read_file",
                     json!({"path": "/repo/.aigentic/memory/facts.md"})
                 ),
-                RiskClass::Read
+                RiskClass::Read,
+                None
             ),
             Outcome::Allow { .. }
         ));
-        // Without a root the argument is compared as given.
+        // Without a root nothing is inside the boundary, so even a
+        // relative path asks before any rule is read (issue #124): a
+        // mis-built runtime must not be unconfined, and the memory deny is
+        // not consulted. With no directory either, the relative path
+        // still asks: nothing can be proven inside.
         let bare = Policy::defaults();
-        assert!(matches!(
-            bare.decide(
-                &call("write_file", json!({"path": ".aigentic/memory/facts.md"})),
-                RiskClass::Write
-            ),
-            Outcome::Deny { .. }
-        ));
+        for cwd in [Some(Path::new("/repo")), None] {
+            assert!(matches!(
+                bare.decide(
+                    &call("write_file", json!({"path": ".aigentic/memory/facts.md"})),
+                    RiskClass::Write,
+                    cwd
+                ),
+                Outcome::AskBoundary { .. }
+            ));
+        }
         assert!(matches!(
             bare.decide(
                 &call(
                     "write_file",
                     json!({"path": "/x/.aigentic/memory/facts.md"})
                 ),
-                RiskClass::Write
+                RiskClass::Write,
+                None
             ),
-            Outcome::Ask { .. }
+            Outcome::AskBoundary { .. }
         ));
         let rule: Rule = toml::from_str(
             "tool = \"write_file\"\npath_prefix = \"secrets/\"\ndecision = \"deny\"\n",

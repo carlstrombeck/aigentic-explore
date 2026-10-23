@@ -24,6 +24,7 @@ use aigentic_server::awake::{
     KeepAwake, ProcessGuard, detect_with, group_gone, on_path, on_path_in,
 };
 use aigentic_server::config::Config;
+use aigentic_server::runs::Working;
 use aigentic_server::{Mail, Mailbox, NoReports, ThreadActor};
 use futures_core::Stream;
 use serde_json::json;
@@ -413,8 +414,14 @@ fn rig_with_guard(script: Vec<Option<Vec<ProviderEvent>>>, guard: Arc<dyn KeepAw
         AgentId("worker".into()),
     )
     .with_policy(Policy::defaults());
-    let (actor, mailbox) =
-        ThreadActor::new(runtime, None, Arc::new(NoReports)).expect("the actor builds");
+    let (actor, mailbox) = ThreadActor::new(
+        runtime,
+        None,
+        Arc::new(NoReports),
+        Arc::new(|_: &str| None),
+        Working::default(),
+    )
+    .expect("the actor builds");
     let actor = actor.with_keep_awake(guard);
     tokio::spawn(actor.run());
     Rig {
@@ -540,7 +547,13 @@ impl Rig {
 /// one release, nothing left outstanding.
 #[tokio::test]
 async fn a_turn_that_ends_on_a_provider_error_is_balanced() {
-    let rig = rig(vec![Some(vec![text("half"), failed()])]);
+    // The retry a transient error after content earns (issue #114) fails
+    // too, so the turn still ends on the error; the hold is taken once per
+    // turn, so the retry adds none.
+    let rig = rig(vec![
+        Some(vec![text("half"), failed()]),
+        Some(vec![failed()]),
+    ]);
     let mut notices = rig.subscribe().await;
     rig.post(steve(), "one", false).await;
     rig.until_idle(&mut notices).await;

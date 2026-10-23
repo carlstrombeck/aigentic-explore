@@ -6,91 +6,21 @@
 //! `CreateThread` writes `thread_started` first; idle unload never
 //! while awaiting approval. A scripted provider stands in for the model.
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use aigentic_api::client::{Addr, Client, ClientError};
 use aigentic_api::{Notice, Request, Response, ThreadState};
-use aigentic_runtime::aigentic_core::{
-    Capabilities, CompletionRequest, ContentBlock, EventKind, Message, Provider, ProviderEvent,
-    ToolCall,
-};
+use aigentic_runtime::aigentic_core::{ContentBlock, EventKind, ProviderEvent};
 use aigentic_runtime::aigentic_log::{ThreadLog, ThreadStartedPayload};
-use aigentic_server::build::{BuildError, ProviderFactory};
 use aigentic_server::config::{Config, ProjectConfig, ServerConfig, UserConfig};
 use aigentic_server::{Listener, NoReports, Server};
-use futures_core::Stream;
-use serde_json::json;
 use tokio::sync::mpsc;
 
-/// Every thread gets the same script, in order; `None` pends.
-struct Scripted(Mutex<VecDeque<Option<Vec<ProviderEvent>>>>);
+mod common;
 
-impl Provider for Scripted {
-    fn complete(
-        &self,
-        _: &CompletionRequest<'_>,
-    ) -> Pin<Box<dyn Stream<Item = ProviderEvent> + Send + '_>> {
-        match self.0.lock().unwrap().pop_front().flatten() {
-            Some(events) => Box::pin(futures_util::stream::iter(events)),
-            None => Box::pin(futures_util::stream::pending()),
-        }
-    }
-    fn count_tokens(&self, _: &[Message]) -> u64 {
-        7
-    }
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            supports_tools: true,
-            supports_images: false,
-            supports_caching: false,
-            supports_structured_output: false,
-            max_context_tokens: 1000,
-        }
-    }
-}
-
-/// One script per thread built, in order.
-type Scripts = VecDeque<Vec<Option<Vec<ProviderEvent>>>>;
-
-struct Factory(Arc<Mutex<Scripts>>);
-
-impl ProviderFactory for Factory {
-    fn build(
-        &self,
-        _: &str,
-    ) -> Result<(Box<dyn aigentic_runtime::aigentic_core::Provider>, String), BuildError> {
-        let script = self.0.lock().unwrap().pop_front().unwrap_or_default();
-        Ok((
-            Box::new(Scripted(Mutex::new(script.into()))),
-            "scripted".into(),
-        ))
-    }
-}
-
-fn text(t: &str) -> ProviderEvent {
-    ProviderEvent::TextDelta(t.into())
-}
-fn done() -> ProviderEvent {
-    ProviderEvent::Done {
-        finish_reason: "stop".into(),
-    }
-}
-fn bash(id: &str, command: &str) -> ProviderEvent {
-    ProviderEvent::ToolCall(ToolCall {
-        id: id.into(),
-        name: "bash".into(),
-        args: json!({"command": command}),
-    })
-}
-fn tool_use() -> ProviderEvent {
-    ProviderEvent::Done {
-        finish_reason: "tool_use".into(),
-    }
-}
+use common::{Factory, bash, done, text, tool_use};
 
 struct Daemon {
     socket: PathBuf,
@@ -151,12 +81,13 @@ async fn daemon(scripts: Vec<Vec<Option<Vec<ProviderEvent>>>>, idle_secs: u64) -
                 root: q,
             },
         ],
+        resume_runs: false,
     };
     let server = Arc::new(Server::new(
         config,
         cfg_dir,
         server,
-        Arc::new(Factory(Arc::new(Mutex::new(scripts.into())))),
+        Arc::new(Factory::new(scripts.into())),
         Arc::new(NoReports),
     ));
     let socket = dir.path().join("d.sock");
@@ -183,8 +114,10 @@ impl Daemon {
             .unwrap()
     }
 
-    fn log(&self, project: &str, thread: ulid::Ulid) -> Vec<EventKind> {
-        ThreadLog::open(self.threads_base.join(project), thread)
+    fn log(&self, thread: ulid::Ulid) -> Vec<EventKind> {
+        // Logs live flat in the threads directory since #9: the project
+        // no longer names a subdirectory.
+        ThreadLog::open(self.threads_base.clone(), thread)
             .unwrap()
             .read_all()
             .unwrap()
@@ -267,7 +200,7 @@ async fn roles_are_checked_before_the_log_and_thread_started_comes_first() {
     assert!(matches!(
         reviewer
             .request(Request::ListThreads {
-                project: "p".into()
+                project: Some("p".into())
             })
             .await
             .unwrap(),
@@ -294,8 +227,8 @@ async fn roles_are_checked_before_the_log_and_thread_started_comes_first() {
         panic!("thread")
     };
     assert_eq!(thread.project.as_deref(), Some("p"));
-    assert_eq!(d.log("p", thread.id), vec![EventKind::ThreadStarted]);
-    let events = ThreadLog::open(d.threads_base.join("p"), thread.id)
+    assert_eq!(d.log(thread.id), vec![EventKind::ThreadStarted]);
+    let events = ThreadLog::open(d.threads_base.clone(), thread.id)
         .unwrap()
         .read_all()
         .unwrap();
@@ -313,7 +246,7 @@ async fn roles_are_checked_before_the_log_and_thread_started_comes_first() {
         .await
         .unwrap();
     assert!(matches!(r, Response::Refused { .. }), "{r:?}");
-    assert_eq!(d.log("p", thread.id), vec![EventKind::ThreadStarted]);
+    assert_eq!(d.log(thread.id), vec![EventKind::ThreadStarted]);
     // A write-level action by an approver runs; a decide by a read user
     // is refused before anything is looked at.
     let r = reviewer
@@ -339,7 +272,7 @@ async fn roles_are_checked_before_the_log_and_thread_started_comes_first() {
     assert!(matches!(r, Response::Refused { .. }), "{r:?}");
     let r = magnus
         .request(Request::ListThreads {
-            project: "zzz".into(),
+            project: Some("zzz".into()),
         })
         .await
         .unwrap();
@@ -347,7 +280,7 @@ async fn roles_are_checked_before_the_log_and_thread_started_comes_first() {
     // Listed under its project once created.
     let Response::Threads { threads } = magnus
         .request(Request::ListThreads {
-            project: "p".into(),
+            project: Some("p".into()),
         })
         .await
         .unwrap()
@@ -537,7 +470,7 @@ async fn idle_threads_unload_but_never_while_awaiting_approval() {
         .await
         .unwrap();
     for _ in 0..100 {
-        if d.log("q", thread.id).last() == Some(&EventKind::TurnEnded) {
+        if d.log(thread.id).last() == Some(&EventKind::TurnEnded) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -608,7 +541,7 @@ async fn tcp_on_a_loopback_port_serves_the_same_sessions() {
         .unwrap();
     until_state(&mut notices, |s| *s == ThreadState::Idle).await;
     assert_eq!(
-        d.log("q", thread.id),
+        d.log(thread.id),
         vec![
             EventKind::ThreadStarted,
             EventKind::UserMessage,
@@ -677,10 +610,10 @@ async fn remember_files_a_line_with_no_model_call() {
         .unwrap();
     assert!(matches!(r, Response::Ok), "{r:?}");
     assert_eq!(
-        d.log("p", thread.id),
+        d.log(thread.id),
         vec![EventKind::ThreadStarted, EventKind::MemoryRemembered]
     );
-    let events = ThreadLog::open(d.threads_base.join("p"), thread.id)
+    let events = ThreadLog::open(d.threads_base.clone(), thread.id)
         .unwrap()
         .read_all()
         .unwrap();

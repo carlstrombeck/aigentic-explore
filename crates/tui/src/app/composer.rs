@@ -74,6 +74,20 @@ impl Composer {
         self.lines.join("\n")
     }
 
+    /// The text a submit sends, pastes expanded; `None` when there is
+    /// nothing to send. Clears nothing and writes no history, so a caller
+    /// can ask what Enter would send before it commits.
+    pub fn submit_text(&self) -> Option<String> {
+        let mut text = self.text();
+        if text.trim().is_empty() {
+            return None;
+        }
+        for (placeholder, full) in &self.pastes {
+            text = text.replacen(placeholder, full, 1);
+        }
+        Some(text)
+    }
+
     pub fn lines(&self) -> &[String] {
         &self.lines
     }
@@ -257,14 +271,10 @@ impl Composer {
     /// the composer is empty after. `None` when there is nothing.
     pub fn take(&mut self) -> Option<String> {
         let typed = self.text();
-        if typed.trim().is_empty() {
+        let Some(text) = self.submit_text() else {
             self.clear();
             return None;
-        }
-        let mut text = typed.clone();
-        for (placeholder, full) in self.pastes.drain(..) {
-            text = text.replacen(&placeholder, &full, 1);
-        }
+        };
         if self.history.last() != Some(&typed) {
             self.history.push(typed.clone());
             if let Some(path) = &self.history_path {
