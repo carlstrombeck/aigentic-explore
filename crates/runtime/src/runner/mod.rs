@@ -2087,9 +2087,9 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
         match end.reason.as_str() {
             STEP_REPORTED => Err(RunnerError::Host(format!("child {child} reported nothing"))),
             // `LENGTH_STOP` is a budget-style stop like `max_tokens`: the
-            // step is Partial, not Failed, and nothing escalates (issue
-            // #96). `EMPTY_REPLY` parks as `done` does: the work so far
-            // stands and the step can continue.
+            // step is Partial, not Failed, and nothing escalates.
+            // `EMPTY_REPLY` parks as `done` does: the work so far stands
+            // and the step can continue.
             "done" | "resumed" | LENGTH_STOP | EMPTY_REPLY | MAX_USD | "max_iterations"
             | "max_tokens" | "max_wall_time" => {
                 let finished = finish(StepStatus::Partial, end.reason, None);

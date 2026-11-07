@@ -1449,7 +1449,10 @@ pub const MAX_TOKENS_STOP: &str = "max_tokens";
 pub const EMPTY_REPLY: &str = "empty_reply";
 
 /// What the model reads after its first empty reply of a turn.
-pub const EMPTY_REPLY_NUDGE: &str = "[Your last reply had no text and no tool call, so nothing reached the person. Carry on: call the next tool, or write your answer.]";
+/// It says reasoning is unseen because a model that only reasoned tends
+/// to answer the nudge as if its reasoning had been read, and leaves out
+/// what it worked out there.
+pub const EMPTY_REPLY_NUDGE: &str = "[Your last reply had no text and no tool call. Your reasoning is not shown to anyone, so nothing reached the person. Carry on: call the next tool, or write your whole answer, including anything you worked out only in your reasoning.]";
 
 /// The `turn_ended` reason when the turn's own spend reached
 /// `Budget::max_cost_usd`: the call that crossed the cap ran to its end,

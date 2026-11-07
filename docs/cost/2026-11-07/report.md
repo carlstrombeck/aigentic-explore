@@ -189,7 +189,7 @@ Per ticket, key found (run a, run b):
 Reading:
 
 - **The fix works.** In section 5, Flash lost 2 of 4 reports. Here it lost none of 8, and 5 of those 8 needed the nudge. GLM never needed it.
-- **One Flash report came back as a fragment.** On #200 run b, items 1 to 9 stayed in the reasoning before the nudge, and after it the model wrote only item 10 and a checklist, as if the rest had already been shown. The nudge text should say that reasoning is not shown to anyone, and ask for the whole answer.
+- **One Flash report came back as a fragment.** On #200 run b, items 1 to 9 stayed in the reasoning before the nudge, and after it the model wrote only item 10 and a checklist, as if the rest had already been shown. The nudge now says that reasoning is not shown to anyone and asks for the whole answer, including what was worked out only in the reasoning. That wording has not been rerun.
 - **GLM finds more of the key, at 4 times the cost.** Counting the real extra findings too, Flash reaches 84% of GLM's points (28 against 33.5) for 25% of the price, but it also raises more minor and unreal items for the merger to sift.
 - **The spread is large.** The same model on the same ticket can score 0 one run and 2.5 the next (GLM on #199). Two runs per cell is still a small sample.
 - **Not a reason to switch alone.** Worth testing next: two Flash runs per spec check, their items merged ($0.90), against one GLM run ($1.83). Two Flash runs that miss different things may beat one GLM run on recall, at half the cost.
