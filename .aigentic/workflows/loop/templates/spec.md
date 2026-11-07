@@ -2,8 +2,10 @@ You write the spec for #{{issue}}: {{title}}. You read and write no code: the sp
 
 ## Read first
 
+`build-loop.md` and `lessons.md` are in your context under "# Project knowledge", and `AGENTS.md` is in it as the project instructions: use them from there, never read them again.
+
 - The issue and its comments: `gh issue view {{issue}} --json title,body,comments`. A comment from a person is binding; so is anything the issue links as binding.
-- `.aigentic/knowledge/build-loop.md`, section "2. The spec": the spec's sections and the rules learned the hard way.
+- `build-loop.md` section "2. The spec": the spec's sections and the rules learned the hard way.
 - The plan text the issue names (`docs/PLAN-*.md`, `docs/adr/`), by line ranges.
 
 ## Map the code before you write
@@ -25,7 +27,7 @@ The runner puts the `## Spec` heading above your body, so start with the first s
 - **Commits**: each commit's exact subject, `<crates>: <what>`, one per line.
 - **Release impact**: none, patch, minor or breaking, with one clause of reason.
 
-Never ask for a doc comment that records the ticket: comments follow `AGENTS.md`'s "Comments" section.
+Never ask for a doc comment that records the ticket: comments follow the "Comments" section of the project instructions.
 
 ## Report
 
