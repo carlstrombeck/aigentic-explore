@@ -313,8 +313,17 @@ fn related_in_reach(
             ));
             continue;
         }
+        // The name the daemon lists this root under, not the entry's own
+        // form: a collapsed project (`aigentic` in workspace `aigentic`)
+        // is addressed by that bare name, which no `aigentic/aigentic`
+        // row counts and `root_of` cannot resolve.
+        let name = rows
+            .iter()
+            .find(|r| r.root == *root)
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| format!("{ws}/{project}"));
         added.push(Listed {
-            name: format!("{ws}/{project}"),
+            name,
             root: root.clone(),
             workspace: Some(ws.to_owned()),
             one_line: None,
@@ -506,17 +515,33 @@ impl ThreadTable {
         Ok(built.ctx)
     }
 
+    /// `project` under the name this daemon lists it by: the listed name
+    /// when it, or a leaf only one project answers to, resolves to a
+    /// project; the string as given otherwise. A thread's index entry, a
+    /// listing and the model's block all name a project by this, so a
+    /// request sent as a bare leaf is filed and compared as the listed
+    /// name rather than as itself.
+    fn listed(&self, project: &str) -> String {
+        self.server
+            .project(project)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| project.to_owned())
+    }
+
     /// Remember that the thread is in `project` now. The log's
     /// `project_switched` is the truth; this is the entry, so the next
-    /// open does not rebuild the old project.
+    /// open does not rebuild the old project. The name is the one this
+    /// daemon lists the project by, so a switch sent as a bare leaf shows
+    /// under the project's listed name at once, before any scan.
     pub fn note_project(&self, thread: Ulid, project: &str) {
+        let project = self.listed(project);
         if let Some(e) = self
             .entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get_mut(&thread)
         {
-            e.project = project.to_owned();
+            e.project = project.clone();
         }
         // The index too, so a listing and the next open see the switch
         // without rereading the log (issue #9).
@@ -526,21 +551,21 @@ impl ThreadTable {
             .unwrap_or_else(|e| e.into_inner())
             .get_mut(&thread)
         {
-            i.switched = Some(project.to_owned());
+            i.switched = Some(project.clone());
             // Where the daemon has that project now (issue #88): the
             // switch's root is this daemon's, not the one an older log
             // line recorded. A name this daemon cannot resolve leaves
             // the field as the log had it.
-            i.switched_root = self.root_of(project).ok().map(|r| r.root);
+            i.switched_root = self.root_of(&project).ok().map(|r| r.root);
         }
     }
 
-    /// The project a live `suggest_project` proposal names, when one
-    /// waits on `call_id` (issue #7): what a `yes` needs before it can
-    /// build the target's context and check the role there. `None` when
-    /// nothing is pending — the turn has moved on, or another client
-    /// answered first.
-    pub async fn waiting_switch(&self, thread: Ulid, call_id: &str) -> Option<String> {
+    /// The project a live proposal names when one waits on `call_id`,
+    /// and whether it is a `start_job` proposal: what a `yes` needs to
+    /// check the role there and, for a switch, build the target's
+    /// context. `None` when nothing is pending — the turn has moved on, or
+    /// another client answered first.
+    pub async fn waiting_switch(&self, thread: Ulid, call_id: &str) -> Option<(String, bool)> {
         let mailbox = self.mailbox(thread)?;
         let (reply, rx) = oneshot::channel();
         mailbox.send(Mail::Status { reply }).ok()?;
@@ -548,8 +573,9 @@ impl ThreadTable {
             ThreadState::AwaitingSwitch {
                 call_id: waiting,
                 project,
+                job,
                 ..
-            } if waiting == call_id => Some(project),
+            } if waiting == call_id => Some((project, job.is_some())),
             _ => None,
         }
     }
@@ -864,12 +890,13 @@ impl ThreadTable {
         Ok(file.participants)
     }
 
-    /// Which project a thread belongs to (issue #9). The entry while it
-    /// is open; otherwise what its log says: its last switch if this
-    /// daemon knows that project — the one `open` would build in — else
-    /// its home. `None` for a log with no project: a pre-phase-4 one, or
-    /// a `_none` thread whose name another project holds at a different
-    /// root.
+    /// Which project a thread belongs to, always under the name this
+    /// daemon lists it by. The entry while it is open;
+    /// otherwise what its log says: its last switch if this daemon knows
+    /// that project — the one `open` would build in — else the project
+    /// that switch's root is now listed as, else its home. `None` for a
+    /// log with no project: a pre-phase-4 one, or a `_none` thread whose
+    /// name another project holds at a different root.
     pub fn project_of(&self, thread: Ulid) -> Option<String> {
         if let Some(e) = self
             .entries
@@ -882,7 +909,18 @@ impl ThreadTable {
         let indexed = self.lookup(thread)?;
         indexed
             .switched
-            .filter(|name| self.server.project(name).is_some())
+            .as_deref()
+            .and_then(|name| self.server.project(name))
+            .map(|p| p.name.clone())
+            .or_else(|| {
+                let root = indexed.switched_root.as_deref()?;
+                let p = self
+                    .server
+                    .projects
+                    .iter()
+                    .find(|p| same_root(&p.root, root))?;
+                Some(p.name.clone())
+            })
             .or(indexed.home)
     }
 
@@ -952,7 +990,10 @@ impl ThreadTable {
             Some(project) => {
                 // The project has to be one this daemon knows, as before.
                 self.root_of(project)?;
-                ids.retain(|id| self.project_of(*id).as_deref() == Some(project));
+                // By the resolved name, not the asked one: a unique leaf
+                // lists the project's threads too.
+                let listed = self.listed(project);
+                ids.retain(|id| self.project_of(*id).as_deref() == Some(listed.as_str()));
                 ids.sort_unstable_by(|a, b| b.cmp(a));
                 // Which threads have an actor, read under the lock and
                 // dropped before any log is read.
@@ -1131,6 +1172,10 @@ impl ThreadTable {
         front: bool,
     ) -> Result<ThreadInfo, ThreadError> {
         let root = self.root_of(project)?;
+        // The log records the name it was asked for; the index and the
+        // summary carry the listed name, so the row counts it and a
+        // listing by either name finds it.
+        let listed = self.listed(project);
         std::fs::create_dir_all(&root.threads_dir).map_err(BuildError::from)?;
         let id = self.ids().next();
         // The creator, for the index and for the log (issue #81): only a
@@ -1158,7 +1203,7 @@ impl ThreadTable {
             id,
             Indexed {
                 dir: root.threads_dir.clone(),
-                home: Some(project.to_owned()),
+                home: Some(listed.clone()),
                 switched: None,
                 switched_root: None,
                 root: Some(root.root.clone()),
@@ -1168,7 +1213,7 @@ impl ThreadTable {
                 front,
             },
         );
-        Ok(summarise(&root.threads_dir, id, project))
+        Ok(summarise(&root.threads_dir, id, &listed))
     }
 
     /// Write `thread`'s `thread_started` into `root`'s threads directory,
@@ -1240,7 +1285,7 @@ impl ThreadTable {
             id,
             Indexed {
                 dir: root.threads_dir.clone(),
-                home: Some(project.to_owned()),
+                home: Some(self.listed(project)),
                 switched: None,
                 switched_root: None,
                 root: Some(root.root.clone()),
@@ -1735,23 +1780,29 @@ impl ThreadTable {
     ) -> Result<(Ulid, bool), ThreadError> {
         let _serial = self.build_lock.lock().await;
         let base = self.threads_base.clone();
+        // The lock, the run lookup and the world all key on the name this
+        // daemon lists the project by: a second `Build` sent as the leaf
+        // has to find the run its predecessor made, and two spellings of
+        // one project must not take two locks. Only `create` below keeps
+        // the asked name, so the log records what was asked.
+        let listed = self.listed(project);
         // Held until the lead exists and is claimed: another process's
         // `Build` for this issue then finds the lead instead of making
         // a second one. The lock names the project (issue #9), so two
         // projects' issue 7 do not wait on each other.
-        let _issue = IssueLock::take(&base, project, issue)
+        let _issue = IssueLock::take(&base, &listed, issue)
             .await
             .map_err(ThreadError::Refused)?;
-        if let Some(lead) = self.unfinished_run(project, issue)? {
+        if let Some(lead) = self.unfinished_run(&listed, issue)? {
             // The run continues where its lead's log is (issue #9): in
             // the flat base, or in a legacy subdirectory the migration
             // held back.
-            let world = self.run_world_for(project, lead)?;
+            let world = self.run_world_for(&listed, lead)?;
             self.claim_or_attach(lead, &world)?;
             return Ok((lead, true));
         }
         // A new run is written flat.
-        let world = self.run_world(project, base)?;
+        let world = self.run_world(&listed, base)?;
         // The workflow defaults to `build`, the name the acceptance uses
         // (issue #58, rule 4).
         let name = workflow.unwrap_or_else(|| DEFAULT_WORKFLOW.to_owned());
@@ -1793,9 +1844,10 @@ impl ThreadTable {
     /// lead is already a lead and this only refreshes its directory.
     fn note_lead(&self, thread: Ulid, issue: u64, dir: &Path, project: &str) {
         let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        let listed = self.listed(project);
         let entry = index.entry(thread).or_insert_with(|| Indexed {
             dir: dir.to_path_buf(),
-            home: Some(project.to_owned()),
+            home: Some(listed.clone()),
             switched: None,
             switched_root: None,
             root: None,
@@ -1808,7 +1860,7 @@ impl ThreadTable {
         entry.dir = dir.to_path_buf();
         entry.run = RunThread::Lead { issue };
         if entry.home.is_none() {
-            entry.home = Some(project.to_owned());
+            entry.home = Some(listed);
         }
     }
 
@@ -2030,41 +2082,70 @@ pub(crate) fn same_root(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// What a scan works out once per root: the name the daemon lists the
+/// project at that root under, and the root's own project name — a file
+/// read that 456 logs sharing a root must not repeat.
+struct RootNames {
+    listed: Option<String>,
+    leaf: String,
+}
+
+fn root_names<'a>(
+    server: &ServerConfig,
+    root: &Path,
+    memo: &'a mut HashMap<PathBuf, RootNames>,
+) -> &'a RootNames {
+    memo.entry(root.to_path_buf()).or_insert_with(|| RootNames {
+        listed: server
+            .projects
+            .iter()
+            .find(|p| same_root(&p.root, root))
+            .map(|p| p.name.clone()),
+        leaf: crate::workspaces::project_name(root),
+    })
+}
+
 /// The project a `thread_started` gives a thread (issue #9): its own
-/// `project`.
+/// `project`, under the name the daemon lists that project by — a thread
+/// started before its project was qualified still belongs to it.
 ///
 /// A pre-phase-6 log wrote [`LEGACY_NONE_PROJECT`] for a root with no
 /// project file, because the per-project directory was the index. That
-/// stand-in name is gone, so such a thread belongs to
-/// `project_name_at(root)` — and to no project at all when that name is
-/// another project's, at a different canonical root.
+/// stand-in name is gone, so such a thread belongs to the project at its
+/// root — and to no project at all when only a project at another root
+/// answers to the root's name.
 fn home_of(
     server: &ServerConfig,
     project: Option<&str>,
     root: Option<&Path>,
-    memo: &mut HashMap<PathBuf, Option<String>>,
+    memo: &mut HashMap<PathBuf, RootNames>,
 ) -> Option<String> {
     let name = project?;
+    let names = root.map(|root| root_names(server, root, memo));
     if name != LEGACY_NONE_PROJECT {
+        // The logged name stands unless this root is listed under
+        // another one.
+        if let (Some(p), Some(root)) = (server.project(name), root)
+            && same_root(&p.root, root)
+        {
+            return Some(p.name.clone());
+        }
+        if let Some(listed) = names.and_then(|n| n.listed.clone()) {
+            return Some(listed);
+        }
         return Some(name.to_owned());
     }
-    let root = root?;
-    // Canonicalising is memoised per distinct root: a scan of 456 logs
-    // must not canonicalise one path 456 times.
-    if let Some(known) = memo.get(root) {
-        return known.clone();
+    if let Some(listed) = names.and_then(|n| n.listed.clone()) {
+        return Some(listed);
     }
-    // The root's project file name if one exists now, else the root's
-    // own basename: the rule the embedded daemon names a bare root by,
-    // minus its hex suffix. A configured project at a different root
-    // claims that name, so the thread has no project it can be built in.
-    let candidate = crate::workspaces::project_name(root);
-    let home = match server.project(&candidate) {
-        Some(p) if !same_root(&p.root, root) => None,
-        _ => Some(candidate),
-    };
-    memo.insert(root.to_path_buf(), home.clone());
-    home
+    // No project at this root: its own name counts only when no project
+    // at another root answers to it, so a thread is never built in the
+    // wrong root.
+    let names = names?;
+    match server.project(&names.leaf) {
+        Some(_) => None,
+        None => Some(names.leaf.clone()),
+    }
 }
 
 /// Read one log into its index entry (issue #9): the `thread_started`,
@@ -2074,7 +2155,7 @@ fn home_of(
 fn scan_log(
     path: &Path,
     server: &ServerConfig,
-    memo: &mut HashMap<PathBuf, Option<String>>,
+    memo: &mut HashMap<PathBuf, RootNames>,
 ) -> Option<(Ulid, Indexed)> {
     let id: Ulid = path.file_stem()?.to_str()?.parse().ok()?;
     let dir = path.parent()?.to_path_buf();
@@ -2141,7 +2222,12 @@ fn scan_log(
                     // whatever its `to` is, so `switched` and
                     // `switched_root` never disagree.
                     entry.switched_root = p.to.as_ref().map(|_| p.root.clone());
-                    entry.switched = p.to;
+                    // The name this daemon lists the project by, so a
+                    // log written before its project was qualified, or
+                    // a switch sent as a bare leaf, still names the row
+                    // the thread counts under.
+                    entry.switched =
+                        p.to.map(|to| server.project(&to).map(|p| p.name.clone()).unwrap_or(to));
                 }
             }
             EventKind::RunStarted if wants_run => {
@@ -2166,7 +2252,7 @@ fn scan_log(
 /// logs once, at start-up (issue #9). The flat directory is read first,
 /// then each legacy subdirectory; if an id is in both, the flat one wins.
 fn scan_index(base: &Path, server: &ServerConfig) -> HashMap<Ulid, Indexed> {
-    let mut memo: HashMap<PathBuf, Option<String>> = HashMap::new();
+    let mut memo: HashMap<PathBuf, RootNames> = HashMap::new();
     let mut index: HashMap<Ulid, Indexed> = HashMap::new();
     for path in log_files(base) {
         if let Some((id, entry)) = scan_log(&path, server, &mut memo) {

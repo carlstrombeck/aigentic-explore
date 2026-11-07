@@ -49,6 +49,10 @@ struct Router {
     /// The tool names each request offered: the front's, then the job's.
     tools: Arc<Mutex<Vec<Vec<String>>>>,
     job_tools: Arc<Mutex<Vec<Vec<String>>>>,
+    /// How many threads may still be built; `None` is no limit. A thread
+    /// built past it fails to build, as a job whose provider cannot be
+    /// made does.
+    builds: Arc<Mutex<Option<u32>>>,
 }
 
 impl Router {
@@ -58,7 +62,14 @@ impl Router {
             job: Arc::new(Mutex::new(job.into())),
             tools: Arc::new(Mutex::new(Vec::new())),
             job_tools: Arc::new(Mutex::new(Vec::new())),
+            builds: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The same router, building only the first `n` threads.
+    fn building_only(self, n: u32) -> Self {
+        *self.builds.lock().unwrap() = Some(n);
+        self
     }
 }
 
@@ -109,6 +120,12 @@ impl Provider for Router {
 
 impl ProviderFactory for Router {
     fn build(&self, _: &str) -> Result<(Box<dyn Provider>, String), BuildError> {
+        if let Some(left) = self.builds.lock().unwrap().as_mut() {
+            if *left == 0 {
+                return Err(BuildError::Config("no provider for this thread".into()));
+            }
+            *left -= 1;
+        }
         Ok((Box::new(self.clone()), "router".into()))
     }
 }
@@ -291,12 +308,17 @@ async fn approve_and_wait(rig: &Rig) -> Ulid {
     })
     .await;
     let Notice::State {
-        state: ThreadState::AwaitingSwitch { call_id, .. },
+        state: ThreadState::AwaitingSwitch { call_id, job, .. },
         ..
     } = parked
     else {
         unreachable!()
     };
+    assert_eq!(
+        job.map(|job| job.task).as_deref(),
+        Some("list the callers"),
+        "the wait names the job it would start"
+    );
     assert_eq!(
         ask(&mailbox, |reply| Mail::AnswerSwitch {
             by: steve(),
@@ -363,6 +385,70 @@ fn last_turn_end(events: &[Event]) -> TurnEndedPayload {
         .find(|e| e.kind == EventKind::TurnEnded)
         .expect("a turn ended");
     serde_json::from_value(ended.payload.clone()).unwrap()
+}
+
+/// A job the driver cannot run says so on the front thread: the person
+/// approved it and is waiting on its return. Here the job's thread cannot
+/// be built once its masthead is written.
+#[tokio::test]
+async fn a_job_that_cannot_run_says_so_on_the_front() {
+    let rig = rig(Router::new(proposes_a_job(), vec![say(JOB_WORDS)]).building_only(1));
+    let (id, mailbox, mut notices) = front(&rig).await;
+    post(&mailbox, "Who calls parse_config?").await;
+    let parked = until(&mut notices, |n| {
+        matches!(
+            n,
+            Notice::State {
+                state: ThreadState::AwaitingSwitch { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    let Notice::State {
+        state: ThreadState::AwaitingSwitch { call_id, .. },
+        ..
+    } = parked
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        ask(&mailbox, |reply| Mail::AnswerSwitch {
+            by: steve(),
+            call_id,
+            answer: SwitchAnswer::Yes,
+            ctx: SwitchCtx::none(),
+            reply,
+        })
+        .await,
+        Response::Ok
+    );
+    let landed = until(
+        &mut notices,
+        |n| matches!(n, Notice::Event { event, .. } if event.kind == EventKind::JobFinished),
+    )
+    .await;
+    let Notice::Event { event, .. } = landed else {
+        unreachable!()
+    };
+    let payload: JobFinishedPayload = serde_json::from_value(event.payload).unwrap();
+    assert_eq!(payload.outcome, JobOutcome::Failed);
+    assert!(
+        payload.summary.starts_with("The job could not be run: ")
+            && payload.summary.contains("no provider for this thread"),
+        "{}",
+        payload.summary
+    );
+    let job = events(&rig.threads, payload.job_thread);
+    let started: ThreadStartedPayload = serde_json::from_value(job[0].payload.clone()).unwrap();
+    assert_eq!(
+        started.parent_thread,
+        Some(id),
+        "the return names this front's job"
+    );
+    let kinds: Vec<EventKind> = job.iter().map(|e| e.kind).collect();
+    assert_eq!(kinds, vec![EventKind::ThreadStarted], "the job never began");
+    assert_eq!(returns(&events(&rig.threads, id)).len(), 1, "one return");
 }
 
 #[tokio::test]
