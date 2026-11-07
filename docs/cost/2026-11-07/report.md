@@ -146,6 +146,56 @@ Reading:
 - **The key is weak.** It is one earlier GLM run's findings, and today's GLM run found only 37% of them. Both arms raised other items that look real and are not in the key. Run-to-run variance is as large as the gap between the models, so one run per cell can't tell them apart on quality.
 - **Not yet a reason to switch.** The cost gap is clear and large. The quality comparison needs the empty-turn fix first, then 2 runs per cell, with the out-of-key items checked by hand.
 
+## 6. The empty-turn fix, and the spec check rerun at two runs per ticket
+
+### The fix (commit `dd45603`)
+
+A reply with no tool call and no visible text (reasoning only, or whitespace) no longer ends the turn as `done`.
+
+- The first such reply in a turn appends a new event kind, `reply_nudged`. Its payload holds the note the model is shown (`EMPTY_REPLY_NUDGE`), and it projects as a user-role message where it stands. The loop then asks again.
+- A second empty reply in the same turn ends it as `empty_reply`. The runner parks `empty_reply` as it parks `done` (Partial, can continue), so nothing gets worse for a model that stays silent.
+- A reply cut at the output limit keeps `length`.
+- Tests: `crates/runtime/tests/empty_reply.rs` (nudge once, then `done`; a second empty reply ends `empty_reply` with no third request; one nudge per turn). All three fail with the check turned off.
+- Three existing scripted tests used an empty reply to mean "finished" and now end on a word of text.
+- Gate: fmt, clippy, 1,945 tests passing, comment check clean.
+
+### The rerun
+
+The same 4 tickets, prompts, base commits and frozen key as section 5. 2 runs per ticket per config, 16 runs, with this branch's binary. Each report was rebuilt from all assistant text after the last tool result, since a report can now span the nudge.
+
+Grading was blind: the four reports per ticket were shuffled into R1 to R4, and one grader per ticket checked every claim against the code at the base commit. Besides the key, each grader judged every other finding: is it real, and does it matter (it would mislead the implementer, break a build or a test, or leave a real hole), or is it minor?
+
+| | GLM 5.3 (as today) | Flash 1017, medium |
+| --- | --- | --- |
+| Runs that ended without a report | 0 of 8 | 0 of 8 (5 nudged, all then reported) |
+| Key found | 22.5 of 40 (**56%**) | 16 of 40 (**40%**) |
+| Extra findings, real and matter | 11 | 12 |
+| Extra findings, real but minor | 11 | 26 |
+| Claims that were not real | 4 | 6 |
+| Key + extras that matter | **33.5** | **28** |
+| Cost per run | **$1.83** ($1.10 to $3.07) | **$0.45** ($0.23 to $0.71) |
+| Cache hit, pooled | 83.3% | 87.8% |
+| Cost per point (key + matters) | $0.44 | $0.13 |
+
+Per ticket, key found (run a, run b):
+
+| Ticket | Key | GLM | Flash |
+| --- | --- | --- | --- |
+| #199 | 3 | 0, 2.5 | 1, 0.5 |
+| #200 | 8.5 | 5.5, 3 | 2.5, 2 |
+| #216 | 5 | 4, 2 | 2, 3 |
+| #218 | 3.5 | 2.5, 3 | 3, 2 |
+
+Reading:
+
+- **The fix works.** In section 5, Flash lost 2 of 4 reports. Here it lost none of 8, and 5 of those 8 needed the nudge. GLM never needed it.
+- **One Flash report came back as a fragment.** On #200 run b, items 1 to 9 stayed in the reasoning before the nudge, and after it the model wrote only item 10 and a checklist, as if the rest had already been shown. The nudge text should say that reasoning is not shown to anyone, and ask for the whole answer.
+- **GLM finds more of the key, at 4 times the cost.** Counting the real extra findings too, Flash reaches 84% of GLM's points (28 against 33.5) for 25% of the price, but it also raises more minor and unreal items for the merger to sift.
+- **The spread is large.** The same model on the same ticket can score 0 one run and 2.5 the next (GLM on #199). Two runs per cell is still a small sample.
+- **Not a reason to switch alone.** Worth testing next: two Flash runs per spec check, their items merged ($0.90), against one GLM run ($1.83). Two Flash runs that miss different things may beat one GLM run on recall, at half the cost.
+
+Spend for this step: $18.28 for the runs. The graders ran on Claude, outside TensorX.
+
 ## Files
 
 - `.aigentic/workflows/loop/templates/*.md`: the audited templates.
