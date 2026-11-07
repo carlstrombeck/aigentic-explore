@@ -598,6 +598,14 @@ pub struct MemoryExtractedPayload {
     pub usage: Usage,
 }
 
+/// Payload of a `reply_nudged` event: the note the model reads in place
+/// of the reply it left empty. Stored rather than rebuilt, so a log
+/// replays the words its model was shown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyNudgedPayload {
+    pub text: String,
+}
+
 /// Payload of a `brief_refreshed` event: the utility model rewrote a
 /// brief's current state from the thread's events up to `through_seq`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

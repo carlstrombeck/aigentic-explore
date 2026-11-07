@@ -38,7 +38,7 @@ use crate::checks::git::{read_commits_between, read_uncommitted};
 use crate::checks::{CheckInput, run_checks};
 use crate::support::recoverable_fault;
 use crate::workflow::{LoadedWorkflow, Step, WorkflowError};
-use crate::{LENGTH_STOP, MAX_USD, Runtime, RuntimeError, STEP_REPORTED, Signal};
+use crate::{EMPTY_REPLY, LENGTH_STOP, MAX_USD, Runtime, RuntimeError, STEP_REPORTED, Signal};
 
 /// The author id of the lead's own events, and of the messages a runner
 /// posts into a child.
@@ -2088,9 +2088,10 @@ impl<F: Forge, H: RunnerHost, R: Repo> Runner<F, H, R> {
             STEP_REPORTED => Err(RunnerError::Host(format!("child {child} reported nothing"))),
             // `LENGTH_STOP` is a budget-style stop like `max_tokens`: the
             // step is Partial, not Failed, and nothing escalates (issue
-            // #96).
-            "done" | "resumed" | LENGTH_STOP | MAX_USD | "max_iterations" | "max_tokens"
-            | "max_wall_time" => {
+            // #96). `EMPTY_REPLY` parks as `done` does: the work so far
+            // stands and the step can continue.
+            "done" | "resumed" | LENGTH_STOP | EMPTY_REPLY | MAX_USD | "max_iterations"
+            | "max_tokens" | "max_wall_time" => {
                 let finished = finish(StepStatus::Partial, end.reason, None);
                 self.append(EventKind::StepFinished, &finished)?;
                 Ok(())

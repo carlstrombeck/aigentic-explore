@@ -1443,6 +1443,14 @@ pub const LENGTH_STOP: &str = "length";
 /// The provider's other name for the same stop (issue #96).
 pub const MAX_TOKENS_STOP: &str = "max_tokens";
 
+/// The `turn_ended` reason when the model left a reply empty (no text, no
+/// tool call) a second time in one turn, after one `reply_nudged`. Not
+/// `done`: nothing was answered.
+pub const EMPTY_REPLY: &str = "empty_reply";
+
+/// What the model reads after its first empty reply of a turn.
+pub const EMPTY_REPLY_NUDGE: &str = "[Your last reply had no text and no tool call, so nothing reached the person. Carry on: call the next tool, or write your answer.]";
+
 /// The `turn_ended` reason when the turn's own spend reached
 /// `Budget::max_cost_usd`: the call that crossed the cap ran to its end,
 /// and the check that reads this runs before the next one. The runner
