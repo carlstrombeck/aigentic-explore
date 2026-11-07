@@ -46,6 +46,11 @@ pub fn switch_declined_line(project: &str) -> String {
     format!("[switch to {project} not answered: non-interactive]")
 }
 
+/// The line `exec` prints when it declines a background job proposal.
+pub fn job_declined_line(task: &str) -> String {
+    format!("[background job not started: non-interactive: {task}]")
+}
+
 /// How many result lines the progress on stderr shows per tool call.
 const RESULT_LINES: usize = 3;
 
@@ -339,12 +344,19 @@ impl Follow {
                         .await?;
                 }
                 ThreadState::AwaitingSwitch {
-                    call_id, project, ..
+                    call_id,
+                    project,
+                    job,
+                    ..
                 } => {
                     self.running = true;
                     self.end_line(err)?;
                     self.denied += 1;
-                    writeln!(err, "{}", switch_declined_line(&project))?;
+                    let line = match job {
+                        Some(job) => job_declined_line(&job.task),
+                        None => switch_declined_line(&project),
+                    };
+                    writeln!(err, "{line}")?;
                     client
                         .request(Request::AnswerSwitch {
                             thread,
@@ -484,13 +496,16 @@ mod tests {
                 root: p,
             }],
         };
-        let server = Arc::new(Server::new(
-            config,
-            cfg_dir,
-            server,
-            Arc::new(Factory(Mutex::new(Some(script)))),
-            Arc::new(NoReports),
-        ));
+        let server = Arc::new(
+            Server::new(
+                config,
+                cfg_dir,
+                server,
+                Arc::new(Factory(Mutex::new(Some(script)))),
+                Arc::new(NoReports),
+            )
+            .unwrap(),
+        );
         let socket = dir.path().join("d.sock");
         tokio::spawn(server.serve(Listener::Unix(socket.clone())));
         for _ in 0..200 {
@@ -612,6 +627,32 @@ mod tests {
             "the turn continued in place: nothing waited for a person"
         );
         assert_eq!(o.reason.as_deref(), Some("done"), "{err}");
+    }
+
+    /// A job proposal is declined the same way, and the line names the job
+    /// rather than a switch.
+    #[tokio::test]
+    async fn a_job_proposal_is_declined_by_name_and_exit_is_three() {
+        let call = ProviderEvent::ToolCall(ToolCall {
+            id: "c1".into(),
+            name: "start_job".into(),
+            args: serde_json::json!({"task": "list the callers", "brief": "find them"}),
+        });
+        let (o, _, err) = exec(
+            vec![
+                vec![call, finish("tool_use")],
+                vec![text("doing it here"), finish("stop")],
+            ],
+            args(false),
+        )
+        .await;
+        assert_eq!(o.denied, 1, "{err}");
+        assert_eq!(o.code, EXIT_NEEDS_HUMAN, "{err}");
+        assert!(
+            err.contains(&job_declined_line("list the callers")),
+            "{err}"
+        );
+        assert!(!err.contains("switch to"), "{err}");
     }
 
     #[tokio::test]
