@@ -112,10 +112,39 @@ Not built. The spec check is the role to climb. It costs $2.11 a run on average 
 - **Tickets:** about 10 closed loop tickets that have a `## Spec`, a `## Spec check` and a `## Spec v2 (consolidated)`, for example #199, #200, #202, #216 and #218 from this log window, plus earlier ones. Split them by ticket number, not at random: **train** 6, **test** 4, all test tickets newer than all train tickets.
 - **Answer key per ticket:** the check items Spec v2 merged (true positives), the ones it rejected (false positives), and any judge finding that a spec gap caused (misses). Built once, by hand or by the decider, and frozen before the climb.
 - **Score:** recall of merged items minus a penalty per rejected item, then cost per run. A config is better only if it is no worse on score and cheaper, or better on score at the same cost.
-- **Climb:** coordinate ascent from today's config (GLM 5.3, effort high, audited prompt). Change one knob at a time on the train set, one run per ticket, and keep a change only when it wins on the rule above. About 5 configs × 6 tickets = 30 runs.
+- **Climb:** coordinate ascent from today's config (GLM 5.3, no `reasoning_effort` set, as in `[profiles.tensorx]`, audited prompt). Change one knob at a time on the train set, one run per ticket, and keep a change only when it wins on the rule above. About 5 configs × 6 tickets = 30 runs.
 - **Test:** the winner against today's config on the 4 test tickets, 2 runs each: 16 runs.
 - **Cost:** a spec check today is $0.5 to $3.5. On Flash it would be a fraction of that. Expect $20 to $40 in all, so it needs Steve's yes first. A cheaper first step is test tickets only, today's config against Flash at medium (8 runs, about $8).
 - **Run it the bench way:** `aigentic exec --config <bench>.toml` in a worktree checked out at each ticket's base commit, with its own threads dir and nothing posted to the issue.
+
+## 5. First step run: spec check, GLM 5.3 against Flash at medium
+
+The four newest closed tickets that have a Spec, a Spec check and a Spec v2: #199, #200, #216, #218. One run per ticket per config, 8 runs.
+
+- **Configs.** `glm`: GLM 5.3 with no `reasoning_effort`, which is what `[profiles.tensorx]` runs today. (Section 4 said "effort high". That was wrong: the profile sets none.) `fl`: DeepSeek V4.1 Flash 1017 at `reasoning_effort = "medium"`.
+- **Setup.** A detached worktree at the last `main` commit before the ticket's real spec check. The audited `speccheck.md` rendered for the ticket, with two changes made to both arms alike: the issue and the spec come from files, so the later Spec v2, review and fix comments can't leak, and the report is the last message, since `exec` has no `finish_step`. `aigentic exec --mode auto`, a separate config and threads dir, nothing posted.
+- **Key, frozen before any output was read.** The items of the real Spec check that Spec v2 merged, and the ones it rejected (only #200's item 11). Judge misses traced to a spec gap: none. #199, #200 and #218 were approved on the first review, and #216 has no review comment. Score: key items found, with #200's three line-number items counted as half each, and minus one for a claim v2 rejected.
+
+| Ticket | Key | GLM 5.3 | Flash, medium |
+| --- | --- | --- | --- |
+| #199 | 3 | 1 (T1's order) | 0 (six other items, none in the key) |
+| #200 | 8.5 | 1.5 (title, `Other` row, half for line fixes; minus 1 for re-raising rejected item 11) | no report |
+| #216 | 5 | 2 (t9 shape, T8's constant) | no report |
+| #218 | 4 | 3 (missed the invented issue quote) | 4 |
+| **Found** | 20.5 | **7.5 (37%)** | **4 (20%)**; 4 of 7 on the two tickets it reported on, the same as GLM |
+
+| Config | Cost per run | Mean | Requests | Cache hit | Wall time |
+| --- | --- | --- | --- | --- | --- |
+| GLM 5.3 | $2.50, $2.79, $2.24, $1.51 | **$2.26** | 44 to 92 | 81.5% to 89.6% | 13 to 15 min |
+| Flash, medium | $0.29, $0.54, $0.34, $0.23 | **$0.35** | 25 to 72 | 88.5% to 93.9% | 4 to 7 min |
+
+The real loop spec checks of these tickets cost $1.81, $3.02, $2.26 and $1.34, so the GLM arm reproduces today's cost. Spend: $10.43.
+
+Reading:
+
+- **Flash is 6.5 times cheaper, but it failed to report on 2 of 4 tickets.** On #200 and #216 its last message held reasoning and no text and no tool call, and the turn ended as `done`. Both runs had already confirmed findings in their reasoning. In the loop, such a step parks at `step_stop` ("done without a report") and costs a retry. That is a harness behaviour worth fixing whatever the model: a reply with reasoning only should not end a turn.
+- **The key is weak.** It is one earlier GLM run's findings, and today's GLM run found only 37% of them. Both arms raised other items that look real and are not in the key. Run-to-run variance is as large as the gap between the models, so one run per cell can't tell them apart on quality.
+- **Not yet a reason to switch.** The cost gap is clear and large. The quality comparison needs the empty-turn fix first, then 2 runs per cell, with the out-of-key items checked by hand.
 
 ## Files
 
