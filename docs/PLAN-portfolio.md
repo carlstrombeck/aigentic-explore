@@ -85,12 +85,15 @@ PRD's build order asks.
 The PRD says to run the orchestrator role by hand before automating it.
 This slice does exactly that.
 
-- Set up two workspaces and at least three real projects on the daemon,
-  each with a written brief.
-- Every morning for two weeks: read each brief, decide the day's work,
-  and start it as jobs (`start_job` from inside each project today).
-  Note what you read, what you decided and what you had to look up.
-- Keep the notes in the portfolio's own project, under `knowledge/`.
+- Set up two workspaces and at least three real projects, each with a
+  written brief. `scripts/routine-setup.sh` does the setup, and
+  `docs/routine/README.md` is the guide.
+- Every morning for two weeks: read each brief
+  (`scripts/routine-briefs.sh`), decide the day's work, and start it as
+  jobs (`start_job` from inside each project today). Note what you read,
+  what you decided and what you had to look up.
+- Keep the notes in the portfolio's own project, in
+  `.aigentic/knowledge/routine-log.md`.
 
 Output: the status line format a project needs, the five or so
 questions the routine asks every day, and the first answer to
@@ -166,6 +169,16 @@ ADR 0002 puts one conversation in front, so the orchestrator is the
 front thread with more tools, not a separate thread. The PRD's rule
 stays: it never reads project threads.
 
+These tools cross a boundary upstream keeps on purpose. A workspace is
+the boundary for understanding (phase 6 §14), so `read_brief` refuses a
+project in another workspace, and a thread sees other workspaces only as
+one line each. The orchestrator has to read briefs in every workspace.
+The proposal: a thread in a project marked `[portfolio] reads = "briefs"`
+may read every workspace's briefs and `PortfolioState`, and nothing
+else. Files, threads and knowledge stay inside the boundary. This needs
+upstream's view before it is built, because it changes a rule upstream
+decided.
+
 - `list_projects`: workspaces, projects and each brief's one line.
 - `read_status(project)`: the brief and that project's lines from
   `PortfolioState`.
@@ -231,6 +244,8 @@ Added, never changed, per `AGENTS.md`:
 
 ## 6. Open items
 
+- [ ] Whether upstream accepts a portfolio project reading briefs across
+  workspaces (slice 7). Ask before slice 7 starts.
 - [ ] Whether `max_jobs` should be per workspace as well as global.
   Decide from slice 1's notes.
 - [ ] Whether the worktree directory belongs in the project
