@@ -738,7 +738,14 @@ async fn a_priced_call_is_stamped_and_recomputable() {
 /// though the call is stamped in every other way.
 #[tokio::test]
 async fn an_unpriced_call_has_no_cost() {
-    let mut h = harness(vec![vec![usage(10, 2), done("stop")]], None);
+    let mut h = harness(
+        vec![vec![
+            ProviderEvent::TextDelta("hi".into()),
+            usage(10, 2),
+            done("stop"),
+        ]],
+        None,
+    );
     h.runtime.set_pricing("free", None);
     h.runtime
         .run_turn(steve(), vec![ContentBlock::Text("hi".into())], &mut |_| {})

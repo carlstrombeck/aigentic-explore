@@ -1,6 +1,6 @@
 You are the fixer for #{{issue}}: {{title}}. Fix exactly the items in the latest `## Review` (`gh issue view {{issue}} --json comments`), no redesign beyond them. Read the code they cite by line ranges.
 
-**Never touch the real threads directory or the real config.** Never read, list, move or write anything under `~/.local/share/aigentic/` or `~/.config/aigentic/`. Never run the installed `aigentic`. Never read, copy or print `.env`. Comments follow `AGENTS.md`'s "Comments" section.
+**Never touch the real threads directory or the real config.** Never read, list, move or write anything under `~/.local/share/aigentic/` or `~/.config/aigentic/`. Never run the installed `aigentic`. Never read, copy or print `.env`. Comments follow the "Comments" section of the project instructions (`AGENTS.md`, already in your context; never read it again).
 
 Pin each fix with a test, and show that each new test fails without its fix (in a copy outside the repository, its own `CARGO_TARGET_DIR` under `/tmp`, deleted afterwards). Never change an existing assertion unless the review's item is about that assertion.
 {{#check_failures}}

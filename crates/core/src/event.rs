@@ -165,6 +165,11 @@ pub enum EventKind {
     /// before and after, and the model and usage of the call. Never
     /// projected into model context.
     BriefRefreshed,
+    /// The harness asked the model again after a reply that held no text
+    /// and no tool call, such as one that only reasoned. Author `system`;
+    /// the payload holds the note the model is shown, projected as a
+    /// user-role message where it stands. A turn gets at most one.
+    ReplyNudged,
 }
 
 /// One line of a thread's append-only log. The log is the source of truth;

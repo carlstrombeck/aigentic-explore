@@ -203,7 +203,7 @@ async fn run_bash(f: &Fixture, command: &str, mode: Mode) -> String {
             }),
             done("tool_use"),
         ],
-        vec![done("stop")],
+        vec![ProviderEvent::TextDelta("done".into()), done("stop")],
     ]);
     let log = ThreadLog::open(&f.project, ulid::Ulid::generate()).unwrap();
     let mut runtime = Runtime::new(
