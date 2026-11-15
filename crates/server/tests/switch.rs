@@ -209,16 +209,19 @@ async fn a_thread_moves_to_another_project_and_stays_there_across_a_reload() {
         vec![text("still q"), done()],
     ])));
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-    let server = Arc::new(Server::new(
-        config,
-        cfg_dir,
-        server,
-        Arc::new(Factory {
-            script,
-            seen: seen.clone(),
-        }),
-        Arc::new(NoReports),
-    ));
+    let server = Arc::new(
+        Server::new(
+            config,
+            cfg_dir,
+            server,
+            Arc::new(Factory {
+                script,
+                seen: seen.clone(),
+            }),
+            Arc::new(NoReports),
+        )
+        .unwrap(),
+    );
     let socket = dir.path().join("d.sock");
     tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));
     for _ in 0..200 {
@@ -231,7 +234,9 @@ async fn a_thread_moves_to_another_project_and_stays_there_across_a_reload() {
         .await
         .unwrap();
     let names: Vec<&str> = welcome.projects.iter().map(|p| p.name.as_str()).collect();
-    assert!(names.contains(&"p") && names.contains(&"q"), "{names:?}");
+    // `p` is the workspace's, so it is addressed as `w/p`; `q` is in no
+    // workspace and keeps its folder's name.
+    assert!(names.contains(&"w/p") && names.contains(&"q"), "{names:?}");
 
     let Response::Thread { thread } = client
         .request(Request::CreateThread {
@@ -432,6 +437,9 @@ struct Rig {
     magnus: Client,
     seen: Seen,
     threads_base: PathBuf,
+    /// `p`'s name as the daemon lists it: `p` lives in a workspace and not
+    /// in `server.toml`, so it is qualified.
+    listed_p: String,
 }
 
 /// A daemon over `dir` with `p` and `q` in workspace `w1`, steve the
@@ -494,16 +502,19 @@ async fn rig(dir: &std::path::Path, script: Vec<Vec<ProviderEvent>>) -> Rig {
         resume_runs: false,
     };
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-    let server = Arc::new(Server::new(
-        config,
-        cfg_dir,
-        server,
-        Arc::new(Factory {
-            script: Arc::new(Mutex::new(VecDeque::from(script))),
-            seen: seen.clone(),
-        }),
-        Arc::new(NoReports),
-    ));
+    let server = Arc::new(
+        Server::new(
+            config,
+            cfg_dir,
+            server,
+            Arc::new(Factory {
+                script: Arc::new(Mutex::new(VecDeque::from(script))),
+                seen: seen.clone(),
+            }),
+            Arc::new(NoReports),
+        )
+        .unwrap(),
+    );
     let socket = dir.join("d.sock");
     tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));
     for _ in 0..200 {
@@ -525,6 +536,7 @@ async fn rig(dir: &std::path::Path, script: Vec<Vec<ProviderEvent>>) -> Rig {
         magnus,
         seen,
         threads_base,
+        listed_p: aigentic_server::workspaces::qualified_name("w1", &p),
     }
 }
 
@@ -593,12 +605,14 @@ async fn post_and_park(
                 project,
                 workspace,
                 reason,
+                job,
             },
         ..
     } = notice
     else {
         panic!("the proposal state")
     };
+    assert_eq!(job, None, "a project proposal carries no job");
     (call_id, project, workspace, reason)
 }
 
@@ -693,6 +707,213 @@ async fn t9_a_proposal_reaches_the_client_and_a_yes_switches_the_project() {
     assert_eq!(rig.server.threads.project_of(id).as_deref(), Some("q"));
 }
 
+/// A yes to a background job is a yes, not a refusal: the job starts and
+/// the front stays where it is, so no project's context is built for it.
+#[tokio::test]
+async fn a_yes_to_a_job_proposal_is_answered_ok_and_moves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rig = rig(
+        dir.path(),
+        vec![vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "j1".into(),
+                name: "start_job".into(),
+                args: json!({"task": "list the callers", "brief": "Find every caller."}),
+            }),
+            tool_use(),
+        ]],
+    )
+    .await;
+    let (id, mut notices) = thread_in_p(&mut rig).await;
+    assert_eq!(
+        rig.steve
+            .request(Request::Post {
+                thread: id,
+                blocks: vec![ContentBlock::Text("hi".into())],
+                interrupt: false,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    let notice = until_notice(&mut notices, |n| {
+        matches!(
+            n,
+            Notice::State {
+                state: ThreadState::AwaitingSwitch { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    let Notice::State {
+        state: ThreadState::AwaitingSwitch { call_id, job, .. },
+        ..
+    } = notice
+    else {
+        unreachable!()
+    };
+    assert!(job.is_some(), "a job's wait");
+
+    assert_eq!(
+        rig.steve
+            .request(Request::AnswerSwitch {
+                thread: id,
+                call_id,
+                answer: SwitchReply::Yes,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        rig.server.threads.project_of(id).as_deref(),
+        Some(rig.listed_p.as_str()),
+        "the front stays in its project"
+    );
+    let kinds: Vec<EventKind> = events_under(&rig.threads_base, id)
+        .iter()
+        .map(|e| e.kind)
+        .collect();
+    assert!(!kinds.contains(&EventKind::ProjectSwitched), "{kinds:?}");
+
+    // The job itself starts, in the front's project, with the brief.
+    let brief = wait_for_job_brief(&rig.threads_base, id).await;
+    assert!(brief.contains("Find every caller."), "{brief}");
+}
+
+/// A person who may only read where a job would run is refused its yes,
+/// and nothing starts.
+#[tokio::test]
+async fn a_readers_yes_to_a_job_proposal_is_refused_and_starts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rig = rig(
+        dir.path(),
+        vec![vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "j1".into(),
+                name: "start_job".into(),
+                args: json!({"task": "list the callers", "brief": "Find every caller."}),
+            }),
+            tool_use(),
+        ]],
+    )
+    .await;
+    let created = rig
+        .steve
+        .request(Request::CreateThread {
+            project: "q".into(),
+        })
+        .await
+        .unwrap();
+    let Response::Thread { thread } = created else {
+        panic!("a thread: {created:?}")
+    };
+    let id = thread.id;
+    for client in [&mut rig.steve, &mut rig.magnus] {
+        assert!(matches!(
+            client
+                .request(Request::Open {
+                    thread: id,
+                    from_seq: 0
+                })
+                .await
+                .unwrap(),
+            Response::Opened { .. }
+        ));
+    }
+    let mut notices = rig.steve.take_notices().unwrap();
+    assert_eq!(
+        rig.steve
+            .request(Request::Post {
+                thread: id,
+                blocks: vec![ContentBlock::Text("hi".into())],
+                interrupt: false,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    let notice = until_notice(&mut notices, |n| {
+        matches!(
+            n,
+            Notice::State {
+                state: ThreadState::AwaitingSwitch { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    let Notice::State {
+        state: ThreadState::AwaitingSwitch { call_id, .. },
+        ..
+    } = notice
+    else {
+        unreachable!()
+    };
+
+    let answered = rig
+        .magnus
+        .request(Request::AnswerSwitch {
+            thread: id,
+            call_id: call_id.clone(),
+            answer: SwitchReply::Yes,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(&answered, Response::Refused { reason } if reason.contains("needs write")),
+        "{answered:?}"
+    );
+    assert!(
+        job_threads_of(&rig.threads_base, id).is_empty(),
+        "no job started"
+    );
+    assert!(
+        rig.server
+            .threads
+            .waiting_switch(id, &call_id)
+            .await
+            .is_some(),
+        "the proposal is still open"
+    );
+}
+
+/// The job threads whose masthead names `front` as their parent.
+fn job_threads_of(base: &std::path::Path, front: Ulid) -> Vec<Ulid> {
+    std::fs::read_dir(base)
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            name.strip_suffix(".jsonl")?.parse::<Ulid>().ok()
+        })
+        .filter(|id| {
+            events_under(base, *id).first().is_some_and(|started| {
+                started.kind == EventKind::ThreadStarted
+                    && started.payload["job"] == json!(true)
+                    && started.payload["parent_thread"] == json!(front.to_string())
+            })
+        })
+        .collect()
+}
+
+/// The brief of `front`'s first job, once its thread has one.
+async fn wait_for_job_brief(base: &std::path::Path, front: Ulid) -> String {
+    for _ in 0..400 {
+        if let Some(job) = job_threads_of(base, front).first() {
+            let brief = events_under(base, *job)
+                .iter()
+                .find(|e| e.kind == EventKind::UserMessage)
+                .map(|e| e.payload.to_string());
+            if let Some(brief) = brief {
+                return brief;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no job started from {front}");
+}
+
 #[tokio::test]
 async fn t9_a_no_leaves_the_project_and_the_prefix_alone() {
     let dir = tempfile::tempdir().unwrap();
@@ -720,7 +941,10 @@ async fn t9_a_no_leaves_the_project_and_the_prefix_alone() {
     );
     until_idle(&mut notices).await;
 
-    assert_eq!(rig.server.threads.project_of(id).as_deref(), Some("p"));
+    assert_eq!(
+        rig.server.threads.project_of(id).as_deref(),
+        Some(rig.listed_p.as_str())
+    );
     let them = events_under(&rig.threads_base, id);
     assert!(
         !them.iter().any(|e| e.kind == EventKind::ProjectSwitched),
@@ -767,7 +991,10 @@ async fn t9_a_yes_without_write_in_the_target_is_refused_and_stays_pending() {
         matches!(refused, Response::Refused { .. }),
         "no write in q: {refused:?}"
     );
-    assert_eq!(rig.server.threads.project_of(id).as_deref(), Some("p"));
+    assert_eq!(
+        rig.server.threads.project_of(id).as_deref(),
+        Some(rig.listed_p.as_str())
+    );
     assert!(
         answers(&events_under(&rig.threads_base, id)).is_empty(),
         "the proposal is still open"
@@ -807,7 +1034,10 @@ async fn t9_an_answer_while_idle_is_refused() {
         matches!(refused, Response::Refused { .. } | Response::Error { .. }),
         "nothing is pending: {refused:?}"
     );
-    assert_eq!(rig.server.threads.project_of(id).as_deref(), Some("p"));
+    assert_eq!(
+        rig.server.threads.project_of(id).as_deref(),
+        Some(rig.listed_p.as_str())
+    );
 }
 
 /// A provider whose first reply holds until the test lets go, so the turn
@@ -908,17 +1138,20 @@ async fn t9_a_switch_project_mid_turn_is_refused() {
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-    let server = Arc::new(Server::new(
-        config,
-        cfg_dir,
-        server,
-        Arc::new(HeldFactory {
-            started: started.clone(),
-            release: release.clone(),
-            seen,
-        }),
-        Arc::new(NoReports),
-    ));
+    let server = Arc::new(
+        Server::new(
+            config,
+            cfg_dir,
+            server,
+            Arc::new(HeldFactory {
+                started: started.clone(),
+                release: release.clone(),
+                seen,
+            }),
+            Arc::new(NoReports),
+        )
+        .unwrap(),
+    );
     let socket = dir.path().join("d.sock");
     tokio::spawn(server.clone().serve(Listener::Unix(socket.clone())));
     for _ in 0..200 {
@@ -1073,7 +1306,10 @@ async fn t9_a_cancelled_turn_leaves_the_answer_refused_and_the_entry_alone() {
         matches!(refused, Response::Refused { .. }),
         "the turn left: {refused:?}"
     );
-    assert_eq!(rig.server.threads.project_of(id).as_deref(), Some("p"));
+    assert_eq!(
+        rig.server.threads.project_of(id).as_deref(),
+        Some(rig.listed_p.as_str())
+    );
     let them = events_under(&rig.threads_base, id);
     assert!(
         !them.iter().any(|e| e.kind == EventKind::ProjectSwitched),

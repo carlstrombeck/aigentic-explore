@@ -1,6 +1,6 @@
 //! The in-memory cache the log serves reads from: it equals what was
-//! appended, and the file is read only at open — twice when a torn tail
-//! is repaired.
+//! appended, and the file is read at open, under the lock when a torn tail
+//! is repaired, and when an append finds it grew.
 
 use aigentic_core::{Author, ContentBlock, EventKind, UserId};
 use aigentic_log::{NewEvent, Repair, ThreadLog, UserMessagePayload};
@@ -59,7 +59,7 @@ fn repaired_torn_tail_seeds_cache() {
     }
     assert_eq!(
         log.file_reads(),
-        2,
-        "the failed pass and the re-read after the cut"
+        3,
+        "the failed pass, the pass under the lock and the re-read after the cut"
     );
 }

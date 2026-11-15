@@ -14,7 +14,7 @@
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
-use aigentic_api::{AskedOption, AskedQuestion, Notice, ReportKind, Response, ThreadState};
+use aigentic_api::{AskedOption, AskedQuestion, JobAsk, Notice, ReportKind, Response, ThreadState};
 use aigentic_runtime::aigentic_core::{Author, ContentBlock, Event, EventKind};
 use aigentic_runtime::aigentic_log::{
     JobFinishedPayload, PermissionRequestedPayload, UserMessagePayload, declined_at_startup,
@@ -496,11 +496,16 @@ impl Shared {
                         call_id,
                         project,
                         reason,
+                        job,
                     } => ThreadState::AwaitingSwitch {
                         call_id: call_id.clone(),
                         project: project.clone(),
                         workspace: (self.labels)(project),
                         reason: reason.clone(),
+                        job: job.as_ref().map(|job| JobAsk {
+                            task: job.task.clone(),
+                            read_only: job.read_only,
+                        }),
                     },
                     Pending::Human {
                         call_id,
@@ -638,6 +643,20 @@ impl ThreadActor {
     pub fn with_store(self, store: Weak<crate::threads::ThreadTable>) -> Self {
         *self.shared.store.lock().unwrap_or_else(|e| e.into_inner()) = store;
         self
+    }
+
+    /// Write the job returns that arrived while a turn ran.
+    fn write_queued_job_notes(&mut self) {
+        let notes = std::mem::take(
+            &mut *self
+                .shared
+                .job_notes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for (payload, reply) in notes {
+            self.write_job_note(payload, reply);
+        }
     }
 
     /// Append a job's return through the runtime, and say how it went. A
@@ -1038,6 +1057,7 @@ impl ThreadActor {
                     project: waiting.project.clone(),
                     workspace: (self.shared.labels)(&waiting.project),
                     reason,
+                    job: None,
                 };
                 self.idle_switch = Some(waiting);
                 self.shared.set_state(state);
@@ -1239,16 +1259,9 @@ impl ThreadActor {
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
             next = self.after_turn(outcome, last_poster);
-        }
-        let notes = std::mem::take(
-            &mut *self
-                .shared
-                .job_notes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        );
-        for (payload, reply) in notes {
-            self.write_job_note(payload, reply);
+            // At every turn boundary, not only when the queue empties: a
+            // front that keeps working would otherwise never see a return.
+            self.write_queued_job_notes();
         }
         *self
             .shared

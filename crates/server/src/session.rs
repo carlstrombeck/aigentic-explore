@@ -919,16 +919,17 @@ async fn handle(
             call_id,
             answer,
         } => {
-            // A `yes` needs the target's context built here, before the
-            // answer reaches the actor, so the proposal's project is
-            // read from the actor's state first (issue #7). The role in
-            // the target is the one a `SwitchProject` needs, and the
-            // refusal text is the same.
+            // A `yes` to a `suggest_project` needs the target's context
+            // built here, before the answer reaches the actor, so the
+            // proposal's project is read from the actor's state first.
+            // The role in that project is the one a `SwitchProject` needs,
+            // and the refusal text is the same.
             let mut ack = None;
             let mut target = None;
             let (answer, ctx) = match answer {
                 SwitchReply::Yes => {
-                    let Some(project) = threads.waiting_switch(thread, &call_id).await else {
+                    let Some((project, job)) = threads.waiting_switch(thread, &call_id).await
+                    else {
                         return Response::Refused {
                             reason: format!("nothing is pending for call {call_id}"),
                         };
@@ -948,14 +949,20 @@ async fn handle(
                             reason: format!("in {project}: {}", denied.reason),
                         };
                     }
-                    match threads.build_target(thread, &project).await {
-                        Ok(ctx) => {
-                            let (ctx, rx) = SwitchCtx::oneshot(ctx);
-                            ack = Some(rx);
-                            target = Some(project);
-                            (SwitchAnswer::Yes, ctx)
+                    // A job runs where the front is: nothing to build, and
+                    // nothing to wait for but the actor's own answer.
+                    if job {
+                        (SwitchAnswer::Yes, SwitchCtx::none())
+                    } else {
+                        match threads.build_target(thread, &project).await {
+                            Ok(ctx) => {
+                                let (ctx, rx) = SwitchCtx::oneshot(ctx);
+                                ack = Some(rx);
+                                target = Some(project);
+                                (SwitchAnswer::Yes, ctx)
+                            }
+                            Err(e) => return thread_error(e),
                         }
-                        Err(e) => return thread_error(e),
                     }
                 }
                 SwitchReply::No => (SwitchAnswer::No, SwitchCtx::none()),
