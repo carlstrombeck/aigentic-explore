@@ -366,7 +366,9 @@ fn runner_kind(kind: EventKind) -> Option<RunnerKind> {
         // another thread is not a move of its own run.
         | EventKind::JobFinished
         // Nor is a brief's refresh: it rewrites a file, not a step.
-        | EventKind::BriefRefreshed => None,
+        | EventKind::BriefRefreshed
+        // Nor a nudge inside a child's turn.
+        | EventKind::ReplyNudged => None,
     }
 }
 

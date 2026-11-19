@@ -3634,10 +3634,11 @@ impl ClientRepl {
             | EventKind::DecisionProposed
             | EventKind::DecisionAnswered
             | EventKind::JobFinished
-            | EventKind::BriefRefreshed => {
-                // The sweep, decision, finished-job and brief-refresh
-                // lines: what the harness did on its own. Developer view
-                // only.
+            | EventKind::BriefRefreshed
+            | EventKind::ReplyNudged => {
+                // The sweep, decision, finished-job, brief-refresh and
+                // nudge lines: what the harness did on its own. Developer
+                // view only.
                 if let Some(line) = system_line(event) {
                     self.flush_partial(out);
                     system_cell(out, line);
@@ -3691,6 +3692,7 @@ fn memory_home_name(home: MemoryHome) -> &'static str {
 /// wording is tested without a daemon.
 fn system_line(event: &Event) -> Option<String> {
     match event.kind {
+        EventKind::ReplyNudged => Some("nudged: the reply had no text and no tool call".to_owned()),
         EventKind::ProviderRetried => payload(
             event,
             |p: aigentic_runtime::aigentic_log::ProviderRetriedPayload| {

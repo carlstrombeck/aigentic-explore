@@ -8,8 +8,8 @@ use aigentic_core::{
     ProviderEvent, RiskClass, Role, ToolCall, ToolResult, ToolSpec,
 };
 use aigentic_log::{
-    AssistantMessagePayload, InterruptedPayload, ProviderRetriedPayload, ToolResultPayload, Usage,
-    UserMessagePayload,
+    AssistantMessagePayload, InterruptedPayload, ProviderRetriedPayload, ReplyNudgedPayload,
+    ToolResultPayload, Usage, UserMessagePayload,
 };
 use futures_util::StreamExt;
 
@@ -21,7 +21,10 @@ use crate::harness_tools::{
     NOT_RUN_OVER_LIMIT, NOT_RUN_SIBLING, NOT_RUN_SOLO, READ_BRIEF, START_JOB, SUGGEST_PROJECT,
     harness_specs_with, is_harness_tool, stale_tasks_reminder, start_job_spec,
 };
-use crate::runtime::{ASKED_HUMAN, INTERRUPTED, LENGTH_STOP, MAX_TOKENS_STOP, STEP_REPORTED};
+use crate::runtime::{
+    ASKED_HUMAN, EMPTY_REPLY, EMPTY_REPLY_NUDGE, INTERRUPTED, LENGTH_STOP, MAX_TOKENS_STOP,
+    STEP_REPORTED,
+};
 use crate::seams::{Verdict, author_name, denial_text};
 use crate::support::{Spent, append_queued, block_start, flush_text, recoverable_fault};
 use crate::{Runtime, RuntimeError, Signal, TurnOutcome, build_context};
@@ -182,6 +185,10 @@ impl Runtime {
         // read it — `steer` at the top of the loop below, `steer` unset
         // in `end_turn`, before `turn_ended`, if the turn ends first.
         let mut held: Vec<Queued> = Vec::new();
+        // One nudge per turn after an empty reply; a second empty reply
+        // ends the turn, so a model that keeps answering with nothing
+        // cannot loop.
+        let mut nudged = false;
 
         loop {
             self.drain_inbox(inbox, observe)?;
@@ -524,6 +531,9 @@ impl Runtime {
                     _ => None,
                 })
                 .collect();
+            let visible = blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if !t.trim().is_empty()));
             let payload = serde_json::to_value(AssistantMessagePayload {
                 blocks,
                 usage: Some(usage),
@@ -561,6 +571,28 @@ impl Runtime {
                     )?;
                 }
                 return self.end_turn(LENGTH_STOP, None, &spent, &mut held, observe);
+            }
+            // A reply with no call and no visible text (one that only
+            // reasoned, or came back blank) answered nothing, so it is not
+            // `done`. A reply cut at the output limit keeps `length`.
+            let empty = calls.is_empty() && !length_stop && !visible;
+            if empty && nudged {
+                return self.end_turn(EMPTY_REPLY, None, &spent, &mut held, observe);
+            }
+            if empty {
+                nudged = true;
+                let payload = serde_json::to_value(ReplyNudgedPayload {
+                    text: EMPTY_REPLY_NUDGE.to_owned(),
+                })
+                .expect("serialisable");
+                self.append(
+                    EventKind::ReplyNudged,
+                    Author::System,
+                    payload,
+                    None,
+                    observe,
+                )?;
+                continue;
             }
             if calls.is_empty() {
                 return self.end_turn(

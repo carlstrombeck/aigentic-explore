@@ -8,8 +8,8 @@ use ulid::Ulid;
 
 use crate::payload::{
     AssistantMessagePayload, CompactedPayload, CompactionStrategy, ContextEvictedPayload,
-    InterruptedPayload, JobFinishedPayload, JobOutcome, PinnedPayload, ResultsStubbedPayload,
-    SkillLoadedPayload, ToolResultPayload, UserMessagePayload,
+    InterruptedPayload, JobFinishedPayload, JobOutcome, PinnedPayload, ReplyNudgedPayload,
+    ResultsStubbedPayload, SkillLoadedPayload, ToolResultPayload, UserMessagePayload,
 };
 use crate::recall::{call_index, cut_chars, short_args};
 use crate::store::LogError;
@@ -392,6 +392,19 @@ pub fn project(events: &[Event]) -> Result<Projection, LogError> {
                             name(&p.from),
                             p.root.display()
                         ))],
+                    },
+                );
+            }
+            EventKind::ReplyNudged => {
+                let p: ReplyNudgedPayload = payload(event)?;
+                push(
+                    &mut body,
+                    &mut pending_calls,
+                    &mut held,
+                    Message {
+                        role: Role::User,
+                        author: Author::System,
+                        blocks: vec![ContentBlock::Text(p.text)],
                     },
                 );
             }
